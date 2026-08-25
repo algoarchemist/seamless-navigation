@@ -1,0 +1,132 @@
+SIH26168 Intelligent Dead Reckoning MVP — Progress Summary
+============================================================
+(Running log of work completed so far. See docs/PROJECT_MAP.md for the
+full technical detail on every file; this is the plain-language recap.)
+
+SLICE 1 — Android sensor -> live sensor display
+------------------------------------------------
+Built SensorRepository, which reads live accelerometer + gyroscope at
+~10 Hz on a background thread (never blocking the UI thread) and
+publishes the latest sample of each plus the *observed* delivery rate
+via a StateFlow. MainActivity renders this live on a Compose screen.
+Added a JUnit4 unit test for the Hz calculation.
+
+Installed on a real Samsung Galaxy S24 FE (SM-S721B, Android 16 / One
+UI 8.5) connected over USB ADB. Live accel/gyro readout confirmed
+working, observed rate ~12.5 Hz against the requested ~10 Hz.
+
+SLICE 2 — Sensor -> orientation
+---------------------------------
+Added OrientationMath.kt: a pure-Kotlin quaternion -> azimuth/pitch/roll
+conversion mirroring Android's own AOSP SensorManager algorithm exactly,
+so it's unit-testable on the plain JVM and matches on-device output.
+Registered the rotation-vector sensor in SensorRepository; MainActivity
+now displays live azimuth/pitch/roll in degrees (radians internally,
+converted only at the display boundary). One unit test caught a wrong
+sign assumption before it ever reached the device (Android's azimuth is
+clockwise-positive, not counterclockwise like a raw quaternion rotation).
+
+Verified live orientation readout updating on the S24 FE.
+
+SLICE 3 — Sensor -> baseline physics velocity/position
+---------------------------------------------------------
+Added a `dr/` package: WorldFrameAcceleration.kt (rotates raw device-
+frame accel into WORLD frame using Slice 2's rotation matrix, then
+removes gravity) and BaselinePhysicsIntegrator.kt (semi-implicit-Euler
+double integration to a 2D East/North position + velocity). This is a
+deliberately naive physics-only baseline (PRD Section 32's fallback
+path) — no ZUPT, no bias correction, expected to drift, which is
+intended, not a bug: it's the honest reference later ML must beat.
+BaselineDeadReckoningRepository.kt is the coroutine glue wiring
+SensorRepository's stream into the integrator. MainActivity shows the
+live position/velocity with an on-screen caption warning it's a naive
+baseline expected to drift.
+
+Verified live position/velocity readout updating on the S24 FE.
+
+SLICE 4 — GNSS outage detection
+----------------------------------
+Added a `gnss/` package: GnssFix.kt (raw fix data), GnssQuality.kt
+(pure: is a fix good enough right now, by age + accuracy),
+GnssOutageDetector.kt (pure: the GNSS_AIDED/TRANSITION/DEAD_RECKONING/
+REACQUISITION hysteresis state machine per PRD Section 18, with proper
+enter/exit dwell times so a single noisy sample can't flip the mode,
+and every transition logged with its trigger condition).
+LocationRepository.kt reads real GPS fixes via FusedLocationProviderClient
+at ~1 Hz; GnssModeRepository.kt evaluates the detector on its own
+independent 5 Hz clock (so GNSS detection keeps working even if the IMU
+pipeline is down). MainActivity now requests location permission at
+runtime and displays live GNSS mode/fix/last-transition.
+
+BUG FOUND AND FIXED during on-device verification: the very first accel
+sample of each run computed a multi-thousand-second "dt" against a 0L
+sentinel instead of treating it as "no prior sample," which briefly sent
+the DR position to ~1e11 meters immediately on launch. Root cause: a
+different first-sample guard pattern than the one already used correctly
+elsewhere in the codebase. Fixed with a nullable Long sentinel (makes the
+bug class structurally impossible, not just patched). Retested, verified
+via screenshot: position stayed small (sub-2m) at rest as expected.
+
+Also hit and resolved an unrelated Windows/ADB driver glitch mid-session
+(the ADB USB interface got stuck in a stale phantom state) — fixed by
+restarting the ADB server and re-toggling USB debugging on the phone,
+not a code issue.
+
+Verified live GNSS mode readout on the S24 FE: correctly showed
+DEAD_RECKONING (no fix available indoors) with the exact expected
+trigger description logged.
+
+SLICE 5 — Dead reckoning: state machine wiring + ZUPT + non-holonomic
+constraint
+--------------------------------------------------------------------
+Added StationaryDetector.kt (pure, deterministic ZUPT trigger: sustained
+low acceleration + gyro magnitude, same dwell/hysteresis principle as
+the GNSS state machine — honestly documents that it can't distinguish
+"at rest" from "coasting at constant velocity," an inherent limitation)
+and NonHolonomicConstraint.kt (pure: vector-projects velocity onto
+device heading, suppressing the sideways component — a simplified
+WORLD-frame stand-in for PRD Section 20's vehicle-frame version, since
+phone-to-vehicle alignment doesn't exist yet, with no "Turning" exemption
+either since the ML motion classifier is Slice 6).
+
+BaselinePhysicsIntegrator gained overrideVelocity() (sets velocity only,
+leaves position untouched) as the mechanism both corrections use.
+BaselineDeadReckoningRepository now also depends on GnssModeRepository:
+applies ZUPT/NHC every tick, and resets the integrator every tick GNSS
+mode is GNSS_AIDED, so the DR readout means "distance traveled since
+GNSS was last good" (the actual drift-measurement quantity PRD wants),
+not drift since app launch. This is the "state machine" wiring for this
+slice: connecting Slice 4's previously-cosmetic mode to actually affect
+the DR estimate (still no GNSS/DR position blending — that's Slice 7).
+
+Verified with two screenshots ~15 seconds apart, phone at rest: position
+stayed essentially at zero the whole time (not just at the first
+reading), versus Slice 4's -0.85/-1.56 m drift over a similar period —
+direct visible proof ZUPT is actually holding the estimate still.
+The GNSS-mode-gated reset couldn't be visually confirmed indoors (no
+real GPS lock reachable inside) — verified by code inspection + existing
+unit tests instead, flagged for a direct outdoor check later.
+
+CURRENT STATE
+--------------
+46 unit tests passing. Real Android app running on real hardware (S24
+FE), reading real sensors, no faked/simulated data anywhere in the
+shipped path. What works end-to-end right now:
+  - Live accel/gyro/orientation readout
+  - A corrected (ZUPT + simplified non-holonomic) physics-only
+    dead-reckoning position/velocity estimate, WORLD frame
+  - A real GNSS outage detector with proper hysteresis, driving a live
+    mode display
+  - The DR "odometer" now resets while GNSS is trustworthy, so it reads
+    as drift-since-outage-start
+
+NOT YET BUILT (by design, not oversight):
+  - Phone-to-vehicle alignment (needs GNSS-aided init window)
+  - Any ML (velocity model, motion classifier) — Slice 6
+  - Actual GNSS/DR position fusion or blending — Slice 7
+  - Map constraint / map UI — Slice 8
+  - End-to-end demo run + measured metrics — Slice 9
+
+NEXT UP: Slice 6 (ML inference), which per PRD Section 24 requires
+Phase 4 dataset inspection (IO-VNBD) first, since no training data has
+been looked at yet.

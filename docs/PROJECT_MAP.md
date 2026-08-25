@@ -5,19 +5,23 @@ added, removed, or has its responsibility/interface changed
 (CLAUDE.md Rule 6/21). This is written to teach the pipeline, not just
 list files — when in doubt, explain *why*, not just *what*.
 
-Status as of last update: **Phase 0 scaffold + Slice 1+2+3 implemented
-and on-device verified.** The folder/build-system skeleton
-(`## Scaffold Status`) and Slice 1+2+3 (Android sensor -> live sensor
-display, sensor -> orientation, sensor -> baseline physics
-velocity/position, `## Slice 1+2+3`) are real, build-verified, and now
-confirmed running on a real Samsung Galaxy S24 FE (Android 16 / One UI
-8.5) with live accel/gyro readout at ~12.5 Hz observed, live
-azimuth/pitch/roll orientation, and a live (expectedly drifting)
-WORLD-frame position/velocity estimate all confirmed updating on
-screen. Everything else under `## Planned File Map` is still a target
-derived from PRD.md — no vehicle-frame alignment, ML, state-machine,
-fusion, or map-matching code exists yet. Each entry gets flipped from
-`PLANNED` to
+Status as of last update: **Phase 0 scaffold + Slice 1+2+3+4+5
+implemented and on-device verified.** The folder/build-system skeleton
+(`## Scaffold Status`) and Slice 1+2+3+4+5 (Android sensor -> live
+sensor display, sensor -> orientation, sensor -> baseline physics
+velocity/position, GNSS outage detection, dead reckoning state-machine
+wiring + ZUPT + non-holonomic constraint, `## Slice 1+2+3+4+5`) are
+real, build-verified, and now confirmed running on a real Samsung
+Galaxy S24 FE (Android 16 / One UI 8.5) with live accel/gyro readout at
+~12.5-16.7 Hz observed, live azimuth/pitch/roll orientation, a live
+GNSS_AIDED/TRANSITION/DEAD_RECKONING/REACQUISITION mode readout, and a
+live WORLD-frame position/velocity estimate that now visibly stays near
+zero while the phone is at rest (confirmed over 15+ seconds — the
+ZUPT correction working, versus Slice 4's -0.85/-1.56 m drift over a
+similar period) all confirmed updating on screen. Everything else
+under `## Planned File Map` is still a target derived from PRD.md — no
+vehicle-frame alignment, ML, fusion, or map-matching code exists yet.
+Each entry gets flipped from `PLANNED` to
 `IMPLEMENTED` (with the fields below filled in for real) as it is
 actually built.
 
@@ -136,13 +140,13 @@ Purpose: Excludes Android/Gradle build output, `local.properties`,
   `./gradlew` works on a fresh clone with no Android Studio sync first.
 ```
 
-No ML, state-machine, fusion, or map-matching code exists yet —
-everything below this line (past `## Slice 1+2+3`) is still the
-Slice-4-onward target, unchanged from the original plan.
+No ML, fusion, or map-matching code exists yet — everything below this
+line (past `## Slice 1+2+3+4+5`) is still the Slice-6-onward target,
+unchanged from the original plan.
 
 ---
 
-## Slice 1+2+3 — live sensor display, sensor -> orientation, sensor -> baseline physics velocity/position (implemented)
+## Slice 1+2+3+4+5 — live sensor display, sensor -> orientation, sensor -> baseline physics velocity/position, GNSS outage detection, dead reckoning state-machine wiring + ZUPT + non-holonomic constraint (implemented)
 
 ```
 android/app/src/main/kotlin/com/sih26168/idr/sensors/SensorSample.kt
@@ -272,64 +276,248 @@ Purpose: Double-integrates WORLD-frame linear acceleration into a 2D
   velocity — more numerically stable than naive explicit Euler, still a
   one-line-per-step method appropriate for a 36-hour MVP, CLAUDE.md
   Rule 18). This is PRD.md Section 32's "physics baseline" fallback path
-  — deliberately naive, with no ZUPT/bias correction/non-holonomic
-  constraint (those are Slice 5), so position error is EXPECTED to grow
-  rapidly and unboundedly, even sitting still. That is the honest,
-  intended behavior of a physics-only baseline, not a bug — its purpose
-  is to be the measured reference Slice 6's ML velocity model must beat
+  — [update] itself still has no bias correction, but ZUPT and the
+  non-holonomic constraint (Slice 5, see StationaryDetector.kt /
+  NonHolonomicConstraint.kt below) are now applied by the caller via
+  overrideVelocity() after each update(), materially reducing at-rest
+  drift versus the Slice 3/4 baseline (measured: sub-2m -> near-zero
+  over 15+ seconds at rest, see Slice 5's build-verification entry).
+  update() alone, without those corrections, remains the honest
+  physics-only reference Slice 6's ML velocity model must beat
   (CLAUDE.md Rule 3).
-Inputs: dtSeconds, linearAccelEastMps2, linearAccelNorthMps2 per tick.
+Inputs: dtSeconds, linearAccelEastMps2, linearAccelNorthMps2 per tick
+  (update()); velocityEastMps, velocityNorthMps (overrideVelocity()).
 Outputs: DeadReckoningState(positionEastM, positionNorthM,
   velocityEastMps, velocityNorthMps) — relative to wherever integration
-  started; not yet tied to a real lat/lon (no GNSS fusion until a later
-  slice).
+  started; not yet tied to a real lat/lon (no GNSS fusion until Slice 7).
 Important functions/classes: update() (no-op on dtSeconds <= 0.0, same
-  clock-reset guard convention as Slice 1's Hz calculation), reset(),
-  currentState().
+  clock-reset guard convention as Slice 1's Hz calculation);
+  overrideVelocity() (added Slice 5 — sets velocity only, leaves
+  position untouched, unlike reset() which zeroes both; the mechanism
+  ZUPT and the non-holonomic constraint both use); reset(); currentState().
 Connected to: BaselineDeadReckoningRepository -> BaselinePhysicsIntegrator -> DeadReckoningState
+
+android/app/src/main/kotlin/com/sih26168/idr/dr/StationaryDetector.kt
+Status: IMPLEMENTED
+Purpose: Deterministic (no ML) "is the phone stationary right now"
+  detector gating the ZUPT correction. PRD.md Section 14 frames
+  Stationary->ZUPT as an ML motion-classifier effect, but that
+  classifier is Slice 6 — CLAUDE.md's slice order puts ZUPT in Slice 5,
+  before ML, so this is a lightweight physics-only stand-in: sustained
+  low linear-acceleration-magnitude AND low gyro-magnitude, with the
+  same hysteresis/dwell principle as GnssOutageDetector (CLAUDE.md
+  Rule 16's spirit, applied here even though that rule technically only
+  names the GNSS state machine).
+Inputs: nowMs (boot-time ms, not wall-clock — only relative durations
+  matter here), linearAccelMagnitudeMps2, gyroMagnitudeRadPerSec.
+Outputs: Boolean (also readable via isStationary).
+Important concepts/assumptions: HONEST LIMITATION — constant-velocity
+  straight-line motion also produces near-zero acceleration/gyro, so
+  this cannot distinguish "truly at rest" from "smoothly coasting."
+  A real system would additionally gate on GNSS speed or the eventual
+  ML classifier; neither is available here. Thresholds (0.25 m/s^2,
+  0.05 rad/s, 300ms dwell) are engineering defaults, not yet validated
+  against a real test drive (CLAUDE.md Rule 13).
+Connected to: BaselineDeadReckoningRepository -> StationaryDetector -> BaselinePhysicsIntegrator.overrideVelocity
+
+android/app/src/main/kotlin/com/sih26168/idr/dr/NonHolonomicConstraint.kt
+Status: IMPLEMENTED
+Purpose: PRD.md Section 20's non-holonomic constraint (a road vehicle
+  can't move sideways relative to its heading) — pure vector projection
+  suppressing the velocity component perpendicular to heading.
+Inputs: velocityEastMps, velocityNorthMps, headingRad (device azimuth).
+Outputs: Pair<Double, Double> (forward-only East/North velocity).
+Important concepts/assumptions: PRD.md Section 20 specifies this in
+  VEHICLE frame with a Turning exemption from the ML motion classifier.
+  Neither exists yet, so this is a deliberately simplified WORLD-frame
+  stand-in: it uses the device's own WORLD-frame heading as a proxy for
+  vehicle heading, under the explicit assumption the phone's yaw tracks
+  the vehicle's yaw (true if rigidly mounted; false if loose, e.g. a
+  cup holder). No Turning exemption either, so a genuine turn's real
+  lateral velocity gets suppressed too — an accepted, documented
+  over-constraint for this slice, to be relaxed once Slice 6's motion
+  classifier can flag Turning windows.
+Connected to: BaselineDeadReckoningRepository -> NonHolonomicConstraint -> BaselinePhysicsIntegrator.overrideVelocity
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/BaselineDeadReckoningRepository.kt
 Status: IMPLEMENTED
 Purpose: Android/coroutine glue connecting SensorRepository's raw
-  accel + orientation StateFlow to the pure WorldFrameAcceleration +
-  BaselinePhysicsIntegrator math, republishing the running position
-  estimate as its own StateFlow. Kept as a separate class from
-  SensorRepository (CLAUDE.md Rule 5) — SensorRepository owns raw
-  sensor IO only, this owns turning that stream into a physics estimate.
-Inputs: SensorRepository (read-only, via its StateFlow), a
-  CoroutineScope (MainActivity's lifecycleScope) to collect on.
+  accel/gyro/orientation StateFlow to the pure WorldFrameAcceleration +
+  BaselinePhysicsIntegrator math; applies StationaryDetector's ZUPT and
+  NonHolonomicConstraint's lateral suppression each tick (Slice 5); gates
+  the position "odometer" on GnssModeRepository's mode (Slice 5's "state
+  machine" wiring); republishes the running position estimate as its own
+  StateFlow. Kept as a separate class from SensorRepository (CLAUDE.md
+  Rule 5) — SensorRepository owns raw sensor IO only, this owns turning
+  that stream into a corrected physics estimate.
+Inputs: SensorRepository (read-only, via its StateFlow),
+  GnssModeRepository (read-only, via its StateFlow, added Slice 5), a
+  CoroutineScope (MainActivity's lifecycleScope) to collect on, an
+  optional StationaryDetector (defaulted).
 Outputs: StateFlow<DeadReckoningState>.
-Connected to: SensorRepository -> BaselineDeadReckoningRepository -> MainActivity (Compose UI)
+Connected to: SensorRepository -> BaselineDeadReckoningRepository -> MainActivity (Compose UI);
+  GnssModeRepository -> BaselineDeadReckoningRepository (mode-gated reset)
 Important functions/classes: start()/stop() (lifecycle-tied, same
-  pattern as SensorRepository), lastProcessedAccelTimestampNs (guards
-  against reprocessing — SensorRepository's StateFlow re-emits on every
-  gyro/orientation update too, not just accel, so this dedupes by accel
-  timestamp before running an integration step).
+  pattern as SensorRepository), lastProcessedAccelTimestampNs: Long?
+  (guards against reprocessing — SensorRepository's StateFlow re-emits
+  on every gyro/orientation update too, not just accel, so this dedupes
+  by accel timestamp before running an integration step).
 Important concepts/assumptions: orientation and accel come from
   independent sensor listeners a few ms apart at ~10 Hz; using the
   latest available orientation for the current accel sample is an
   accepted, documented approximation for this baseline (CLAUDE.md
-  Rule 9/14), not a silently-ignored timing mismatch.
+  Rule 9/14), not a silently-ignored timing mismatch. GNSS-mode gating
+  (Slice 5): while mode == GNSS_AIDED, the integrator is reset every
+  tick, so the moment GNSS is lost, the DR readout starts counting from
+  zero — representing distance traveled purely during THIS outage
+  (PRD.md Section 28's actual measurement target), not accumulated
+  drift since app launch. This does NOT fuse GNSS and DR positions
+  together (no blending math) — that's Slice 7.
+Bug found + fixed during Slice 4 on-device verification (2026-08-25):
+  lastProcessedAccelTimestampNs was originally a Long defaulting to 0L
+  as the "no sample yet" sentinel. On the very first accel sample of a
+  run, that made dt compute as (accel.timestampNs - 0L) — the device's
+  entire boot-time uptime in nanoseconds (thousands of seconds) — fed
+  straight into BaselinePhysicsIntegrator as one massive spurious dt on
+  a single tick. Observed on-device as position/velocity jumping to
+  ~1e11 m / ~65,000 m/s immediately on launch, instead of the small,
+  plausible near-zero drift expected for a stationary phone. Root cause
+  was NOT reusing the exact same "!= 0L" first-sample guard
+  SensorRepository already uses correctly for its Hz calculation.
+  Fixed by changing the field to a nullable Long (null = genuinely no
+  prior sample), which makes the bug class structurally impossible
+  rather than just patching the one call site. Re-verified on the same
+  S24 FE: position/velocity now stay small (sub-2m, sub-0.1 m/s) at
+  rest, as expected. (Slice 5's ZUPT then reduced that further to
+  near-zero — see build-verification entry below.)
+
+android/app/src/main/kotlin/com/sih26168/idr/gnss/GnssFix.kt
+Status: IMPLEMENTED
+Purpose: A single GNSS fix, reduced from android.location.Location to
+  what the outage detector needs.
+Outputs: GnssFix(timeMs, latitudeDeg, longitudeDeg, accuracyM, speedMps,
+  bearingDeg).
+Important concepts/assumptions: timeMs is WALL-CLOCK
+  (System.currentTimeMillis()-based, from Location.getTime()) — unlike
+  sensor timestamps (boot-time monotonic, see sensors/SensorSample.kt).
+  The two clocks are explicitly NOT reconciled against each other yet
+  (CLAUDE.md Rule 9/14); that alignment is deferred to Slice 7 (fusion).
+
+android/app/src/main/kotlin/com/sih26168/idr/gnss/GnssQuality.kt
+Status: IMPLEMENTED
+Purpose: Pure function classifying whether a fix is "good enough to
+  navigate on right now" from its age and accuracy — deliberately
+  separate from GnssOutageDetector (CLAUDE.md Rule 5): this answers
+  "is GNSS good this instant," the detector answers "given a history of
+  that, what state are we in."
+Inputs: fixAgeMs, accuracyM (nullable — null means no fix ever
+  received), maxFixAgeMs (default 3000ms), maxAccuracyM (default 25m).
+Outputs: Boolean.
+Important concepts/assumptions: thresholds are engineering defaults,
+  not yet validated against a real outage test run (PRD.md Section 28)
+  — not to be reported to judges as measured figures (CLAUDE.md Rule 13).
+Connected to: GnssModeRepository -> GnssQuality -> GnssOutageDetector
+
+android/app/src/main/kotlin/com/sih26168/idr/gnss/GnssOutageDetector.kt
+Status: IMPLEMENTED
+Purpose: The GNSS_AIDED / TRANSITION / DEAD_RECKONING / REACQUISITION
+  hysteresis state machine (PRD.md Section 18). Pure Kotlin — no
+  Android dependency — driven by repeated evaluate(nowMs, gnssGoodNow)
+  calls, so the dwell-time/hysteresis logic is unit-testable on the
+  plain JVM with a synthetic time sequence (CLAUDE.md Rule 19).
+Inputs: nowMs (wall-clock), gnssGoodNow (from GnssQuality) per call.
+Outputs: current GnssMode; a running List<GnssModeTransition> log
+  (fromMode, toMode, atMs, triggerDescription) satisfying CLAUDE.md
+  Rule 17's "every transition logged for replay" requirement at the
+  pure-math layer (GnssModeRepository additionally Logcats each one).
+Important functions/classes: evaluate() (the state machine step);
+  outageEnterDwellMs / reacquisitionEnterDwellMs / transitionDwellMs /
+  reacquisitionDwellMs (constructor params, defaults 2000/2000/1000/
+  1000ms — engineering defaults, not yet empirically validated).
+Important concepts/assumptions: hysteresis (CLAUDE.md Rule 16) — a
+  single bad/good sample cannot flip the mode; leaving GNSS_AIDED
+  requires GNSS bad continuously for outageEnterDwellMs, leaving
+  DEAD_RECKONING requires GNSS good continuously for
+  reacquisitionEnterDwellMs, and TRANSITION/REACQUISITION each have
+  their own minimum dwell before the next transition is even
+  considered. TRANSITION/REACQUISITION are state-machine bookkeeping
+  ONLY in this slice — they do NOT yet blend GNSS and DR position
+  estimates together (PRD.md Section 18's "freeze/average"/"blend"
+  behavior is Slice 7, Fusion / re-alignment on GNSS reacquisition).
+Connected to: GnssModeRepository -> GnssOutageDetector -> GnssModeUiState
+
+android/app/src/main/kotlin/com/sih26168/idr/gnss/LocationRepository.kt
+Status: IMPLEMENTED
+Purpose: Collects GNSS fixes via FusedLocationProviderClient at ~1 Hz
+  (PRD.md Section 11/21) and republishes the latest as LocationUiState.
+  Slice 4 scope only: reads and republishes raw fixes — no outage state
+  machine here (CLAUDE.md Rule 5, that's GnssOutageDetector), no fusion
+  with the dead-reckoned position (Slice 7).
+Inputs: android.content.Context.
+Outputs: StateFlow<LocationUiState> — {latestFix, hasLocationPermission}.
+Important functions/classes: hasLocationPermission() (checks
+  ACCESS_FINE_LOCATION at runtime — the actual permission REQUEST from
+  the user is an Activity-level UI concern, handled in MainActivity, not
+  here); start() no-ops (and reports the gap via state) if permission
+  isn't granted yet, rather than crashing on the Google Play Services
+  call. Registers on a dedicated background HandlerThread, same pattern
+  as SensorRepository, per CLAUDE.md Android Rule 7.
+Connected to: MainActivity (permission grant) -> LocationRepository -> GnssModeRepository
+
+android/app/src/main/kotlin/com/sih26168/idr/gnss/GnssModeRepository.kt
+Status: IMPLEMENTED
+Purpose: Android/coroutine glue repeatedly evaluating GnssOutageDetector
+  against LocationRepository's latest fix on its OWN 5 Hz wall-clock
+  timer (deliberately NOT piggybacked on SensorRepository's flow — GNSS
+  outage detection must keep working even if the accelerometer/gyro
+  pipeline is unavailable; the two concerns are unrelated, CLAUDE.md
+  Rule 5), republishing mode + fix info as its own StateFlow, and
+  Logcat-ing every transition (CLAUDE.md Rule 17).
+Inputs: LocationRepository (read-only, via its StateFlow), a
+  CoroutineScope, an optional GnssOutageDetector (defaulted).
+Outputs: StateFlow<GnssModeUiState> — {mode, latestFix, fixAgeMs,
+  hasLocationPermission, lastTransition}.
+Connected to: LocationRepository -> GnssModeRepository -> MainActivity (Compose UI)
+Important concepts/assumptions: fixAgeMs and the detector's nowMs both
+  use System.currentTimeMillis() (wall-clock) consistently with
+  GnssFix.timeMs — no boot-time/wall-clock mixing occurs in this
+  repository (CLAUDE.md Rule 9/14).
 
 android/app/src/main/kotlin/com/sih26168/idr/MainActivity.kt
 Status: IMPLEMENTED
-Purpose: Slice 1+2+3 entry point — instantiates SensorRepository and
-  BaselineDeadReckoningRepository, starts/stops both on onResume/onPause,
-  and renders the latest accel/gyro/orientation sample plus observed Hz
-  and the live baseline-physics position/velocity via a Compose screen
-  (IdrSensorScreen).
+Purpose: Slice 1+2+3+4+5 entry point — instantiates SensorRepository,
+  LocationRepository, GnssModeRepository, and (depending on
+  GnssModeRepository, Slice 5) BaselineDeadReckoningRepository in that
+  dependency order; starts/stops all on onResume/onPause (GnssModeRepository
+  before BaselineDeadReckoningRepository, so its mode-gated reset reads
+  an already-ticking mode); requests ACCESS_FINE_LOCATION at runtime via
+  ActivityResultContracts if not already granted; renders the latest
+  accel/gyro/orientation sample, observed Hz, live corrected DR
+  position/velocity, and live GNSS mode/fix/transition via a Compose
+  screen (IdrSensorScreen).
 Connected to: SensorRepository -> MainActivity -> IdrSensorScreen (Compose);
-  SensorRepository -> BaselineDeadReckoningRepository -> MainActivity -> IdrSensorScreen
+  SensorRepository -> BaselineDeadReckoningRepository -> MainActivity -> IdrSensorScreen;
+  LocationRepository -> GnssModeRepository -> MainActivity -> IdrSensorScreen;
+  GnssModeRepository -> BaselineDeadReckoningRepository (Slice 5)
+Important functions/classes: requestLocationPermission
+  (registerForActivityResult(RequestPermission()), registered as a
+  property initializer since it must be registered before the activity
+  reaches STARTED) — starts LocationRepository once granted; if already
+  granted on resume, starts it directly instead of re-prompting.
 Important concepts/assumptions: orientation is displayed in degrees but
   every internal value stays in radians — the rad->deg conversion
   happens only at this UI display boundary (CLAUDE.md Rule 15), never
   silently earlier in the pipeline. The DR readout is captioned on-screen
-  as a naive baseline expected to drift, so a demo viewer isn't misled
-  into thinking it's an accurate position (CLAUDE.md Rule 13's honesty
-  requirement extended to in-app copy, not just final reported metrics).
-  No filtering, no GNSS, no ML yet — purely a live readout proving the
-  sensor + orientation + physics-integration pipeline works end-to-end
-  without blocking the UI thread.
+  with what corrections ARE applied (ZUPT, non-holonomic) and what still
+  ISN'T (bias correction, vehicle-frame alignment), so a demo viewer
+  isn't misled into thinking it's a fully accurate position (CLAUDE.md
+  Rule 13's honesty requirement extended to in-app copy, not just final
+  reported metrics). If location permission isn't granted, the GNSS mode
+  readout still works (reflects "no fix" honestly) rather than crashing
+  or hiding the section. No ML, no GNSS/DR position fusion yet — purely
+  a live readout proving the sensor + orientation + corrected-physics-
+  integration + GNSS-outage-detection pipeline works end-to-end without
+  blocking the UI thread.
 
 android/app/src/test/kotlin/com/sih26168/idr/sensors/SampleRateTest.kt
 Status: IMPLEMENTED
@@ -368,8 +556,54 @@ Purpose: JUnit4 unit tests for BaselinePhysicsIntegrator — dtSeconds <= 0
   dt=0.1s match the closed-form semi-implicit-Euler analytic result
   (v=1.0 m/s, pos=0.55 m — hand-derived, not just "close enough");
   reset() zeroes state; East and North integrate independently of each
-  other. Satisfies CLAUDE.md Rule 19 before this math is trusted for any
-  reported drift number (PRD.md Section 28).
+  other; overrideVelocity() changes velocity but leaves position
+  untouched (added Slice 5); an overridden velocity correctly feeds into
+  the NEXT tick's position update. Satisfies CLAUDE.md Rule 19 before
+  this math is trusted for any reported drift number (PRD.md Section 28).
+
+android/app/src/test/kotlin/com/sih26168/idr/dr/StationaryDetectorTest.kt
+Status: IMPLEMENTED
+Purpose: JUnit4 unit tests for StationaryDetector — starts not
+  stationary; a brief below-threshold blip does not commit (one ms
+  before the dwell boundary is checked explicitly); sustained
+  below-threshold for the full dwell commits to stationary; high linear
+  accel alone (regardless of gyro) prevents stationary, and vice versa;
+  a mid-streak spike resets the dwell clock rather than accumulating
+  across the interruption. Satisfies CLAUDE.md Rule 19 before this gates
+  a real velocity correction.
+
+android/app/src/test/kotlin/com/sih26168/idr/dr/NonHolonomicConstraintTest.kt
+Status: IMPLEMENTED
+Purpose: JUnit4 unit tests for NonHolonomicConstraint.suppressLateralVelocity
+  — heading-north keeps north, drops east (and vice versa for
+  heading-east); velocity purely along heading is unchanged; velocity
+  purely perpendicular to heading is fully suppressed; reverse motion
+  along heading preserves its sign; zero velocity stays zero. Each
+  non-trivial case is checked against a hand-derived expected vector,
+  not just "some suppression happened."
+
+android/app/src/test/kotlin/com/sih26168/idr/gnss/GnssQualityTest.kt
+Status: IMPLEMENTED
+Purpose: JUnit4 unit tests for GnssQuality.isGood — no fix ever received
+  is not good; fresh+accurate is good; fresh-but-inaccurate is not good;
+  accurate-but-stale is not good; boundary values are inclusive of the
+  threshold; one unit past either boundary is not good. Satisfies
+  CLAUDE.md Rule 19 before this classification feeds the state machine.
+
+android/app/src/test/kotlin/com/sih26168/idr/gnss/GnssOutageDetectorTest.kt
+Status: IMPLEMENTED
+Purpose: JUnit4 unit tests for the hysteresis state machine — starts in
+  GNSS_AIDED with no transitions; a brief bad blip that recovers before
+  the dwell threshold does NOT flip the mode (CLAUDE.md Rule 16's "a
+  single noisy sample must never flip the mode," directly verified, not
+  assumed); sustained bad GNSS moves GNSS_AIDED -> TRANSITION ->
+  DEAD_RECKONING at the exact dwell boundaries (one ms before is checked
+  explicitly, not just "eventually"); GNSS recovering mid-TRANSITION
+  returns to GNSS_AIDED instead of continuing to DEAD_RECKONING;
+  sustained good GNSS moves DEAD_RECKONING -> REACQUISITION ->
+  GNSS_AIDED; GNSS degrading again mid-REACQUISITION returns to
+  DEAD_RECKONING; an interrupted good streak in DEAD_RECKONING resets
+  the dwell timer rather than accumulating across the interruption.
 ```
 
 **Build verification (this environment):**
@@ -408,6 +642,56 @@ Purpose: JUnit4 unit tests for BaselinePhysicsIntegrator — dtSeconds <= 0
   user-verified. Slice 1+2+3 now fully verified end-to-end on real
   hardware with real sensors, no faked data, no ML. Ready to start
   Slice 4 (GNSS outage detection).
+- Slice 4 (2026-08-25): `./gradlew.bat test` — BUILD SUCCESSFUL, all 32
+  tests pass (6 SampleRateTest + 5 OrientationMathTest +
+  4 WorldFrameAccelerationTest + 4 BaselinePhysicsIntegratorTest +
+  6 GnssQualityTest + 7 GnssOutageDetectorTest). `./gradlew.bat
+  installDebug` onto the same S24 FE. The device briefly dropped off
+  ADB mid-session (Windows Device Manager showed the ADB USB interface
+  in a stale `CM_PROB_PHANTOM` state while the MTP interface still
+  enumerated fine — a driver-binding glitch, not a cable/app problem);
+  restarting the ADB server and re-toggling USB debugging on the phone
+  resolved it.
+  First on-device run surfaced a real bug (not expected-baseline
+  drift): the DR position/velocity readout jumped to ~1e11 m /
+  ~65,000 m/s within seconds of launch. Root-caused to
+  BaselineDeadReckoningRepository's first-accel-sample dt calculation
+  (see that file's entry above for the fix) — fixed, retested (32/32
+  still pass), reinstalled, and re-verified via screenshot: position/
+  velocity now stay small (sub-2m, sub-0.1 m/s) at rest, as expected of
+  the naive baseline. A system "Android App Compatibility" dialog also
+  appeared once, warning that `onnxruntime-android`'s bundled
+  `.so` libraries aren't 16KB-page-size aligned (Android 15+
+  requirement) — harmless today since no ONNX inference code exists
+  yet (Slice 6), but noted as a known issue to revisit before Slice 6
+  bundles real inference.
+  GNSS mode readout confirmed live via screenshot: correctly showed
+  `DEAD_RECKONING` after `TRANSITION` (no fix available indoors),
+  with the exact expected trigger description logged
+  ("TRANSITION window elapsed, GNSS still degraded/lost") — the
+  hysteresis state machine's on-device behavior matches its unit-tested
+  behavior. Slice 1+2+3+4 now fully verified end-to-end on real
+  hardware, no faked data, no ML. Ready to start Slice 5 (dead
+  reckoning: state machine + ZUPT + non-holonomic constraint).
+- Slice 5 (2026-08-25): `./gradlew.bat test` — BUILD SUCCESSFUL, all 46
+  tests pass (32 from Slices 1-4 + 6 StationaryDetectorTest +
+  6 NonHolonomicConstraintTest + 2 new BaselinePhysicsIntegratorTest
+  cases for overrideVelocity()). `./gradlew.bat installDebug` onto the
+  same S24 FE. Verified via two screenshots ~15 seconds apart, phone at
+  rest: position stayed at essentially zero the whole time
+  (east=-0.01/north=0.00, then east=0.00/north=-0.02; velocity 0.00/0.00
+  both times) — versus Slice 4's -0.85/-1.56 m over a comparable period.
+  Confirms ZUPT is actually holding the estimate still at rest, not just
+  reducing drift by a fixed amount once. GNSS mode readout still correct
+  (DEAD_RECKONING, no fix available indoors, matching Slice 4's verified
+  behavior — GNSS-mode-gated integrator reset couldn't be visually
+  confirmed indoors without a real GPS lock, since indoors GNSS never
+  reaches GNSS_AIDED; that specific behavior is verified by code
+  inspection + the existing GnssOutageDetector unit tests, and will get
+  a direct visual check once tested outdoors with real GPS). Slice
+  1+2+3+4+5 now fully verified end-to-end on real hardware, no faked
+  data, no ML, no GNSS/DR position fusion yet. Ready to start Slice 6
+  (ML inference: velocity + motion classifier wired in).
 
 ---
 
@@ -445,12 +729,18 @@ Purpose: Slice 3's naive WORLD-frame (not vehicle-frame) physics-only
   fallback path / CLAUDE.md Rule 3's required physics comparison point).
 Connected to: SensorRepository -> BaselineDeadReckoningRepository -> MainActivity
 
-LocationRepository.kt
-Status: PLANNED
-Purpose: Collect GNSS fixes (lat/lon, speed, course, accuracy) via
-  FusedLocationProvider/LocationManager; expose availability/quality for
-  outage detection.
-Connected to: -> GnssOutageDetector, -> StateEstimator
+gnss/{GnssFix,GnssQuality,GnssOutageDetector,LocationRepository,GnssModeRepository}.kt
+Status: IMPLEMENTED — see `## Slice 1+2+3+4` above for full detail.
+Purpose: Collect GNSS fixes via FusedLocationProvider (LocationRepository),
+  classify fix quality (GnssQuality), and run the GNSS_AIDED/TRANSITION/
+  DEAD_RECKONING/REACQUISITION hysteresis state machine
+  (GnssOutageDetector), glued together and republished by
+  GnssModeRepository.
+Connected to: MainActivity (permission) -> LocationRepository ->
+  GnssModeRepository -> GnssOutageDetector -> MainActivity (Compose UI).
+  -> StateEstimator is still a PLANNED downstream consumer (Slice 5+,
+  once GNSS mode actually gates DR behavior instead of just being
+  displayed).
 
 FeatureExtractor.kt
 Status: PLANNED
@@ -476,20 +766,19 @@ Purpose: On-device ONNX/LiteRT inference wrappers for the two trained
 Connected to: FeatureExtractor -> {VelocityModel, MotionClassifierModel}
   -> StateEstimator
 
-GnssOutageDetector.kt
-Status: PLANNED
-Purpose: Implement the GNSS_AIDED / TRANSITION / DEAD_RECKONING /
-  REACQUISITION state machine with hysteresis (PRD.md Section 18).
-Connected to: LocationRepository -> GnssOutageDetector -> StateEstimator
-
 StateEstimator.kt
 Status: PLANNED
-Purpose: Integrate heading + ML velocity into position, apply ZUPT
-  (Stationary) and non-holonomic constraint, blend with GNSS during
-  fusion/reacquisition. Supersedes Slice 3's BaselinePhysicsIntegrator
-  as the primary estimator once built (Slice 5) — BaselinePhysicsIntegrator
-  stays in the codebase as the measured physics-only comparison point
-  (CLAUDE.md Rule 3), not deleted.
+Purpose: Integrate heading + ML velocity into position, blend with GNSS
+  during fusion/reacquisition (actual position blending, Slice 7 — not
+  just mode display). ZUPT (StationaryDetector) and non-holonomic
+  constraint (NonHolonomicConstraint) are already IMPLEMENTED as of
+  Slice 5, applied directly to BaselinePhysicsIntegrator rather than
+  waiting for this file — see `## Slice 1+2+3+4+5` above. StateEstimator
+  will eventually supersede BaselineDeadReckoningRepository as the
+  primary estimator once ML velocity (Slice 6) and GNSS/DR fusion
+  (Slice 7) exist; BaselinePhysicsIntegrator stays in the codebase as
+  the measured physics-only comparison point (CLAUDE.md Rule 3), not
+  deleted.
 Connected to: everything above -> StateEstimator -> MapConstraint -> UI
 
 MapConstraint.kt
@@ -619,3 +908,78 @@ regression can be traced to a specific model version.
   (GNSS outage detection) — needed before phone-to-vehicle alignment
   (PRD.md Section 15) can be attempted, since that needs a GNSS-aided
   initialization window.
+- Slice 4 implemented (2026-08-25): new `gnss/` package. `GnssFix.kt`
+  (wall-clock-timestamped fix data, explicitly NOT reconciled against
+  boot-time sensor timestamps yet, CLAUDE.md Rule 9/14).
+  `GnssQuality.kt` (pure: is a fix good enough right now, by age +
+  accuracy). `GnssOutageDetector.kt` (pure: the GNSS_AIDED/TRANSITION/
+  DEAD_RECKONING/REACQUISITION hysteresis state machine, PRD.md
+  Section 18 — separate enter/exit dwell times per CLAUDE.md Rule 16,
+  every transition logged with trigger condition per Rule 17).
+  `LocationRepository.kt` (Android glue: FusedLocationProviderClient at
+  ~1 Hz, requires runtime ACCESS_FINE_LOCATION). `GnssModeRepository.kt`
+  (Android/coroutine glue: evaluates the detector on its own 5 Hz timer,
+  independent of the sensor pipeline so GNSS detection works even if
+  IMU sensors are unavailable — CLAUDE.md Rule 5). `MainActivity.kt`
+  now requests location permission at runtime
+  (ActivityResultContracts.RequestPermission) and displays live GNSS
+  mode/fix/last-transition. Added `GnssQualityTest.kt` and
+  `GnssOutageDetectorTest.kt` (13 cases, CLAUDE.md Rule 19) — including
+  explicit "one ms before the dwell threshold" boundary checks, not just
+  "eventually transitions." `./gradlew test` — all 32 tests pass.
+  TRANSITION/REACQUISITION are state-only in this slice; actual
+  GNSS/DR position blending is deferred to Slice 7 (Fusion /
+  re-alignment on GNSS reacquisition), matching CLAUDE.md's slice order.
+  On-device: hit and fixed a real bug in `BaselineDeadReckoningRepository`
+  (Slice 3 code) — the first accel sample of each run computed a
+  multi-thousand-second dt against a `0L` sentinel instead of treating
+  it as "no prior sample," sending the DR position to ~1e11 m
+  immediately on launch. Fixed with a nullable-Long sentinel (see that
+  file's entry above); re-verified via screenshot after the fix —
+  position/velocity now stay small at rest as expected. GNSS mode
+  readout confirmed via screenshot too: `DEAD_RECKONING` with the
+  correct trigger description, matching unit-tested behavior. Also hit
+  (and resolved) an unrelated ADB connectivity issue mid-session — the
+  Windows ADB USB interface got stuck in a stale `CM_PROB_PHANTOM`
+  driver state; restarting the ADB server and re-toggling USB debugging
+  on the phone fixed it, not a code or cable problem. Slice 1+2+3+4
+  complete and hardware-verified, no ML, no GNSS/DR fusion yet. Next:
+  Slice 5 (dead reckoning: state machine + ZUPT + non-holonomic
+  constraint).
+- Slice 5 implemented (2026-08-25): added `dr/StationaryDetector.kt`
+  (pure: sustained low accel+gyro magnitude, with the same dwell/
+  hysteresis principle as GnssOutageDetector, gates ZUPT — honestly
+  documented as unable to distinguish "at rest" from "coasting at
+  constant velocity," an inherent limit of accel/gyro-only ZUPT) and
+  `dr/NonHolonomicConstraint.kt` (pure: vector-projects velocity onto
+  device heading, suppressing the lateral component — a simplified
+  WORLD-frame stand-in for PRD.md Section 20's VEHICLE-frame constraint,
+  since phone-to-vehicle alignment doesn't exist yet; no Turning
+  exemption either, since the ML motion classifier is Slice 6).
+  Added `BaselinePhysicsIntegrator.overrideVelocity()` (sets velocity
+  only, leaves position untouched — distinct from `reset()`) as the
+  mechanism both corrections use. `BaselineDeadReckoningRepository.kt`
+  now depends on `GnssModeRepository` too: applies ZUPT/NHC every tick,
+  and resets the integrator every tick GNSS mode is GNSS_AIDED, so the
+  DR readout represents "distance traveled since GNSS was last good"
+  (PRD.md Section 28's actual drift-measurement target) rather than
+  drift since app launch — this is Slice 5's "state machine" wiring:
+  connecting Slice 4's previously-cosmetic mode to actually affect the
+  DR estimate, without yet blending GNSS and DR positions together
+  (that's Slice 7). `MainActivity.kt` construction order changed —
+  `GnssModeRepository` must now exist before `BaselineDeadReckoningRepository`.
+  Added `StationaryDetectorTest.kt` and `NonHolonomicConstraintTest.kt`
+  (12 cases total, CLAUDE.md Rule 19) plus 2 new BaselinePhysicsIntegratorTest
+  cases for `overrideVelocity()`. `./gradlew test` — all 46 tests pass.
+  Installed on the same S24 FE; two screenshots ~15 seconds apart at
+  rest confirmed position stays near-zero throughout (not just at
+  launch) — direct, visible proof ZUPT is working, versus Slice 4's
+  -0.85/-1.56 m drift over a similar period. The GNSS-mode-gated reset
+  couldn't be visually confirmed indoors (no real GPS lock available to
+  reach GNSS_AIDED) — verified by code inspection + existing
+  GnssOutageDetector tests instead; flagged for a direct outdoor check
+  later. Slice 1+2+3+4+5 complete and hardware-verified, no ML, no
+  GNSS/DR position fusion yet. Next: Slice 6 (ML inference: velocity +
+  motion classifier wired in) — requires Phase 4 dataset inspection
+  (PRD.md Section 24) first, since no training data has been looked at
+  yet.

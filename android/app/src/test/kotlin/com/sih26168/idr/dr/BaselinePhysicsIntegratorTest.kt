@@ -52,4 +52,29 @@ class BaselinePhysicsIntegratorTest {
         assertEquals(4.0, result.positionEastM, tolerance)
         assertEquals(-8.0, result.positionNorthM, tolerance)
     }
+
+    @Test
+    fun `overrideVelocity changes velocity but leaves position untouched`() {
+        val integrator = BaselinePhysicsIntegrator()
+        integrator.update(dtSeconds = 2.0, linearAccelEastMps2 = 1.0, linearAccelNorthMps2 = -2.0)
+        val positionBefore = integrator.currentState()
+
+        integrator.overrideVelocity(velocityEastMps = 0.0, velocityNorthMps = 0.0)
+        val after = integrator.currentState()
+
+        assertEquals(0.0, after.velocityEastMps, tolerance)
+        assertEquals(0.0, after.velocityNorthMps, tolerance)
+        assertEquals(positionBefore.positionEastM, after.positionEastM, tolerance)
+        assertEquals(positionBefore.positionNorthM, after.positionNorthM, tolerance)
+    }
+
+    @Test
+    fun `overridden velocity feeds into the next tick's position update`() {
+        val integrator = BaselinePhysicsIntegrator()
+        integrator.overrideVelocity(velocityEastMps = 3.0, velocityNorthMps = 0.0)
+        val result = integrator.update(dtSeconds = 2.0, linearAccelEastMps2 = 0.0, linearAccelNorthMps2 = 0.0)
+        // velocity unchanged (zero accel), position advances using the overridden velocity.
+        assertEquals(3.0, result.velocityEastMps, tolerance)
+        assertEquals(6.0, result.positionEastM, tolerance)
+    }
 }

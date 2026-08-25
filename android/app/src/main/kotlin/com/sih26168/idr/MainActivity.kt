@@ -1,8 +1,10 @@
 package com.sih26168.idr
 
+import android.Manifest
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -18,45 +20,79 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.sih26168.idr.dr.BaselineDeadReckoningRepository
 import com.sih26168.idr.dr.DeadReckoningState
+import com.sih26168.idr.gnss.GnssModeRepository
+import com.sih26168.idr.gnss.GnssModeUiState
+import com.sih26168.idr.gnss.LocationRepository
 import com.sih26168.idr.sensors.SensorRepository
 import com.sih26168.idr.sensors.SensorUiState
 
 /**
- * Slice 1+2+3 (per CLAUDE.md's slice order): reads live accelerometer,
- * gyroscope, and rotation-vector-derived orientation via
- * [SensorRepository]; feeds that into [BaselineDeadReckoningRepository]
- * for a naive WORLD-frame (not vehicle-frame) physics-only position
- * estimate; renders both live. No ML, no GNSS, no state machine yet —
- * those are later slices. Orientation is DEVICE-relative-to-WORLD frame
- * only (CLAUDE.md Rule 9/14) — no vehicle-frame alignment.
+ * Slice 1+2+3+4+5 (per CLAUDE.md's slice order): reads live
+ * accelerometer, gyroscope, and rotation-vector-derived orientation via
+ * [SensorRepository]; reads GNSS fixes via [LocationRepository] and runs
+ * the GNSS_AIDED/TRANSITION/DEAD_RECKONING/REACQUISITION hysteresis
+ * state machine via [GnssModeRepository]; feeds sensors + GNSS mode into
+ * [BaselineDeadReckoningRepository] for a WORLD-frame (not vehicle-frame)
+ * physics position estimate corrected by ZUPT and a non-holonomic
+ * constraint; renders all of it live. No ML, no actual fusion between
+ * GNSS and the DR position estimate yet (Slice 7) — those are later
+ * slices. Orientation is DEVICE-relative-to-WORLD frame only (CLAUDE.md
+ * Rule 9/14) — no vehicle-frame alignment.
  */
 class MainActivity : ComponentActivity() {
 
     private lateinit var sensorRepository: SensorRepository
     private lateinit var deadReckoningRepository: BaselineDeadReckoningRepository
+    private lateinit var locationRepository: LocationRepository
+    private lateinit var gnssModeRepository: GnssModeRepository
+
+    // Must be registered before the activity reaches STARTED — a property
+    // initializer (runs during construction, before onCreate) satisfies that.
+    private val requestLocationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            locationRepository.start()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         sensorRepository = SensorRepository(applicationContext)
-        deadReckoningRepository = BaselineDeadReckoningRepository(sensorRepository, lifecycleScope)
+        locationRepository = LocationRepository(applicationContext)
+        // GnssModeRepository must exist before BaselineDeadReckoningRepository —
+        // Slice 5 wires the DR odometer's reset behavior to the GNSS mode.
+        gnssModeRepository = GnssModeRepository(locationRepository, lifecycleScope)
+        deadReckoningRepository = BaselineDeadReckoningRepository(sensorRepository, gnssModeRepository, lifecycleScope)
 
         setContent {
             val uiState by sensorRepository.state.collectAsState()
             val drState by deadReckoningRepository.state.collectAsState()
-            IdrSensorScreen(uiState, drState, sensorRepository.hasRequiredSensors())
+            val gnssState by gnssModeRepository.state.collectAsState()
+            IdrSensorScreen(uiState, drState, gnssState, sensorRepository.hasRequiredSensors())
         }
     }
 
-    // Sensors are only registered while the activity is visible, so the
+    // Sensors/GNSS are only active while the activity is visible, so the
     // demo doesn't drain battery/CPU in the background — start/stop is
     // tied to the standard Android lifecycle, not a custom one.
     override fun onResume() {
         super.onResume()
         sensorRepository.start()
+        gnssModeRepository.start()
+        if (locationRepository.hasLocationPermission()) {
+            locationRepository.start()
+        } else {
+            requestLocationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        // Started after gnssModeRepository so its GNSS-mode-gated reset
+        // (Slice 5) reads an already-ticking mode, not just the default.
         deadReckoningRepository.start()
     }
 
     override fun onPause() {
+        gnssModeRepository.stop()
+        locationRepository.stop()
         deadReckoningRepository.stop()
         sensorRepository.stop()
         super.onPause()
@@ -67,6 +103,7 @@ class MainActivity : ComponentActivity() {
 private fun IdrSensorScreen(
     state: SensorUiState,
     drState: DeadReckoningState,
+    gnssState: GnssModeUiState,
     hasRequiredSensors: Boolean,
 ) {
     MaterialTheme {
@@ -77,7 +114,7 @@ private fun IdrSensorScreen(
                     .padding(24.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text(text = "IDR MVP — Slice 3: live sensor + orientation + baseline physics DR")
+                Text(text = "IDR MVP — Slice 5: + ZUPT + non-holonomic constraint")
 
                 if (!hasRequiredSensors) {
                     Text(text = "This device is missing an accelerometer, gyroscope, or rotation-vector sensor.")
@@ -127,7 +164,7 @@ private fun IdrSensorScreen(
                 Text(text = "Orientation observed rate: %.1f Hz".format(state.orientationHz))
 
                 Text(
-                    text = "Baseline physics DR (WORLD frame, m from start): " +
+                    text = "Baseline physics DR (WORLD frame, m since GNSS last good): " +
                         "east=%.2f north=%.2f".format(drState.positionEastM, drState.positionNorthM),
                 )
                 Text(
@@ -136,8 +173,34 @@ private fun IdrSensorScreen(
                     ),
                 )
                 Text(
-                    text = "^ naive double-integration of raw accel, no ZUPT/bias " +
-                        "correction yet — expect rapid, unbounded drift (Slice 3 baseline only).",
+                    text = "^ ZUPT (zero-velocity when stationary) and a simplified " +
+                        "non-holonomic constraint are applied (Slice 5), but there is " +
+                        "still no accelerometer bias correction and no vehicle-frame " +
+                        "alignment — still expect drift during real motion.",
+                )
+
+                Text(text = "GNSS mode: ${gnssState.mode}")
+                if (!gnssState.hasLocationPermission) {
+                    Text(text = "Location permission not granted — GNSS mode above reflects 'no fix' only.")
+                }
+                val fix = gnssState.latestFix
+                Text(
+                    text = if (fix != null) {
+                        "GNSS fix: lat=%.6f lon=%.6f accuracy=%.1fm age=%dms".format(
+                            fix.latitudeDeg, fix.longitudeDeg, fix.accuracyM, gnssState.fixAgeMs,
+                        )
+                    } else {
+                        "GNSS fix: none yet"
+                    },
+                )
+                val transition = gnssState.lastTransition
+                Text(
+                    text = if (transition != null) {
+                        "Last transition: ${transition.fromMode} -> ${transition.toMode} " +
+                            "(${transition.triggerDescription})"
+                    } else {
+                        "Last transition: none yet"
+                    },
                 )
             }
         }

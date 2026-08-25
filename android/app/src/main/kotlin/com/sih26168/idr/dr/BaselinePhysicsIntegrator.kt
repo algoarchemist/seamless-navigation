@@ -23,13 +23,17 @@ data class DeadReckoningState(
  *
  * This is the PRD.md Section 32 "physics baseline" fallback path — a
  * deliberately naive reference, not a production estimator. Raw MEMS
- * accelerometer bias and noise are never corrected here (no ZUPT, no
- * bias estimation, no non-holonomic constraint — those belong to
- * Slice 5's Dead Reckoning state machine), so position error is
- * expected to grow rapidly and unboundedly over more than a few
- * seconds. That is the intended, honest behavior of a physics-only
- * baseline (CLAUDE.md Rule 3: ML is only justified once compared
- * against a real measurement of how bad this baseline actually is).
+ * accelerometer bias and noise are not corrected by [update] itself (no
+ * bias estimation) — ZUPT and the non-holonomic constraint (Slice 5,
+ * see [StationaryDetector] / [NonHolonomicConstraint]) are applied by
+ * the caller via [overrideVelocity] after each [update], not inside
+ * this class, so this class stays a pure, minimal integrator (CLAUDE.md
+ * Rule 5). Without those corrections applied, position error grows
+ * rapidly and unboundedly over more than a few seconds — that was the
+ * intended, honest behavior of the Slice 3 baseline before Slice 5's
+ * corrections existed, and remains true of [update] in isolation
+ * (CLAUDE.md Rule 3: ML is only justified once compared against a real
+ * measurement of how bad this baseline actually is).
  */
 class BaselinePhysicsIntegrator {
 
@@ -61,6 +65,18 @@ class BaselinePhysicsIntegrator {
     }
 
     fun currentState(): DeadReckoningState = state
+
+    /**
+     * Overrides velocity only, leaving position untouched — the
+     * mechanism Slice 5's ZUPT (override to zero when stationary) and
+     * non-holonomic constraint (override to the lateral-suppressed
+     * value) both use. Deliberately separate from [reset] (which also
+     * zeroes position) — these corrections must not discard legitimate
+     * accumulated position just because velocity needed adjusting.
+     */
+    fun overrideVelocity(velocityEastMps: Double, velocityNorthMps: Double) {
+        state = state.copy(velocityEastMps = velocityEastMps, velocityNorthMps = velocityNorthMps)
+    }
 
     /** Zeroes position and velocity — used when (re)starting a DR run. */
     fun reset() {
