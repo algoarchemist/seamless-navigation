@@ -31,3 +31,32 @@ data class GyroSample(
     val yRadPerSec: Float,
     val zRadPerSec: Float,
 )
+
+/**
+ * A single orientation reading: DEVICE orientation relative to the
+ * WORLD/EARTH frame (East-North-Up), NOT vehicle frame (CLAUDE.md
+ * Rule 9/14). Derived from Android's TYPE_ROTATION_VECTOR sensor fusion
+ * output via [OrientationMath]. Units: rad, per PRD.md Section 11's
+ * "device rotation vector as the base orientation source" — see
+ * [OrientationAngles] for the azimuth/pitch/roll convention.
+ *
+ * Phone-to-vehicle alignment (PRD.md Section 15) is NOT applied here —
+ * that requires a GNSS-aided initialization window and is a later slice.
+ */
+data class OrientationSample(
+    val timestampNs: Long,
+    val azimuthRad: Float,
+    val pitchRad: Float,
+    val rollRad: Float,
+    // Row-major 3x3 rotation matrix, DEVICE frame -> WORLD frame (the same
+    // matrix azimuth/pitch/roll above were extracted from). Kept alongside
+    // the human-readable angles because Slice 3 (baseline physics) needs
+    // to rotate a 3D accelerometer vector into world frame directly —
+    // reconstructing a rotation matrix back out of azimuth/pitch/roll
+    // afterward would be lossier and more error-prone than keeping the
+    // matrix OrientationMath already computed. List<Float>, not
+    // FloatArray, so this data class gets correct structural equals()
+    // (Kotlin data classes compare FloatArray fields by reference, which
+    // is a well-known footgun).
+    val rotationMatrixDeviceToWorld: List<Float>,
+)

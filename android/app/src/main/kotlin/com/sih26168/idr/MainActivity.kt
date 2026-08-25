@@ -15,26 +15,35 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.lifecycleScope
+import com.sih26168.idr.dr.BaselineDeadReckoningRepository
+import com.sih26168.idr.dr.DeadReckoningState
 import com.sih26168.idr.sensors.SensorRepository
 import com.sih26168.idr.sensors.SensorUiState
 
 /**
- * Slice 1 (Android sensor -> live sensor display, per CLAUDE.md's slice
- * order): reads live accelerometer + gyroscope via [SensorRepository]
- * and renders the latest sample plus observed delivery rate. No
- * orientation, fusion, GNSS, or ML yet — those are later slices.
+ * Slice 1+2+3 (per CLAUDE.md's slice order): reads live accelerometer,
+ * gyroscope, and rotation-vector-derived orientation via
+ * [SensorRepository]; feeds that into [BaselineDeadReckoningRepository]
+ * for a naive WORLD-frame (not vehicle-frame) physics-only position
+ * estimate; renders both live. No ML, no GNSS, no state machine yet —
+ * those are later slices. Orientation is DEVICE-relative-to-WORLD frame
+ * only (CLAUDE.md Rule 9/14) — no vehicle-frame alignment.
  */
 class MainActivity : ComponentActivity() {
 
     private lateinit var sensorRepository: SensorRepository
+    private lateinit var deadReckoningRepository: BaselineDeadReckoningRepository
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         sensorRepository = SensorRepository(applicationContext)
+        deadReckoningRepository = BaselineDeadReckoningRepository(sensorRepository, lifecycleScope)
 
         setContent {
             val uiState by sensorRepository.state.collectAsState()
-            IdrSensorScreen(uiState, sensorRepository.hasRequiredSensors())
+            val drState by deadReckoningRepository.state.collectAsState()
+            IdrSensorScreen(uiState, drState, sensorRepository.hasRequiredSensors())
         }
     }
 
@@ -44,16 +53,22 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         sensorRepository.start()
+        deadReckoningRepository.start()
     }
 
     override fun onPause() {
+        deadReckoningRepository.stop()
         sensorRepository.stop()
         super.onPause()
     }
 }
 
 @Composable
-private fun IdrSensorScreen(state: SensorUiState, hasRequiredSensors: Boolean) {
+private fun IdrSensorScreen(
+    state: SensorUiState,
+    drState: DeadReckoningState,
+    hasRequiredSensors: Boolean,
+) {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
             Column(
@@ -62,10 +77,10 @@ private fun IdrSensorScreen(state: SensorUiState, hasRequiredSensors: Boolean) {
                     .padding(24.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text(text = "IDR MVP — Slice 1: live sensor display")
+                Text(text = "IDR MVP — Slice 3: live sensor + orientation + baseline physics DR")
 
                 if (!hasRequiredSensors) {
-                    Text(text = "This device is missing an accelerometer or gyroscope.")
+                    Text(text = "This device is missing an accelerometer, gyroscope, or rotation-vector sensor.")
                     return@Column
                 }
 
@@ -92,6 +107,38 @@ private fun IdrSensorScreen(state: SensorUiState, hasRequiredSensors: Boolean) {
                     },
                 )
                 Text(text = "Gyro observed rate: %.1f Hz".format(state.gyroHz))
+
+                val orientation = state.latestOrientation
+                Text(
+                    text = if (orientation != null) {
+                        // rad -> deg conversion happens only here, at the
+                        // human-display boundary (CLAUDE.md Rule 15) —
+                        // every internal value stays in radians.
+                        "Orientation (device-vs-world frame, deg): " +
+                            "azimuth=%.1f pitch=%.1f roll=%.1f".format(
+                                Math.toDegrees(orientation.azimuthRad.toDouble()),
+                                Math.toDegrees(orientation.pitchRad.toDouble()),
+                                Math.toDegrees(orientation.rollRad.toDouble()),
+                            )
+                    } else {
+                        "Orientation: waiting for first sample..."
+                    },
+                )
+                Text(text = "Orientation observed rate: %.1f Hz".format(state.orientationHz))
+
+                Text(
+                    text = "Baseline physics DR (WORLD frame, m from start): " +
+                        "east=%.2f north=%.2f".format(drState.positionEastM, drState.positionNorthM),
+                )
+                Text(
+                    text = "Baseline physics DR velocity (m/s): east=%.2f north=%.2f".format(
+                        drState.velocityEastMps, drState.velocityNorthMps,
+                    ),
+                )
+                Text(
+                    text = "^ naive double-integration of raw accel, no ZUPT/bias " +
+                        "correction yet — expect rapid, unbounded drift (Slice 3 baseline only).",
+                )
             }
         }
     }

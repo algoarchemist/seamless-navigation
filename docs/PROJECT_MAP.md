@@ -5,16 +5,21 @@ added, removed, or has its responsibility/interface changed
 (CLAUDE.md Rule 6/21). This is written to teach the pipeline, not just
 list files — when in doubt, explain *why*, not just *what*.
 
-Status as of last update: **Phase 0 scaffold + Slice 1 implemented and
-on-device verified.** The folder/build-system skeleton
-(`## Scaffold Status`) and Slice 1 (Android sensor -> live sensor
-display, `## Slice 1`) are real, build-verified, and now confirmed
-running on a real Samsung Galaxy S24 FE (Android 16 / One UI 8.5) with
-live accel/gyro readout at ~12.5 Hz observed. Everything else under
-`## Planned File Map` is still a target derived from PRD.md — no
-orientation, ML, state-machine, fusion, or map-matching code exists
-yet. Each entry gets flipped from `PLANNED` to `IMPLEMENTED` (with the
-fields below filled in for real) as it is actually built.
+Status as of last update: **Phase 0 scaffold + Slice 1+2+3 implemented
+and on-device verified.** The folder/build-system skeleton
+(`## Scaffold Status`) and Slice 1+2+3 (Android sensor -> live sensor
+display, sensor -> orientation, sensor -> baseline physics
+velocity/position, `## Slice 1+2+3`) are real, build-verified, and now
+confirmed running on a real Samsung Galaxy S24 FE (Android 16 / One UI
+8.5) with live accel/gyro readout at ~12.5 Hz observed, live
+azimuth/pitch/roll orientation, and a live (expectedly drifting)
+WORLD-frame position/velocity estimate all confirmed updating on
+screen. Everything else under `## Planned File Map` is still a target
+derived from PRD.md — no vehicle-frame alignment, ML, state-machine,
+fusion, or map-matching code exists yet. Each entry gets flipped from
+`PLANNED` to
+`IMPLEMENTED` (with the fields below filled in for real) as it is
+actually built.
 
 ---
 
@@ -131,91 +136,278 @@ Purpose: Excludes Android/Gradle build output, `local.properties`,
   `./gradlew` works on a fresh clone with no Android Studio sync first.
 ```
 
-No orientation, ML, state-machine, fusion, or map-matching code exists
-yet — everything below this line (past `## Slice 1`) is still the
-Slice-2-onward target, unchanged from the original plan.
+No ML, state-machine, fusion, or map-matching code exists yet —
+everything below this line (past `## Slice 1+2+3`) is still the
+Slice-4-onward target, unchanged from the original plan.
 
 ---
 
-## Slice 1 — Android sensor -> live sensor display (implemented)
+## Slice 1+2+3 — live sensor display, sensor -> orientation, sensor -> baseline physics velocity/position (implemented)
 
 ```
 android/app/src/main/kotlin/com/sih26168/idr/sensors/SensorSample.kt
 Status: IMPLEMENTED
-Purpose: Data classes for a single accelerometer/gyroscope reading.
+Purpose: Data classes for a single accelerometer/gyroscope/orientation
+  reading.
 Outputs: AccelSample(timestampNs, xMps2, yMps2, zMps2),
-  GyroSample(timestampNs, xRadPerSec, yRadPerSec, zRadPerSec).
-Important concepts/assumptions: values are in DEVICE frame (raw, not
-  gravity-compensated, not rotated to vehicle frame — that is Slice 2)
-  per CLAUDE.md Rule 9/14. timestampNs is Android's SensorEvent.timestamp
-  — boot-time monotonic nanoseconds, NOT wall-clock — per PRD.md
+  GyroSample(timestampNs, xRadPerSec, yRadPerSec, zRadPerSec),
+  OrientationSample(timestampNs, azimuthRad, pitchRad, rollRad).
+Important concepts/assumptions: AccelSample/GyroSample are DEVICE frame
+  (raw, not gravity-compensated, not rotated to vehicle frame) per
+  CLAUDE.md Rule 9/14. timestampNs is Android's SensorEvent.timestamp —
+  boot-time monotonic nanoseconds, NOT wall-clock — per PRD.md
   Section 11 / CLAUDE.md Rule 14; nothing here reconciles it against
   GNSS/wall-clock time yet, since GNSS isn't read until a later slice.
+  OrientationSample is DEVICE-relative-to-WORLD/EARTH frame (Slice 2,
+  see OrientationMath.kt below) — explicitly NOT vehicle frame. Vehicle-
+  frame alignment (PRD.md Section 15) needs a GNSS-aided initialization
+  window and cannot be built before GNSS is read (later slice).
+  Extended in Slice 3 with rotationMatrixDeviceToWorld (List<Float>,
+  9 elements, row-major) — the same device->world rotation matrix
+  azimuth/pitch/roll were extracted from, kept alongside them because
+  Slice 3's WorldFrameAcceleration needs to rotate a raw 3D accel vector
+  directly; reconstructing a matrix back out of azimuth/pitch/roll would
+  be lossier/more error-prone than keeping the one already computed.
+  Uses List<Float> rather than FloatArray specifically so this data
+  class's generated equals()/hashCode() stay structurally correct
+  (Kotlin data classes compare FloatArray fields by reference).
 
 android/app/src/main/kotlin/com/sih26168/idr/sensors/SampleRate.kt
 Status: IMPLEMENTED
-Purpose: Pure function converting a timestamp delta (ns) to an observed
-  Hz, with no Android dependency so it is unit-testable on the plain JVM
-  (CLAUDE.md Rule 19).
-Important functions: SampleRate.hzFromDeltaNs(deltaNs: Long): Double —
-  returns 0.0 for zero/negative deltas rather than dividing by zero or
-  returning a nonsense negative rate.
-Connected to: SensorRepository -> SampleRate -> SensorUiState.accelHz/gyroHz
+Purpose: Pure functions converting a timestamp delta (ns) to an observed
+  Hz or to elapsed seconds, with no Android dependency so both are
+  unit-testable on the plain JVM (CLAUDE.md Rule 19).
+Important functions: SampleRate.hzFromDeltaNs(deltaNs: Long): Double;
+  SampleRate.secondsFromDeltaNs(deltaNs: Long): Double (added Slice 3,
+  for BaselinePhysicsIntegrator's dt). Both return 0.0 for zero/negative
+  deltas rather than dividing by zero or returning nonsense negative
+  values — callers must treat 0.0 as "skip this step."
+Connected to: SensorRepository -> SampleRate -> SensorUiState.accelHz/gyroHz/orientationHz;
+  BaselineDeadReckoningRepository -> SampleRate.secondsFromDeltaNs -> BaselinePhysicsIntegrator
 
 android/app/src/main/kotlin/com/sih26168/idr/sensors/SensorRepository.kt
 Status: IMPLEMENTED
-Purpose: Registers accelerometer + gyroscope listeners at a requested
-  ~10 Hz (100,000 us sampling period, PRD.md Section 8/11) and publishes
-  the latest sample of each plus its *observed* delivery rate.
+Purpose: Registers accelerometer + gyroscope + rotation-vector listeners
+  at a requested ~10 Hz (100,000 us sampling period, PRD.md
+  Section 8/11), converts rotation-vector quaternion samples to
+  azimuth/pitch/roll + rotation matrix via OrientationMath, and
+  publishes the latest sample of each plus its *observed* delivery rate.
+  Still only raw IO + orientation — no physics integration happens here
+  (that's BaselineDeadReckoningRepository, a separate consumer, per
+  CLAUDE.md Rule 5's one-responsibility-per-file).
 Inputs: android.content.Context (for SensorManager).
-Outputs: StateFlow<SensorUiState> — {latestAccel, latestGyro, accelHz, gyroHz}.
+Outputs: StateFlow<SensorUiState> — {latestAccel, latestGyro,
+  latestOrientation, accelHz, gyroHz, orientationHz}.
 Connected to: MainActivity -> SensorRepository -> (StateFlow) -> Compose UI
+  ; SensorRepository -> OrientationMath (pure function, orientation
+  conversion only, no reverse dependency)
 Important functions/classes: start()/stop() (lifecycle-tied — called
   from onResume/onPause, not onCreate/onDestroy, so sensors aren't
-  active while backgrounded); hasRequiredSensors().
+  active while backgrounded); hasRequiredSensors() (now also requires
+  TYPE_ROTATION_VECTOR).
 Important concepts/assumptions: listener callbacks run on a dedicated
   background HandlerThread ("SensorRepositoryThread"), never the
   main/UI thread, per CLAUDE.md Android Rule 7. StateFlow is the
   thread-safe hand-back point — its value can be written from the
   background thread and read from Compose on the main thread with no
   extra locking. Requesting a 100 ms period does not guarantee Android
-  actually delivers at exactly 10 Hz; accelHz/gyroHz expose the real
-  observed rate live so a demo-time stall or platform throttling is
-  visible rather than assumed away (CLAUDE.md Rule 10).
+  actually delivers at exactly 10 Hz; accelHz/gyroHz/orientationHz
+  expose the real observed rate live so a demo-time stall or platform
+  throttling is visible rather than assumed away (CLAUDE.md Rule 10).
+  Rotation-vector's scalar quaternion component (w) is read from
+  event.values[3] when present, else derived defensively via
+  OrientationMath.scalarFromVectorPart (older devices/edge case).
+
+android/app/src/main/kotlin/com/sih26168/idr/sensors/OrientationMath.kt
+Status: IMPLEMENTED
+Purpose: Pure-Kotlin (no android.* import) conversion from a rotation-
+  vector quaternion to azimuth/pitch/roll radians, mirroring AOSP
+  SensorManager.getRotationMatrixFromVector + getOrientation exactly so
+  on-device output matches this math, not just approximates it.
+  Unit-testable on the plain JVM (CLAUDE.md Rule 19), same pattern as
+  SampleRate.kt.
+Inputs: quaternion (x, y, z, w) — device-frame -> world-frame rotation,
+  per Android's TYPE_ROTATION_VECTOR convention.
+Outputs: OrientationAngles(azimuthRad, pitchRad, rollRad) — DEVICE
+  orientation relative to WORLD/EARTH (ENU) frame. azimuth is
+  clockwise-positive from magnetic north (Android's compass-bearing
+  convention), NOT the counterclockwise-positive convention a raw
+  quaternion rotation about +Z would suggest — verified explicitly in
+  OrientationMathTest (see below), not assumed.
+Important functions: quaternionToRotationMatrix, rotationMatrixToOrientation,
+  orientationFromQuaternion, scalarFromVectorPart (clamps to avoid NaN
+  from sqrt(negative) when floating-point error pushes a should-be-unit
+  quaternion's vector-part norm fractionally above 1.0). SensorRepository
+  now calls quaternionToRotationMatrix + rotationMatrixToOrientation
+  directly (rather than the orientationFromQuaternion convenience
+  wrapper) so it can keep the intermediate rotation matrix for
+  OrientationSample.rotationMatrixDeviceToWorld (Slice 3 need) instead
+  of discarding it.
+Connected to: SensorRepository -> OrientationMath -> SensorUiState.latestOrientation
+
+android/app/src/main/kotlin/com/sih26168/idr/dr/WorldFrameAcceleration.kt
+Status: IMPLEMENTED
+Purpose: Pure-Kotlin (no android.* import) math to rotate a raw DEVICE-
+  frame accelerometer reading into WORLD frame (East, North, Up) using
+  Slice 2's rotation matrix, then subtract standard gravity to get
+  motion-caused linear acceleration. Explicitly WORLD frame, NOT vehicle
+  frame (CLAUDE.md Rule 9/14) — works regardless of phone mounting,
+  which is exactly why it's in-scope before phone-to-vehicle alignment
+  (PRD.md Section 15, still PLANNED, needs GNSS) exists.
+Inputs: device-frame accel (x, y, z, m/s^2) + rotationMatrixDeviceToWorld
+  (List<Float>, 9 elements, from OrientationSample).
+Outputs: WORLD-frame linear acceleration (East, North, Up components,
+  m/s^2), gravity removed.
+Important functions: rotateDeviceToWorld (row-major matrix-vector
+  multiply), removeGravity (subtracts STANDARD_GRAVITY_MPS2 = 9.80665
+  from the Up component only — a fixed approximation, not a per-location
+  measured value; documented as negligible next to raw MEMS bias/noise).
+Connected to: BaselineDeadReckoningRepository -> WorldFrameAcceleration -> BaselinePhysicsIntegrator
+
+android/app/src/main/kotlin/com/sih26168/idr/dr/BaselinePhysicsIntegrator.kt
+Status: IMPLEMENTED
+Purpose: Double-integrates WORLD-frame linear acceleration into a 2D
+  (East, North) position/velocity estimate via semi-implicit Euler
+  (velocity updated from acceleration first, then position from the new
+  velocity — more numerically stable than naive explicit Euler, still a
+  one-line-per-step method appropriate for a 36-hour MVP, CLAUDE.md
+  Rule 18). This is PRD.md Section 32's "physics baseline" fallback path
+  — deliberately naive, with no ZUPT/bias correction/non-holonomic
+  constraint (those are Slice 5), so position error is EXPECTED to grow
+  rapidly and unboundedly, even sitting still. That is the honest,
+  intended behavior of a physics-only baseline, not a bug — its purpose
+  is to be the measured reference Slice 6's ML velocity model must beat
+  (CLAUDE.md Rule 3).
+Inputs: dtSeconds, linearAccelEastMps2, linearAccelNorthMps2 per tick.
+Outputs: DeadReckoningState(positionEastM, positionNorthM,
+  velocityEastMps, velocityNorthMps) — relative to wherever integration
+  started; not yet tied to a real lat/lon (no GNSS fusion until a later
+  slice).
+Important functions/classes: update() (no-op on dtSeconds <= 0.0, same
+  clock-reset guard convention as Slice 1's Hz calculation), reset(),
+  currentState().
+Connected to: BaselineDeadReckoningRepository -> BaselinePhysicsIntegrator -> DeadReckoningState
+
+android/app/src/main/kotlin/com/sih26168/idr/dr/BaselineDeadReckoningRepository.kt
+Status: IMPLEMENTED
+Purpose: Android/coroutine glue connecting SensorRepository's raw
+  accel + orientation StateFlow to the pure WorldFrameAcceleration +
+  BaselinePhysicsIntegrator math, republishing the running position
+  estimate as its own StateFlow. Kept as a separate class from
+  SensorRepository (CLAUDE.md Rule 5) — SensorRepository owns raw
+  sensor IO only, this owns turning that stream into a physics estimate.
+Inputs: SensorRepository (read-only, via its StateFlow), a
+  CoroutineScope (MainActivity's lifecycleScope) to collect on.
+Outputs: StateFlow<DeadReckoningState>.
+Connected to: SensorRepository -> BaselineDeadReckoningRepository -> MainActivity (Compose UI)
+Important functions/classes: start()/stop() (lifecycle-tied, same
+  pattern as SensorRepository), lastProcessedAccelTimestampNs (guards
+  against reprocessing — SensorRepository's StateFlow re-emits on every
+  gyro/orientation update too, not just accel, so this dedupes by accel
+  timestamp before running an integration step).
+Important concepts/assumptions: orientation and accel come from
+  independent sensor listeners a few ms apart at ~10 Hz; using the
+  latest available orientation for the current accel sample is an
+  accepted, documented approximation for this baseline (CLAUDE.md
+  Rule 9/14), not a silently-ignored timing mismatch.
 
 android/app/src/main/kotlin/com/sih26168/idr/MainActivity.kt
 Status: IMPLEMENTED
-Purpose: Slice 1 entry point — instantiates SensorRepository, starts/
-  stops it on onResume/onPause, and renders the latest accel/gyro sample
-  plus observed Hz via a Compose screen (IdrSensorScreen).
-Connected to: SensorRepository -> MainActivity -> IdrSensorScreen (Compose)
-Important concepts/assumptions: no orientation math, no filtering, no
-  GNSS — purely a live readout to prove the sensor pipeline works
-  end-to-end without blocking the UI thread.
+Purpose: Slice 1+2+3 entry point — instantiates SensorRepository and
+  BaselineDeadReckoningRepository, starts/stops both on onResume/onPause,
+  and renders the latest accel/gyro/orientation sample plus observed Hz
+  and the live baseline-physics position/velocity via a Compose screen
+  (IdrSensorScreen).
+Connected to: SensorRepository -> MainActivity -> IdrSensorScreen (Compose);
+  SensorRepository -> BaselineDeadReckoningRepository -> MainActivity -> IdrSensorScreen
+Important concepts/assumptions: orientation is displayed in degrees but
+  every internal value stays in radians — the rad->deg conversion
+  happens only at this UI display boundary (CLAUDE.md Rule 15), never
+  silently earlier in the pipeline. The DR readout is captioned on-screen
+  as a naive baseline expected to drift, so a demo viewer isn't misled
+  into thinking it's an accurate position (CLAUDE.md Rule 13's honesty
+  requirement extended to in-app copy, not just final reported metrics).
+  No filtering, no GNSS, no ML yet — purely a live readout proving the
+  sensor + orientation + physics-integration pipeline works end-to-end
+  without blocking the UI thread.
 
 android/app/src/test/kotlin/com/sih26168/idr/sensors/SampleRateTest.kt
 Status: IMPLEMENTED
-Purpose: JUnit4 unit test for SampleRate.hzFromDeltaNs — 100 ms -> 10 Hz,
-  20 ms -> 50 Hz, zero delta -> 0.0, negative delta -> 0.0 (clock-reset
-  guard). Satisfies CLAUDE.md Rule 19 before anything downstream (the
-  live Hz readout) relies on this math.
+Purpose: JUnit4 unit test for SampleRate.hzFromDeltaNs and
+  secondsFromDeltaNs — 100 ms -> 10 Hz / 0.1 s, 20 ms -> 50 Hz, zero/
+  negative delta -> 0.0 (clock-reset guard, both functions). Satisfies
+  CLAUDE.md Rule 19 before anything downstream (the live Hz readout,
+  and Slice 3's dt calculation) relies on this math.
+
+android/app/src/test/kotlin/com/sih26168/idr/sensors/OrientationMathTest.kt
+Status: IMPLEMENTED
+Purpose: JUnit4 unit tests for OrientationMath — identity quaternion ->
+  zero azimuth/pitch/roll; a known 90-degree yaw quaternion -> -90-degree
+  azimuth (catches the clockwise-vs-counterclockwise sign convention
+  mismatch between Android's compass-bearing azimuth and a raw
+  quaternion rotation — this test caught a wrong sign assumption during
+  development, per CLAUDE.md Rule 19's purpose); scalar-derivation
+  matches an explicit w; scalar derivation clamps instead of NaN-ing on
+  floating-point norm overshoot; identity quaternion -> identity
+  rotation matrix.
+
+android/app/src/test/kotlin/com/sih26168/idr/dr/WorldFrameAccelerationTest.kt
+Status: IMPLEMENTED
+Purpose: JUnit4 unit tests for WorldFrameAcceleration — identity
+  rotation leaves a vector unchanged; a non-identity rotation matrix
+  correctly routes device axes per a real row-major matrix-vector
+  multiply (not a pass-through bug); a stationary at-rest device reading
+  is near-zero after removeGravity (the whole-pipeline "sitting still"
+  case removeGravity exists to handle); removeGravity only touches the
+  Up component, East/North pass through unchanged.
+
+android/app/src/test/kotlin/com/sih26168/idr/dr/BaselinePhysicsIntegratorTest.kt
+Status: IMPLEMENTED
+Purpose: JUnit4 unit tests for BaselinePhysicsIntegrator — dtSeconds <= 0
+  is a no-op; ten ticks of constant 1 m/s^2 east acceleration at
+  dt=0.1s match the closed-form semi-implicit-Euler analytic result
+  (v=1.0 m/s, pos=0.55 m — hand-derived, not just "close enough");
+  reset() zeroes state; East and North integrate independently of each
+  other. Satisfies CLAUDE.md Rule 19 before this math is trusted for any
+  reported drift number (PRD.md Section 28).
 ```
 
-**Build verification (this environment, 2026-08-24):**
-- `./gradlew.bat test` — BUILD SUCCESSFUL, all 4 SampleRateTest cases pass.
-- `./gradlew.bat assembleDebug` — BUILD SUCCESSFUL, produces
-  `android/app/build/outputs/apk/debug/app-debug.apk` (~76 MB — see the
-  "Known issue" note on `app/build.gradle.kts` above).
-- **On-device verification (2026-08-25): done.** Installed via
-  `./gradlew.bat installDebug` on a real Samsung Galaxy S24 FE
-  (SM-S721B, Android 16 / One UI 8.5) connected over USB with ADB
-  debugging authorized. `MainActivity` launched, live accel/gyro values
-  update on screen, and observed sample rate reads **~12.5 Hz** against
-  the requested ~10 Hz (100,000 us period) — confirms CLAUDE.md Rule 10
-  (real observed rate, not assumed) and that Android delivered faster
-  than the requested period rather than throttling below it. Slice 1 is
-  now fully verified end-to-end on real hardware with real sensors, no
-  faked data. Ready to start Slice 2 (sensor -> orientation).
+**Build verification (this environment):**
+- Slice 1 (2026-08-24): `./gradlew.bat test` — BUILD SUCCESSFUL, all 4
+  SampleRateTest cases pass. `./gradlew.bat assembleDebug` — BUILD
+  SUCCESSFUL, produces `android/app/build/outputs/apk/debug/app-debug.apk`
+  (~76 MB — see the "Known issue" note on `app/build.gradle.kts` above).
+- Slice 1 on-device (2026-08-25): installed via `./gradlew.bat
+  installDebug` on a real Samsung Galaxy S24 FE (SM-S721B, Android 16 /
+  One UI 8.5) connected over USB with ADB debugging authorized.
+  `MainActivity` launched, live accel/gyro values update on screen, and
+  observed sample rate reads **~12.5 Hz** against the requested ~10 Hz
+  (100,000 us period) — confirms CLAUDE.md Rule 10 (real observed rate,
+  not assumed) and that Android delivered faster than the requested
+  period rather than throttling below it.
+- Slice 2 (2026-08-25): `./gradlew.bat test` — BUILD SUCCESSFUL, all 9
+  tests pass (4 SampleRateTest + 5 OrientationMathTest). One test's
+  expected sign was initially wrong (assumed a +90-degree quaternion
+  yaw reads as +90-degree azimuth) and the test caught it before it
+  reached the device — Android's azimuth is clockwise-positive, a raw
+  quaternion rotation about +Z is counterclockwise-positive, so the
+  correct expected value is -90 degrees; fixed in the test, not by
+  changing the math (the math was transcribed directly from AOSP's own
+  algorithm and re-verified by hand). Then `./gradlew.bat installDebug`
+  onto the same S24 FE — live orientation (azimuth/pitch/roll, degrees)
+  confirmed updating on screen alongside accel/gyro, user-verified.
+  Slice 1+2 now fully verified end-to-end on real hardware with real
+  sensors, no faked data. Ready to start Slice 3 (sensor -> baseline
+  physics velocity/position).
+- Slice 3 (2026-08-25): `./gradlew.bat test` — BUILD SUCCESSFUL, all 19
+  tests pass (6 SampleRateTest + 5 OrientationMathTest +
+  4 WorldFrameAccelerationTest + 4 BaselinePhysicsIntegratorTest).
+  Then `./gradlew.bat installDebug` onto the same S24 FE — live
+  "Baseline physics DR" east/north position and velocity readout
+  confirmed updating on screen alongside accel/gyro/orientation,
+  user-verified. Slice 1+2+3 now fully verified end-to-end on real
+  hardware with real sensors, no faked data, no ML. Ready to start
+  Slice 4 (GNSS outage detection).
 
 ---
 
@@ -224,19 +416,34 @@ Purpose: JUnit4 unit test for SampleRate.hzFromDeltaNs — 100 ms -> 10 Hz,
 ### android/
 
 ```
-sensors/SensorRepository.kt (+ SensorSample.kt, SampleRate.kt)
-Status: IMPLEMENTED — see `## Slice 1` above for full detail.
-Purpose: Collect accelerometer + gyroscope samples from Android Sensor
-  APIs at ~10 Hz and timestamp them consistently.
-Outputs: Timestamped AccelSample/GyroSample objects (device frame,
-  m/s^2, rad/s) via StateFlow<SensorUiState>.
-Connected to: currently -> MainActivity (live display) only.
-  -> FeatureExtractor, -> AlignmentEstimator are still PLANNED
-  downstream consumers (Slice 2+) — not wired yet.
+sensors/SensorRepository.kt (+ SensorSample.kt, SampleRate.kt, OrientationMath.kt)
+Status: IMPLEMENTED — see `## Slice 1+2+3` above for full detail.
+Purpose: Collect accelerometer + gyroscope + rotation-vector samples
+  from Android Sensor APIs at ~10 Hz, timestamp them consistently, and
+  convert rotation-vector to device-vs-world azimuth/pitch/roll (+
+  rotation matrix).
+Outputs: Timestamped AccelSample/GyroSample (device frame, m/s^2,
+  rad/s) and OrientationSample (device-vs-world frame, rad + rotation
+  matrix) via StateFlow<SensorUiState>.
+Connected to: -> MainActivity (live display) and
+  -> BaselineDeadReckoningRepository (Slice 3, IMPLEMENTED) both consume
+  this. -> FeatureExtractor, -> AlignmentEstimator are still PLANNED
+  downstream consumers (Slice 4+) — not wired yet.
 Important concept: Android sensor timestamps are boot-time monotonic,
   not wall-clock — must be reconciled explicitly against GNSS time,
-  never assumed equal (CLAUDE.md Rule 9/14). No rotation-vector sensor
-  is read yet; that belongs to Slice 2 (orientation), not Slice 1.
+  never assumed equal (CLAUDE.md Rule 9/14). Orientation is
+  device-relative-to-WORLD frame only (Slice 2) — vehicle-frame
+  transform is a separate step (AlignmentEstimator, still PLANNED)
+  that needs GNSS and hasn't been built yet.
+
+dr/{WorldFrameAcceleration,BaselinePhysicsIntegrator,BaselineDeadReckoningRepository}.kt
+Status: IMPLEMENTED — see `## Slice 1+2+3` above for full detail.
+Purpose: Slice 3's naive WORLD-frame (not vehicle-frame) physics-only
+  dead-reckoning baseline — rotate raw accel into world frame, remove
+  gravity, double-integrate to position/velocity. No ZUPT, no ML, no
+  GNSS fusion; expected to drift rapidly by design (PRD.md Section 32
+  fallback path / CLAUDE.md Rule 3's required physics comparison point).
+Connected to: SensorRepository -> BaselineDeadReckoningRepository -> MainActivity
 
 LocationRepository.kt
 Status: PLANNED
@@ -279,7 +486,10 @@ StateEstimator.kt
 Status: PLANNED
 Purpose: Integrate heading + ML velocity into position, apply ZUPT
   (Stationary) and non-holonomic constraint, blend with GNSS during
-  fusion/reacquisition.
+  fusion/reacquisition. Supersedes Slice 3's BaselinePhysicsIntegrator
+  as the primary estimator once built (Slice 5) — BaselinePhysicsIntegrator
+  stays in the codebase as the measured physics-only comparison point
+  (CLAUDE.md Rule 3), not deleted.
 Connected to: everything above -> StateEstimator -> MapConstraint -> UI
 
 MapConstraint.kt
@@ -364,5 +574,48 @@ regression can be traced to a specific model version.
 - On-device verification (2026-08-25): installed and ran Slice 1 on a
   real Samsung Galaxy S24 FE (Android 16 / One UI 8.5) over USB ADB.
   Live accel/gyro readout confirmed working, observed rate ~12.5 Hz.
-  See `## Slice 1` above for detail. Phase 1 (Slice 1) is now complete
-  and hardware-verified. Next: Slice 2 (sensor -> orientation).
+  Phase 1 (Slice 1) is now complete and hardware-verified. Next: Slice 2
+  (sensor -> orientation).
+- Slice 2 implemented (2026-08-25): added `OrientationSample` (device-
+  vs-world frame, rad) to `SensorSample.kt` and `OrientationMath.kt` — a
+  pure-Kotlin quaternion -> azimuth/pitch/roll conversion mirroring
+  AOSP's own SensorManager algorithm, unit-tested on the plain JVM
+  (`OrientationMathTest.kt`, 5 cases; CLAUDE.md Rule 19). Registered the
+  TYPE_ROTATION_VECTOR listener in `SensorRepository.kt` alongside
+  accel/gyro; `MainActivity.kt` now displays live azimuth/pitch/roll in
+  degrees (rad->deg conversion only at that display boundary, CLAUDE.md
+  Rule 15). Deliberately did NOT build vehicle-frame alignment
+  (PRD.md Section 15) in this slice — that needs a GNSS-aided
+  initialization window and GNSS isn't read until a later slice.
+  `./gradlew test` — all 9 tests pass. Installed on the same S24 FE via
+  `./gradlew installDebug`; live orientation readout confirmed updating
+  on screen, user-verified. Slice 1+2 complete and hardware-verified.
+  Next: Slice 3 (sensor -> baseline physics velocity/position).
+- Slice 3 implemented (2026-08-25): added a `dr/` package (deliberately
+  separate from `sensors/` — CLAUDE.md Rule 5) with `WorldFrameAcceleration.kt`
+  (pure: rotate device-frame accel into WORLD frame via Slice 2's
+  rotation matrix, then remove gravity) and `BaselinePhysicsIntegrator.kt`
+  (pure: semi-implicit-Euler double integration to a 2D East/North
+  position + velocity — PRD.md Section 32's physics-baseline fallback
+  path, deliberately naive with no ZUPT/bias correction so it drifts
+  fast, by design). `BaselineDeadReckoningRepository.kt` is the Android/
+  coroutine glue that collects SensorRepository's StateFlow, dedupes
+  by accel timestamp, and feeds the two pure classes. Extended
+  `OrientationSample` with `rotationMatrixDeviceToWorld` (List<Float>,
+  not FloatArray — avoids Kotlin's data-class array-equality footgun)
+  since Slice 3 needs the raw matrix, not just azimuth/pitch/roll;
+  `SensorRepository.kt` now keeps that matrix instead of discarding it.
+  Added `SampleRate.secondsFromDeltaNs` alongside the existing Hz
+  function. `MainActivity.kt` displays the live position/velocity with
+  an explicit on-screen caption that it's a naive baseline expected to
+  drift (CLAUDE.md Rule 13's honesty requirement applied to in-app copy,
+  not just final reported numbers). Added `WorldFrameAccelerationTest.kt`
+  and `BaselinePhysicsIntegratorTest.kt` (CLAUDE.md Rule 19) — the
+  integrator test checks against a hand-derived closed-form result, not
+  just "looks plausible." `./gradlew test` — all 19 tests pass. Installed
+  on the same S24 FE via `./gradlew installDebug`; live position/velocity
+  readout confirmed updating on screen, user-verified. Slice 1+2+3
+  complete and hardware-verified, no ML anywhere yet. Next: Slice 4
+  (GNSS outage detection) — needed before phone-to-vehicle alignment
+  (PRD.md Section 15) can be attempted, since that needs a GNSS-aided
+  initialization window.

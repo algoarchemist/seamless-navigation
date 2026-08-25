@@ -24,4 +24,15 @@ class SampleRateTest {
     fun `negative delta returns zero instead of a nonsense negative rate`() {
         assertEquals(0.0, SampleRate.hzFromDeltaNs(-1L), 1e-9)
     }
+
+    @Test
+    fun `100 ms delta is 0point1 seconds`() {
+        assertEquals(0.1, SampleRate.secondsFromDeltaNs(100_000_000L), 1e-9)
+    }
+
+    @Test
+    fun `zero or negative delta returns zero seconds`() {
+        assertEquals(0.0, SampleRate.secondsFromDeltaNs(0L), 1e-9)
+        assertEquals(0.0, SampleRate.secondsFromDeltaNs(-1L), 1e-9)
+    }
 }
