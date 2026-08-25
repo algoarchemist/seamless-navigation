@@ -27,6 +27,11 @@ data/processed/*
 !data/processed/.gitkeep
 models/*.onnx
 models/*.tflite
+# The Android app's bundled copy of the same model (needed at build
+# time for VelocityModel.kt to load from assets) is gitignored for the
+# same reason — regenerate with `python ml/export_model.py` then copy
+# models/velocity_v1.onnx to this path, see docs/PROJECT_MAP.md.
+android/app/src/main/assets/*.onnx
 
 # OS/editor cruft
 .DS_Store
