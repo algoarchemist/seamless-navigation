@@ -130,3 +130,319 @@ NOT YET BUILT (by design, not oversight):
 NEXT UP: Slice 6 (ML inference), which per PRD Section 24 requires
 Phase 4 dataset inspection (IO-VNBD) first, since no training data has
 been looked at yet.
+
+PHASE 4 — Dataset inspection (IO-VNBD)
+-----------------------------------------
+Downloaded the IO-VNBD dataset (real research dataset: GPS + IMU
+recordings from real vehicle drives across UK/France/Nigeria, from
+github.com/onyekpeu/IO-VNBD — ~194 MB, stored via Git LFS). Verified
+the download's checksum matched exactly before trusting it. Extracted
+and inspected the actual CSV files plus the dataset's own descriptor
+PDF (not just guessed from filenames).
+
+Findings:
+  - Confirmed real ~10 Hz smartphone sampling / 1 Hz GPS updates,
+    matching our app's target rate.
+  - IMPORTANT: found a real mismatch between how this dataset labels
+    its accelerometer/gyroscope X/Y/Z axes and how Android's own raw
+    sensors report X/Y/Z. Confirmed this by extracting and looking at
+    the dataset's own diagram image (not by guessing) — their axes are
+    relabeled/permuted relative to Android's standard convention. This
+    matters: if we trained a model on this data's raw axes and fed it
+    our own raw device readings without accounting for the mismatch,
+    the model would get consistently wrong inputs. This has to be
+    handled during feature extraction (Slice 6) — documented in
+    docs/PROJECT_MAP.md so it isn't missed.
+  - No pothole/turning/phone-moved labels exist per-moment in the data
+    — only descriptions of what happened SOMEWHERE during each whole
+    drive (e.g. "this 90-minute trip included some hard brakes and
+    roundabouts"). Fine for training the velocity estimator (which has
+    real GPS/speed ground truth throughout), not enough on its own for
+    the motion classifier's pothole/phone-moved detection. Decision:
+    use this dataset for velocity + "stationary" training (it even has
+    dedicated 20+ minute stationary recordings, useful for tuning our
+    own at-rest detector), and plan a short self-recorded session later
+    specifically to capture potholes and phone-movement examples.
+  - Confirmed the dataset's phone was mounted in a fixed, known
+    orientation the whole time (windshield mount) — unlike our live app,
+    which doesn't know how the phone is mounted. This is a second reason
+    (beyond the axis-mismatch one above) our planned vehicle-frame
+    conversion step is necessary, not optional.
+
+Dataset is gitignored (confirmed via git check-ignore) — the ~194 MB
+never risks landing in the repo. Re-download instructions recorded in
+data/README.md for anyone who clones the repo fresh.
+
+NEXT UP: Slice 6 (ML inference) is now actually unblocked. Starting
+point is turning this manual inspection into a reproducible script
+(ml/inspect_dataset.py) and building feature extraction that correctly
+handles the axis-convention fix found above.
+
+ml/inspect_dataset.py built and run for real
+-----------------------------------------------
+Turned the manual Phase 4 inspection into a real, tested script.
+Installed the rest of the Python ML dependencies (onnx, onnxruntime,
+etc.) which weren't present yet.
+
+Two more real findings caught while building/running it:
+  1. The dataset's "Categorised" and "Uncategorised" folders both
+     contain the SAME 72 trips, just organized differently (confirmed
+     by diffing a sample file pair). A naive scan finds 144 files and
+     would have silently duplicated every trip if used for training —
+     caught and fixed (script now only reads the properly-organized
+     "Categorised" tree) before any training happened, not after.
+  2. GPS doesn't actually update once per second like the dataset's own
+     documentation claims — real measurement shows fixes only change
+     about every 9 seconds, consistent across 68 of 72 trips. Same
+     "requested rate isn't delivered rate" lesson our own Android app
+     already learned early on. This matters for how the "time since
+     last GPS fix" training feature gets built next.
+
+Real numbers from the actual downloaded data: 72 unique trips,
+1,070,745 rows, 25.1 hours, all consistent schema, all correctly
+paired with vehicle ground-truth files. 7 unit tests passing for the
+script's parsing logic.
+
+NEXT UP: ml/feature_extraction.py — building the actual training
+features (windowed accelerometer/gyro statistics in vehicle frame),
+now designed with the corrected GPS-timing assumption from the start.
+
+ml/feature_extraction.py built — and a real sign-flip bug caught before
+any model was trained
+------------------------------------------------------------------------
+Built the vehicle-frame feature extraction: converts raw phone-frame
+accelerometer/gyro readings into "forward / lateral / up relative to
+the car" using each moment's recorded gravity direction (since the
+phone's mounting tilt isn't perfectly known, this is more robust than
+assuming a single fixed angle).
+
+Before trusting this for training, I checked it against reality: does
+"forward acceleration" from this pipeline actually line up with the
+car's real GPS speed changing? Across all 72 trips (nearly 14,000
+real accelerate/decelerate events), it didn't — the data said pressing
+the gas correlated with SLOWING DOWN, which is backwards. The
+dataset's own diagram had suggested one axis direction was "forward,"
+but the diagram turned out to not match the actual sign in the
+recorded numbers. Flipped the axis, re-checked against the same real
+data, and now it lines up correctly (accelerating correlates with
+speeding up, as it should).
+
+This is worth calling out because it's exactly the kind of bug that
+could have silently trained a backwards model — one that predicts high
+speed during braking and low speed during acceleration — and it might
+not have been obvious until testing on a real drive much later. Caught
+now because I checked the numbers against independent, real GPS speed
+data before building anything on top of it, rather than trusting a
+diagram or assuming the math was right just because it ran without
+errors.
+
+NEXT UP: train_velocity_model.py — training an actual regression model
+on this now-validated feature set, and honestly measuring how well it
+predicts speed compared to our simple physics-only baseline (the whole
+point per the project's own rule: don't claim ML helps until you've
+actually measured it beating the simpler approach).
+
+train_velocity_model.py — first real ML-vs-baseline result
+---------------------------------------------------------------
+Trained a Random Forest to predict forward speed from the windowed
+sensor features, split by trip (not by row) so the same drive never
+leaks between training and validation, and measured it against a
+Python re-implementation of the app's own physics-only + ZUPT
+baseline on the exact same held-out drives.
+
+One deliberate exclusion: PRD wants "previous velocity" as a feature,
+but since GPS updates only every ~9s in this data (see the earlier
+finding), "previous row's GPS speed" is basically identical to the
+current answer for 89 out of every 90 rows — including it would let
+the model cheat by copying the answer instead of learning from the
+IMU. Left it out for this pass.
+
+Real result: the ML model's average error is 1.244 m/s, versus 5.205
+m/s for the physics-only baseline — about 4x more accurate, and it won
+on 13 of the 14 held-out drives. This is the first genuine, measured
+proof in this project that machine learning actually helps here,
+rather than being assumed to help because "AI/ML" is in the problem
+title. One drive out of 14 the physics baseline actually won on — not
+dug into yet, noted for later.
+
+Honesty caveat worth keeping in mind: this measures how well the model
+predicts speed tick-by-tick when given sensor readings, not yet how
+well it holds up over several real minutes with zero GPS correction
+(errors compound over time in ways a single-tick average doesn't
+capture) — that fuller test comes later once everything is wired
+together end-to-end.
+
+NEXT UP: export_model.py — converting the trained model to the ONNX
+format the Android app can actually run, and checking that the
+exported version gives the same answers as the Python one before
+trusting it on-device.
+
+export_model.py — model exported and verified
+--------------------------------------------------
+Retrained on all 72 trips (not just the 80% used for the honest
+accuracy measurement above — standard practice once you've already
+proven the approach works, you use all the data for the real model),
+exported it to models/velocity_v1.onnx (20.7 MB), and checked that the
+exported file actually gives the same predictions as the original —
+ran 5,000 sample inputs through both and compared: max difference was
+0.000001 m/s, essentially a perfect match. This model is not wired
+into the Android app yet.
+
+===========================================================
+WHERE THINGS STAND NOW (end of this session)
+===========================================================
+Android app (Slices 1-5): fully working end-to-end on the real S24 FE
+— live sensors, orientation, a corrected physics-only position
+estimate, and a real GNSS-outage detector. No ML in the app yet.
+
+ML pipeline (Slice 6, Python side only): fully working and genuinely
+validated — real dataset downloaded and inspected, real features
+extracted (with a real sign bug caught and fixed via cross-checking
+against GPS ground truth), a real model trained and proven to beat the
+app's physics baseline by ~4x, exported and checksummed for accuracy.
+
+NOT done yet: the model above is sitting in models/velocity_v1.onnx —
+nothing in the Android app reads it. To actually use it live, still
+need: the Kotlin equivalent of the Python feature-extraction logic
+(so live sensor readings get turned into the same kind of input the
+model was trained on), the phone-to-vehicle mounting-alignment piece
+(the model was trained assuming a specific known mounting; the app
+doesn't know how the phone is mounted yet), a Kotlin wrapper to
+actually run the ONNX model on-device, and then wiring its output into
+the existing position-estimate pipeline. Also still need the
+pothole/turning/phone-moved motion classifier (needs a short
+self-recorded session to get labels IO-VNBD doesn't have).
+
+NEXT UP: this is a natural pause point — the Python ML work is a
+complete, verified deliverable, but wiring it into the actual Android
+app is a separate, substantial chunk of Kotlin work. Will continue
+with that next unless redirected.
+
+Testing checkpoint (before starting the Kotlin work)
+---------------------------------------------------------
+Two of the four ML scripts (the training script and the export script)
+had shipped with zero automated tests — only checked by running them
+once and reading the output. Added proper tests for both:
+  - 14 new tests for the training script, including a real check that
+    training twice with the same settings gives byte-identical results
+    (not just "looked the same" — actually verified).
+  - 2 new tests for the export script, including a deliberately-broken
+    case to prove the ONNX-matches-Python check can actually catch a
+    real mismatch, not just pass silently every time.
+One test itself had a bug (my own mental math was off by one row) —
+caught because the test failed against the real code, fixed the test,
+not the code.
+
+Also reran the real training script a second time against the actual
+dataset and got the identical accuracy numbers as before, and reran
+the whole Android/Kotlin test suite to make sure nothing there had
+broken. Full picture: 29 Python tests + 46 Kotlin tests, all passing.
+
+NEXT UP: Kotlin side of Slice 6 — FeatureExtractor.kt (mirrors the
+Python feature logic), AlignmentEstimator.kt (phone-to-vehicle
+mounting), VelocityModel.kt (runs the ONNX model on-device), and
+wiring it all into the existing app.
+
+Slice 6 Kotlin wiring — the ML model is now actually running on the
+phone
+------------------------------------------------------------------------
+Built the on-device half. Key decision made up front: the phone's
+built-in orientation sensor already accounts for tilt, so the only
+real gap for "which way is the car pointing" was the leftover compass
+offset (is the phone mounted straight, or rotated relative to the car)
+— built a small estimator that figures this out by comparing the
+phone's compass heading against real GPS direction-of-travel while
+driving straight.
+
+Then built the feature-computation logic to match the Python training
+script as closely as possible (including two easy-to-miss details:
+the statistics use "sample" standard deviation not "population"
+standard deviation, and a specific counting quirk from the training
+script needed to be copied exactly, not "cleaned up"), wrapped the
+ONNX model in a loader (double-checked the model's actual input/output
+names against the real file rather than guessing), and wired
+everything into a new component that runs ALONGSIDE the existing
+physics estimate rather than replacing it — so both show up on screen
+at once for direct comparison.
+
+Caught 3 bugs along the way, all in my own test code (not the actual
+logic) — including one where I had to double check my own hand math
+using Python before trusting a test's expected value. Fixed the tests,
+not the code, since the code was right.
+
+Installed on the real phone: no crashes, and the model started
+producing live predictions immediately. But then found a real UI bug —
+the screen had grown too tall to fit and there was no way to scroll
+down, so the entire new ML section was invisible even though it was
+working correctly underneath. Fixed by making the screen scrollable.
+After the fix: scrolled down and could see the live ML prediction and
+an honest "not aligned yet" status (correct, since the phone was
+sitting still indoors with no GPS).
+
+Also went back through the project's documentation and fixed several
+sentences that were still saying "not built yet" about things that
+this session just built — the project's own rule is that the docs
+must never describe something that no longer exists, so those got
+swept and corrected too, not left for later.
+
+CURRENT STATE (end of Slice 6 Kotlin wiring):
+  - The Android app now has BOTH a physics-only speed estimate AND a
+    real ML-predicted speed estimate, visible side by side, live, on
+    real hardware.
+  - The ML speed is for comparison only right now — it's not yet
+    plugged into the actual position-tracking math. That's the next
+    natural step.
+  - The motion classifier (pothole/turning/phone-moved detection)
+    still isn't built — it needs a short self-recorded test drive for
+    labels the training dataset doesn't have.
+  - 76 total Kotlin tests passing, 29 Python tests passing.
+
+NEXT UP: either (a) actually feed the ML speed into the position
+integrator so it starts improving the real position estimate, or
+(b) move on to GNSS/DR fusion (blending GPS and dead-reckoning
+smoothly on reacquisition). Not yet decided which to do first.
+
+Wired ML velocity into an actual position estimate — and found a real,
+interesting limitation
+------------------------------------------------------------------------
+Picked option (a). Built a small piece of math that takes the model's
+predicted speed each moment plus the direction we're facing and turns
+that into an actual moving position (following the same approach the
+original design document specifies). Wired it in alongside the
+existing physics-based position, so both are now visible and directly
+comparable on screen. Installed and ran it on the real phone — no
+crashes, both positions displaying live.
+
+Then, while just letting the phone sit on the desk to verify it stayed
+stable, I noticed the physics-based position stayed almost perfectly
+still (as expected) but the new ML-based position suddenly jumped by
+about a meter and a half over less than a minute, then stopped moving
+again. Dug into why: it's a real, honest design gap, not a bug. The
+physics approach has "memory" — even if it briefly misreads a small
+motion, that error only builds up a little before being corrected.
+The new ML approach has none — every single moment it thinks the phone
+might be moving, it applies the model's full speed estimate for that
+instant, with no accumulated-error damping. So a brief nudge (probably
+me bumping the desk while running commands) that the physics side
+brushed off almost entirely caused a real jump in the ML-based
+estimate.
+
+I flagged this clearly rather than just working around it quietly, and
+asked how to handle it. Decision: document it honestly now, and treat
+the actual fix (there are a few reasonable options — a minimum-speed
+cutoff, smoothing the model's output, or making the "are we stationary"
+check stricter for this path) as a separate piece of work that deserves
+proper thought rather than a rushed patch. This is exactly the kind of
+thing that only shows up from testing on real hardware with real
+sensor noise — all the automated tests still pass, because they
+correctly verify the math does what it was built to do; they just
+can't reveal that the design itself has this consequence in the real
+world.
+
+CURRENT STATE: 83 total Kotlin tests passing (up from 76), both
+physics and ML position estimates live and visible side by side on
+the real phone, with the ML path's real sensitivity limitation
+documented rather than hidden.
+
+NEXT UP: (b) GNSS/DR fusion (Slice 7), or circle back to actually fix
+the ML position's sensitivity issue first — not yet decided.

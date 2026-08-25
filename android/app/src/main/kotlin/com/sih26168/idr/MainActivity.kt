@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -23,21 +25,29 @@ import com.sih26168.idr.dr.DeadReckoningState
 import com.sih26168.idr.gnss.GnssModeRepository
 import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.gnss.LocationRepository
+import com.sih26168.idr.ml.MlVelocityRepository
+import com.sih26168.idr.ml.MlVelocityUiState
+import com.sih26168.idr.ml.VelocityModel
 import com.sih26168.idr.sensors.SensorRepository
 import com.sih26168.idr.sensors.SensorUiState
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Slice 1+2+3+4+5 (per CLAUDE.md's slice order): reads live
+ * Slice 1+2+3+4+5+6 (per CLAUDE.md's slice order): reads live
  * accelerometer, gyroscope, and rotation-vector-derived orientation via
  * [SensorRepository]; reads GNSS fixes via [LocationRepository] and runs
  * the GNSS_AIDED/TRANSITION/DEAD_RECKONING/REACQUISITION hysteresis
  * state machine via [GnssModeRepository]; feeds sensors + GNSS mode into
- * [BaselineDeadReckoningRepository] for a WORLD-frame (not vehicle-frame)
- * physics position estimate corrected by ZUPT and a non-holonomic
- * constraint; renders all of it live. No ML, no actual fusion between
- * GNSS and the DR position estimate yet (Slice 7) — those are later
- * slices. Orientation is DEVICE-relative-to-WORLD frame only (CLAUDE.md
- * Rule 9/14) — no vehicle-frame alignment.
+ * [BaselineDeadReckoningRepository] for a WORLD-frame physics position
+ * estimate corrected by ZUPT and a non-holonomic constraint; ALSO feeds
+ * sensors + GNSS into [MlVelocityRepository] for a live ML-predicted
+ * velocity, displayed side by side with the physics estimate (Slice 6
+ * — see that class's doc for why it's parallel, not a replacement, yet).
+ * Orientation is DEVICE-relative-to-WORLD frame only (CLAUDE.md
+ * Rule 9/14) — no vehicle-frame alignment for the position estimate
+ * (AlignmentEstimator only feeds the ML feature path so far).
  */
 class MainActivity : ComponentActivity() {
 
@@ -45,6 +55,15 @@ class MainActivity : ComponentActivity() {
     private lateinit var deadReckoningRepository: BaselineDeadReckoningRepository
     private lateinit var locationRepository: LocationRepository
     private lateinit var gnssModeRepository: GnssModeRepository
+    private var mlVelocityRepository: MlVelocityRepository? = null
+    private var velocityModel: VelocityModel? = null
+
+    // Reported via a StateFlow rather than a thrown exception surfaced
+    // only in Logcat — a missing/corrupt bundled model is a real,
+    // demo-relevant failure mode (e.g. forgot to copy the gitignored
+    // asset per docs/PROJECT_MAP.md) and should be visible on screen.
+    private val _mlModelLoadError = MutableStateFlow<String?>(null)
+    private val mlModelLoadError: StateFlow<String?> = _mlModelLoadError.asStateFlow()
 
     // Must be registered before the activity reaches STARTED — a property
     // initializer (runs during construction, before onCreate) satisfies that.
@@ -65,11 +84,26 @@ class MainActivity : ComponentActivity() {
         gnssModeRepository = GnssModeRepository(locationRepository, lifecycleScope)
         deadReckoningRepository = BaselineDeadReckoningRepository(sensorRepository, gnssModeRepository, lifecycleScope)
 
+        try {
+            val model = VelocityModel.loadFromAssets(applicationContext)
+            velocityModel = model
+            mlVelocityRepository = MlVelocityRepository(sensorRepository, gnssModeRepository, model, lifecycleScope)
+        } catch (e: Exception) {
+            // Loading a bundled asset / building an ONNX session can fail
+            // in ways specific to the model file (missing, truncated,
+            // schema mismatch) — caught here rather than crashing the
+            // whole app, since Slice 1-5 must keep working even if the
+            // ML half isn't wired up on this build.
+            _mlModelLoadError.value = e.message ?: e::class.simpleName ?: "unknown error"
+        }
+
         setContent {
             val uiState by sensorRepository.state.collectAsState()
             val drState by deadReckoningRepository.state.collectAsState()
             val gnssState by gnssModeRepository.state.collectAsState()
-            IdrSensorScreen(uiState, drState, gnssState, sensorRepository.hasRequiredSensors())
+            val mlState by (mlVelocityRepository?.state ?: MutableStateFlow(MlVelocityUiState())).collectAsState()
+            val mlError by mlModelLoadError.collectAsState()
+            IdrSensorScreen(uiState, drState, gnssState, mlState, mlError, sensorRepository.hasRequiredSensors())
         }
     }
 
@@ -88,14 +122,21 @@ class MainActivity : ComponentActivity() {
         // Started after gnssModeRepository so its GNSS-mode-gated reset
         // (Slice 5) reads an already-ticking mode, not just the default.
         deadReckoningRepository.start()
+        mlVelocityRepository?.start()
     }
 
     override fun onPause() {
+        mlVelocityRepository?.stop()
         gnssModeRepository.stop()
         locationRepository.stop()
         deadReckoningRepository.stop()
         sensorRepository.stop()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        velocityModel?.close()
+        super.onDestroy()
     }
 }
 
@@ -104,6 +145,8 @@ private fun IdrSensorScreen(
     state: SensorUiState,
     drState: DeadReckoningState,
     gnssState: GnssModeUiState,
+    mlState: MlVelocityUiState,
+    mlModelLoadError: String?,
     hasRequiredSensors: Boolean,
 ) {
     MaterialTheme {
@@ -111,10 +154,11 @@ private fun IdrSensorScreen(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
                     .padding(24.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text(text = "IDR MVP — Slice 5: + ZUPT + non-holonomic constraint")
+                Text(text = "IDR MVP — Slice 6: + ML velocity + ML position (side by side with physics)")
 
                 if (!hasRequiredSensors) {
                     Text(text = "This device is missing an accelerometer, gyroscope, or rotation-vector sensor.")
@@ -202,6 +246,41 @@ private fun IdrSensorScreen(
                         "Last transition: none yet"
                     },
                 )
+
+                if (mlModelLoadError != null) {
+                    Text(text = "ML velocity model failed to load: $mlModelLoadError")
+                } else {
+                    Text(
+                        text = if (mlState.predictedVelocityMps != null) {
+                            "ML predicted forward speed: %.2f m/s (compare to physics DR velocity above)".format(
+                                mlState.predictedVelocityMps,
+                            )
+                        } else {
+                            "ML predicted forward speed: waiting for first inference..."
+                        },
+                    )
+                    Text(
+                        text = "ML-based DR position (WORLD frame, m since GNSS last good): " +
+                            "east=%.2f north=%.2f".format(mlState.positionEastM, mlState.positionNorthM),
+                    )
+                    Text(
+                        text = "^ position from ML velocity + heading (PRD Section 16), ZUPT " +
+                            "applied, non-holonomic satisfied by construction (no lateral " +
+                            "component is ever predicted) — compare directly to the physics " +
+                            "DR position above; same GNSS-mode-gated reset, same units.",
+                    )
+                    Text(
+                        text = if (mlState.isAligned) {
+                            "Phone-to-vehicle yaw alignment: locked, offset=%.1f deg (%d samples)".format(
+                                mlState.yawOffsetDeg, mlState.alignmentSampleCount,
+                            )
+                        } else {
+                            "Phone-to-vehicle yaw alignment: not yet established " +
+                                "(${mlState.alignmentSampleCount} samples so far — needs sustained " +
+                                "straight-line driving above ~18 km/h with GNSS available)"
+                        },
+                    )
+                }
             }
         }
     }

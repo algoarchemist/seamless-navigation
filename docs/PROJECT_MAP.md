@@ -5,23 +5,48 @@ added, removed, or has its responsibility/interface changed
 (CLAUDE.md Rule 6/21). This is written to teach the pipeline, not just
 list files — when in doubt, explain *why*, not just *what*.
 
-Status as of last update: **Phase 0 scaffold + Slice 1+2+3+4+5
-implemented and on-device verified.** The folder/build-system skeleton
-(`## Scaffold Status`) and Slice 1+2+3+4+5 (Android sensor -> live
+Status as of last update: **Phase 0 scaffold + Slice 1-6 (Kotlin half
+included) implemented and on-device verified.** The folder/build-system
+skeleton (`## Scaffold Status`) and Slice 1-5 (Android sensor -> live
 sensor display, sensor -> orientation, sensor -> baseline physics
 velocity/position, GNSS outage detection, dead reckoning state-machine
-wiring + ZUPT + non-holonomic constraint, `## Slice 1+2+3+4+5`) are
-real, build-verified, and now confirmed running on a real Samsung
-Galaxy S24 FE (Android 16 / One UI 8.5) with live accel/gyro readout at
-~12.5-16.7 Hz observed, live azimuth/pitch/roll orientation, a live
-GNSS_AIDED/TRANSITION/DEAD_RECKONING/REACQUISITION mode readout, and a
-live WORLD-frame position/velocity estimate that now visibly stays near
-zero while the phone is at rest (confirmed over 15+ seconds — the
-ZUPT correction working, versus Slice 4's -0.85/-1.56 m drift over a
-similar period) all confirmed updating on screen. Everything else
-under `## Planned File Map` is still a target derived from PRD.md — no
-vehicle-frame alignment, ML, fusion, or map-matching code exists yet.
-Each entry gets flipped from `PLANNED` to
+wiring + ZUPT + non-holonomic constraint) are real, build-verified, and
+confirmed running on a real Samsung Galaxy S24 FE (Android 16 / One UI
+8.5). **Phase 4 (dataset inspection) and Slice 6's full pipeline —
+Python training AND Kotlin on-device wiring — are now also done.**
+Python side: `ml/inspect_dataset.py`, `ml/feature_extraction.py`,
+`ml/train_velocity_model.py`, `ml/export_model.py` — real, tested, run
+against the actual downloaded IO-VNBD dataset. Real measured result:
+the trained velocity model beats the app's own physics+ZUPT baseline by
+~4.2x (MAE 1.244 m/s vs 5.205 m/s on held-out trips — CLAUDE.md Rule 3
+satisfied with a real comparison), exported to `models/velocity_v1.onnx`
+with a clean output-parity check. Kotlin side (2026-08-25): AlignmentEstimator,
+FeatureExtractor, VelocityModel (ONNX Runtime Mobile), and
+MlVelocityRepository are all implemented, tested (29 new unit tests),
+and confirmed RUNNING LIVE on the same S24 FE — the ONNX model produces
+real-time predictions on-device with no crash, displayed side by side
+with the physics-only estimate. Several real bugs were caught and fixed
+along the way, each before it could silently corrupt something
+downstream: a duplicate-trip-tree risk in the raw dataset, a
+forward-axis sign error caught by correlating against real GPS ground
+truth, and a Compose screen-overflow bug (the ML section was rendering
+but genuinely invisible off the bottom of the screen — only caught by
+looking at the real device output, not by compiling) — see `## Phase 4
+— Dataset inspection findings` and the relevant file entries below for
+the full writeups. **UPDATE (2026-08-25, same day)**: ML velocity is
+now ALSO wired into a real position estimate —
+`ml/MlPositionIntegrator.kt` propagates it per PRD.md Section 16,
+running parallel to (not replacing) the physics position. On-device
+testing surfaced a real, honestly-documented finding: this ML position
+path is measurably more sensitive to brief disturbances than the
+physics path (no momentum damping — see MlPositionIntegrator.kt's
+entry), deliberately left unfixed for now as an explicit, discussed
+decision. **Still not done**: `train_motion_classifier.py` (blocked on
+self-captured Pothole/Phone-Moved data), true GNSS/DR position fusion
+(Slice 7). Everything else under `## Planned File Map` is still a
+target derived from PRD.md — no vehicle-frame alignment for the
+physics position estimate (only for ML features), fusion, or
+map-matching code exists yet. Each entry gets flipped from `PLANNED` to
 `IMPLEMENTED` (with the fields below filled in for real) as it is
 actually built.
 
@@ -76,8 +101,13 @@ Purpose: App module build config — Kotlin + Jetpack Compose, minSdk 26
 Important concept: dependencies for play-services-location and
   onnxruntime-android are declared now so the module graph resolves, but
   no code uses them yet — LocationRepository.kt and VelocityModel.kt
-  /MotionClassifierModel.kt (Section below) are still PLANNED. Declaring
-  a dependency early is not the same as building the feature. Also adds
+  /MotionClassifierModel.kt (Section below) are still PLANNED at this
+  point in the timeline (Phase 0). UPDATE: both LocationRepository.kt
+  (Slice 4) and VelocityModel.kt (Slice 6) are now IMPLEMENTED and
+  actually use these dependencies — only MotionClassifierModel.kt
+  remains planned. Declaring a dependency early is not the same as
+  building the feature, but by Slice 6 that gap has closed for onnxruntime.
+  Also adds
   `kotlinx-coroutines-android` (StateFlow, used by SensorRepository —
   see `## Slice 1`) and a `src/test/kotlin` source set + JUnit4 for
   Slice 1's unit test.
@@ -140,13 +170,17 @@ Purpose: Excludes Android/Gradle build output, `local.properties`,
   `./gradlew` works on a fresh clone with no Android Studio sync first.
 ```
 
-No ML, fusion, or map-matching code exists yet — everything below this
-line (past `## Slice 1+2+3+4+5`) is still the Slice-6-onward target,
-unchanged from the original plan.
+No fusion or map-matching code exists yet — everything below this line
+(past `## Slice 1-5`) is still a target, unchanged from the original
+plan, EXCEPT the Slice 6 ML files (alignment/, features/, ml/ packages,
+further down in this same "Planned File Map" section) — those ARE
+implemented; the "Planned File Map" heading refers to the map's
+original scope, not every entry's current status, and each entry's own
+`Status:` line is the actual source of truth.
 
 ---
 
-## Slice 1+2+3+4+5 — live sensor display, sensor -> orientation, sensor -> baseline physics velocity/position, GNSS outage detection, dead reckoning state-machine wiring + ZUPT + non-holonomic constraint (implemented)
+## Slice 1-5 — live sensor display, sensor -> orientation, sensor -> baseline physics velocity/position, GNSS outage detection, dead reckoning state-machine wiring + ZUPT + non-holonomic constraint (implemented)
 
 ```
 android/app/src/main/kotlin/com/sih26168/idr/sensors/SensorSample.kt
@@ -257,7 +291,10 @@ Purpose: Pure-Kotlin (no android.* import) math to rotate a raw DEVICE-
   motion-caused linear acceleration. Explicitly WORLD frame, NOT vehicle
   frame (CLAUDE.md Rule 9/14) — works regardless of phone mounting,
   which is exactly why it's in-scope before phone-to-vehicle alignment
-  (PRD.md Section 15, still PLANNED, needs GNSS) exists.
+  existed. UPDATE (Slice 6): AlignmentEstimator.kt is now IMPLEMENTED,
+  but only feeds MlVelocityRepository's ML feature path — this file
+  (and BaselineDeadReckoningRepository's physics position estimate) are
+  still deliberately alignment-free, per Slice 5's original design.
 Inputs: device-frame accel (x, y, z, m/s^2) + rotationMatrixDeviceToWorld
   (List<Float>, 9 elements, from OrientationSample).
 Outputs: WORLD-frame linear acceleration (East, North, Up components,
@@ -485,25 +522,31 @@ Important concepts/assumptions: fixAgeMs and the detector's nowMs both
 
 android/app/src/main/kotlin/com/sih26168/idr/MainActivity.kt
 Status: IMPLEMENTED
-Purpose: Slice 1+2+3+4+5 entry point — instantiates SensorRepository,
-  LocationRepository, GnssModeRepository, and (depending on
-  GnssModeRepository, Slice 5) BaselineDeadReckoningRepository in that
-  dependency order; starts/stops all on onResume/onPause (GnssModeRepository
-  before BaselineDeadReckoningRepository, so its mode-gated reset reads
-  an already-ticking mode); requests ACCESS_FINE_LOCATION at runtime via
+Purpose: Slice 1+2+3+4+5+6 entry point — instantiates SensorRepository,
+  LocationRepository, GnssModeRepository, BaselineDeadReckoningRepository,
+  and (Slice 6) loads VelocityModel from assets and instantiates
+  MlVelocityRepository, in that dependency order; starts/stops all on
+  onResume/onPause; requests ACCESS_FINE_LOCATION at runtime via
   ActivityResultContracts if not already granted; renders the latest
   accel/gyro/orientation sample, observed Hz, live corrected DR
-  position/velocity, and live GNSS mode/fix/transition via a Compose
-  screen (IdrSensorScreen).
+  position/velocity, live GNSS mode/fix/transition, AND (Slice 6) the
+  live ML-predicted velocity + alignment status, side by side, via a
+  Compose screen (IdrSensorScreen) — now scrollable (see bug note below).
 Connected to: SensorRepository -> MainActivity -> IdrSensorScreen (Compose);
   SensorRepository -> BaselineDeadReckoningRepository -> MainActivity -> IdrSensorScreen;
   LocationRepository -> GnssModeRepository -> MainActivity -> IdrSensorScreen;
-  GnssModeRepository -> BaselineDeadReckoningRepository (Slice 5)
+  GnssModeRepository -> BaselineDeadReckoningRepository (Slice 5);
+  SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity -> IdrSensorScreen (Slice 6)
 Important functions/classes: requestLocationPermission
   (registerForActivityResult(RequestPermission()), registered as a
   property initializer since it must be registered before the activity
   reaches STARTED) — starts LocationRepository once granted; if already
   granted on resume, starts it directly instead of re-prompting.
+  VelocityModel.loadFromAssets() is wrapped in try/catch — a missing or
+  corrupt bundled model (e.g. forgot to copy the gitignored asset, see
+  .gitignore) is caught and surfaced as an on-screen message instead of
+  crashing the whole app; Slices 1-5 keep working even if the ML half
+  isn't wired up on a given build.
 Important concepts/assumptions: orientation is displayed in degrees but
   every internal value stays in radians — the rad->deg conversion
   happens only at this UI display boundary (CLAUDE.md Rule 15), never
@@ -514,10 +557,22 @@ Important concepts/assumptions: orientation is displayed in degrees but
   Rule 13's honesty requirement extended to in-app copy, not just final
   reported metrics). If location permission isn't granted, the GNSS mode
   readout still works (reflects "no fix" honestly) rather than crashing
-  or hiding the section. No ML, no GNSS/DR position fusion yet — purely
-  a live readout proving the sensor + orientation + corrected-physics-
-  integration + GNSS-outage-detection pipeline works end-to-end without
-  blocking the UI thread.
+  or hiding the section. Still no actual GNSS/DR position fusion (Slice
+  7) and ML velocity is NOT yet fed into the position integrator — it's
+  displayed for comparison only (see MlVelocityRepository's doc).
+BUG FOUND + FIXED on real-device verification (2026-08-25): the Column
+  had no scroll modifier — as the screen accumulated more readout lines
+  across Slices 4/5/6, it silently overflowed past the bottom of the
+  display with NO way to reach the extra content (confirmed by swiping,
+  which did nothing — proving it wasn't scrollable, not just that a
+  swipe gesture was needed). This meant Slice 6's entire ML section was
+  present in the composition but genuinely invisible on a real S24 FE
+  screen. Fixed by adding `.verticalScroll(rememberScrollState())` to
+  the Column; re-verified by scrolling to and screenshotting the
+  previously-hidden ML section. A real lesson: a screen that "builds
+  successfully" and "doesn't crash" is not the same as "the content is
+  actually visible" — this could only be caught by looking at the real
+  device output, not by compiling or by reading the Compose code.
 
 android/app/src/test/kotlin/com/sih26168/idr/sensors/SampleRateTest.kt
 Status: IMPLEMENTED
@@ -604,6 +659,74 @@ Purpose: JUnit4 unit tests for the hysteresis state machine — starts in
   GNSS_AIDED; GNSS degrading again mid-REACQUISITION returns to
   DEAD_RECKONING; an interrupted good streak in DEAD_RECKONING resets
   the dwell timer rather than accumulating across the interruption.
+
+android/app/src/test/kotlin/com/sih26168/idr/alignment/YawRateTest.kt
+Status: IMPLEMENTED (Slice 6)
+Purpose: JUnit4 unit tests for YawRate.radPerSecond — first sample (no
+  previous) is null; a quarter turn over 1s reads exactly pi/4 rad/s;
+  wrap-around across the +-180 degree boundary reads as a small step
+  (20 degrees), not a near-360-degree jump — the case this function
+  exists to get right; zero/negative dt returns null; negative turn
+  direction is preserved (sign matters, not just magnitude).
+
+android/app/src/test/kotlin/com/sih26168/idr/alignment/AlignmentEstimatorTest.kt
+Status: IMPLEMENTED (Slice 6)
+Purpose: JUnit4 unit tests for the yaw-alignment accumulator — starts
+  unaligned; matching azimuth/bearing converges to a zero offset once
+  enough samples accumulate; a consistent 10-degree offset is correctly
+  recovered; below-minimum-speed samples don't count; high-yaw-rate
+  (turning) samples don't count; a null GNSS bearing doesn't count but
+  STILL updates the internal yaw-rate tracker (verified by a two-call
+  sequence proving the first call's azimuth was retained); wraps
+  correctly across the +-180 degree boundary (179 vs -179 degrees
+  correctly resolves to -2 degrees, not +2 or +-358 — an initial hand-
+  derivation of this test's own expected value had the sign backwards,
+  caught by cross-checking with Python's math.atan2 before trusting it,
+  not just trusting the first answer that compiled); reset() clears
+  accumulated state.
+
+android/app/src/test/kotlin/com/sih26168/idr/features/RollingWindowTest.kt
+Status: IMPLEMENTED (Slice 6)
+Purpose: JUnit4 unit tests for the rolling-window math — mean of an
+  empty window is zero; mean matches hand calculation; std of fewer
+  than two samples is zero; std uses SAMPLE standard deviation (ddof=1)
+  — explicitly checked against BOTH the correct sample-std value AND
+  documented as NOT matching what population std (ddof=0) would give,
+  so this parity-critical detail can't silently regress; energy is mean
+  of squares; oldest sample is evicted once capacity is exceeded; fewer
+  samples than capacity still computes over what's available rather
+  than zero-padding (matches pandas' min_periods=1).
+
+android/app/src/test/kotlin/com/sih26168/idr/features/FeatureExtractorTest.kt
+Status: IMPLEMENTED (Slice 6)
+Purpose: JUnit4 unit tests for the full feature vector — returns
+  exactly 13 elements; each input lands at its documented index (not
+  silently transposed); elapsed-since-fix passes through unwindowed;
+  first tick has zero jerk and counts as a sign change (the pandas
+  NaN-quirk replication); jerk matches a hand calculation for a steady
+  ramp — INCLUDING correctly modeling that the rolling window mixes in
+  the first tick's 0.0 jerk (two of this file's test expectations were
+  initially wrong for exactly this reason — assumed the windowed output
+  would equal the latest instantaneous value alone, forgot earlier
+  in-window samples are averaged in too; caught by the test failing
+  against the real code, fixed the test's math, not the implementation);
+  constant acceleration has zero std/jerk after the first tick; sign
+  change is detected when forward acceleration crosses zero; window
+  only retains the most recent 10 samples; non-forward channels
+  (lateral/up/gyro) are tracked independently of each other.
+
+android/app/src/test/kotlin/com/sih26168/idr/ml/MlPositionIntegratorTest.kt
+Status: IMPLEMENTED (2026-08-25)
+Purpose: JUnit4 unit tests for MlPositionIntegrator — zero/negative dt
+  is a no-op; heading north moves purely north, heading east moves
+  purely east (independently checked, basic trig sanity); isStationary
+  forces effective velocity to zero regardless of the predicted speed
+  passed in; position accumulates correctly across multiple ticks;
+  negative (reverse) velocity moves the opposite direction; reset()
+  clears accumulated position. See MlPositionIntegrator.kt's entry
+  above for why these synthetic-input tests, despite all passing,
+  could not have caught the real on-device sensitivity finding — that
+  required actual sensor noise on real hardware, not unit tests.
 ```
 
 **Build verification (this environment):**
@@ -692,6 +815,36 @@ Purpose: JUnit4 unit tests for the hysteresis state machine — starts in
   1+2+3+4+5 now fully verified end-to-end on real hardware, no faked
   data, no ML, no GNSS/DR position fusion yet. Ready to start Slice 6
   (ML inference: velocity + motion classifier wired in).
+- Slice 6 Kotlin wiring (2026-08-25): after Slice 6's Python training
+  pipeline (Phase 4 findings + ml/ scripts, documented separately
+  above), built the on-device half: alignment/{YawRate,AlignmentEstimator}.kt,
+  features/{RollingWindow,FeatureExtractor}.kt,
+  ml/{VelocityModel,MlVelocityRepository}.kt. `./gradlew test` — all 76
+  tests pass (46 from Slices 1-5 + 29 new + 1 net from a removed/added
+  case), after fixing 3 test bugs found DURING development (a
+  wrap-around sign error in AlignmentEstimatorTest, and two
+  FeatureExtractorTest cases that forgot the rolling window mixes in
+  earlier ticks' values rather than reflecting only the latest
+  instantaneous value) — each caught by the test failing against
+  correct code, and fixed in the test, not the implementation.
+  `./gradlew installDebug` onto the same S24 FE: no crash, ONNX Runtime
+  loaded the bundled 21 MB model and produced live predictions
+  (observed 0.11-0.74 m/s while stationary — a plausible small noise
+  floor, not an obviously-broken output) with the alignment status
+  honestly showing "not yet established" (correct — stationary indoors,
+  no GNSS fix, exactly the condition under which real alignment
+  shouldn't be claimed). Found and fixed a real Compose bug along the
+  way: the screen had no scroll modifier, so the new ML section was
+  present in the layout but genuinely invisible below the bottom edge
+  on a real device — only caught by looking at the actual screen, not
+  by a successful build. Slice 1-6 (Kotlin half) now fully verified
+  end-to-end on real hardware. Explicitly NOT done: ML velocity is
+  displayed for comparison only, not fed into the position integrator;
+  the motion classifier; a true cross-language feature-parity test
+  (documented as a known gap, not silently assumed fine). Next:
+  either wire ML velocity into the actual position integrator (PRD.md
+  Section 16), or Slice 7 (GNSS/DR fusion on reacquisition) — decision
+  not yet made, both are legitimate next steps.
 
 ---
 
@@ -701,7 +854,7 @@ Purpose: JUnit4 unit tests for the hysteresis state machine — starts in
 
 ```
 sensors/SensorRepository.kt (+ SensorSample.kt, SampleRate.kt, OrientationMath.kt)
-Status: IMPLEMENTED — see `## Slice 1+2+3` above for full detail.
+Status: IMPLEMENTED — see `## Slice 1-5` above for full detail.
 Purpose: Collect accelerometer + gyroscope + rotation-vector samples
   from Android Sensor APIs at ~10 Hz, timestamp them consistently, and
   convert rotation-vector to device-vs-world azimuth/pitch/roll (+
@@ -709,16 +862,20 @@ Purpose: Collect accelerometer + gyroscope + rotation-vector samples
 Outputs: Timestamped AccelSample/GyroSample (device frame, m/s^2,
   rad/s) and OrientationSample (device-vs-world frame, rad + rotation
   matrix) via StateFlow<SensorUiState>.
-Connected to: -> MainActivity (live display) and
-  -> BaselineDeadReckoningRepository (Slice 3, IMPLEMENTED) both consume
-  this. -> FeatureExtractor, -> AlignmentEstimator are still PLANNED
-  downstream consumers (Slice 4+) — not wired yet.
+Connected to: -> MainActivity (live display), -> BaselineDeadReckoningRepository,
+  and (Slice 6, IMPLEMENTED) -> MlVelocityRepository (which itself
+  drives AlignmentEstimator and FeatureExtractor) all consume this.
 Important concept: Android sensor timestamps are boot-time monotonic,
   not wall-clock — must be reconciled explicitly against GNSS time,
   never assumed equal (CLAUDE.md Rule 9/14). Orientation is
-  device-relative-to-WORLD frame only (Slice 2) — vehicle-frame
-  transform is a separate step (AlignmentEstimator, still PLANNED)
-  that needs GNSS and hasn't been built yet.
+  device-relative-to-WORLD frame only (Slice 2) — a true DEVICE-frame
+  vehicle-frame transform (matching Section 15/23's original plan) is
+  still not built; what Slice 6 built instead is a WORLD-frame
+  heading-projection approximation (AlignmentEstimator + MlVelocityRepository,
+  IMPLEMENTED) used only for ML feature extraction, NOT for the
+  physics position estimate — see AlignmentEstimator.kt's entry below
+  for the full reasoning and MlVelocityRepository's entry for the
+  documented parity gap this creates.
 
 dr/{WorldFrameAcceleration,BaselinePhysicsIntegrator,BaselineDeadReckoningRepository}.kt
 Status: IMPLEMENTED — see `## Slice 1+2+3` above for full detail.
@@ -742,29 +899,221 @@ Connected to: MainActivity (permission) -> LocationRepository ->
   once GNSS mode actually gates DR behavior instead of just being
   displayed).
 
-FeatureExtractor.kt
-Status: PLANNED
-Purpose: Compute the windowed feature set (mean/variance/energy of
-  vehicle-frame accel + gyro, jerk, etc.) at the same cadence used by
-  the trained models — must mirror the Python-side feature logic
-  exactly (CLAUDE.md Rule 20).
-Connected to: SensorRepository -> FeatureExtractor -> VelocityModel,
-  MotionClassifierModel
+android/app/src/main/kotlin/com/sih26168/idr/alignment/{YawRate,AlignmentEstimator}.kt
+Status: IMPLEMENTED (Slice 6, 2026-08-25) — see `## Slice 1-6` build
+  verification below for full detail.
+Purpose: PRD.md Section 15's phone-to-vehicle YAW alignment. Scope
+  note: pitch/roll are deliberately NOT separately estimated — Android's
+  rotation-vector sensor already fuses gravity into its own azimuth/
+  pitch/roll (sensors/OrientationMath.kt), so device orientation
+  reaching this class is already gravity-referenced. The only piece
+  nothing else computes is the YAW offset between device compass
+  azimuth and true vehicle heading, which gravity alone can never
+  resolve (PRD.md Section 15's own stated reason for using GNSS course).
+Inputs: azimuthRad (from OrientationSample), gnssBearingDeg/gnssSpeedMps
+  (nullable, from GnssFix), a wall/boot-time nowNs per tick.
+Outputs: AlignmentEstimate(yawOffsetRad, sampleCount, isAligned).
+Important functions/classes: YawRate.radPerSecond (pure, angle-unwrap-
+  aware WORLD-frame turning-rate calculation from consecutive azimuth
+  samples — deliberately NOT derived from raw device gyro Z, which only
+  approximates yaw rate if the phone happens to be held upright/flat,
+  exactly the unknown-mounting problem this class exists to solve);
+  AlignmentEstimator.evaluate (circular-mean accumulation of
+  device-azimuth-minus-GNSS-course, gated to straight-line driving
+  above a minimum speed — plain arithmetic angle averaging is wrong
+  near the +-180 degree wrap boundary, so this sums sin/cos and
+  recovers the mean via atan2, verified with a dedicated wrap-around
+  unit test); reset() (exposed for a future "Phone Moved" re-trigger —
+  not yet invoked automatically, no motion classifier exists).
+Important concepts/assumptions: engineering-default thresholds
+  (min 5.0 m/s, max yaw rate 0.1 rad/s, min 20 samples), not yet
+  validated against a real test drive (CLAUDE.md Rule 13). Explicit
+  limitations matching PRD.md Section 15's own: assumes at least one
+  clean straight-line moving segment with GNSS near trip start; does
+  not re-estimate while GNSS is unavailable; no "Phone Moved"
+  re-trigger yet.
+Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> AlignmentEstimator
 
-AlignmentEstimator.kt
-Status: PLANNED
-Purpose: Estimate phone-to-vehicle pitch/roll/yaw during an
-  initialization window (gravity for pitch/roll, GNSS course vs. device
-  heading for yaw); re-triggered on a "Phone Moved" classification.
-Connected to: SensorRepository, LocationRepository -> FeatureExtractor
-  (vehicle-frame transform)
+android/app/src/main/kotlin/com/sih26168/idr/features/{RollingWindow,FeatureExtractor}.kt
+Status: IMPLEMENTED (Slice 6, 2026-08-25)
+Purpose: Kotlin mirror of ml/feature_extraction.py's windowed feature
+  computation — turns a stream of already vehicle-frame-rotated accel/
+  gyro ticks into the same 13-element feature vector the Python
+  training pipeline produced, in the FEATURE_COLUMNS order (load-
+  bearing for ONNX input — must never be reordered independently of
+  the Python list). Deliberately does NOT do the device-frame ->
+  vehicle-frame rotation itself (that's the caller's job, CLAUDE.md
+  Rule 5) — starts from already-rotated forward/lateral/up components.
+Inputs: per tick — timestampNs, accelForwardMps2, accelLateralMps2,
+  accelUpMps2, gyroYawRateRadPerSec, elapsedSinceLastGnssFixS.
+Outputs: FloatArray(13).
+Important functions/classes: RollingWindow (fixed-capacity trailing
+  window; mean/std(ddof=1, SAMPLE std matching pandas' rolling().std()
+  default, NOT population std — a real, easy-to-miss parity detail,
+  directly unit-tested against a hand-derived value)/energy — mirrors
+  pandas `.rolling(w, min_periods=1)` including using however many
+  samples are available before the window fills); FeatureExtractor.update
+  (jerk = d(accel_forward)/dt per tick, fed into its own rolling window
+  like Python; zero-crossing rate replicates pandas' specific
+  `sign().diff() != 0` mechanics INCLUDING the NaN-comparison quirk
+  that counts the very first-ever sample as a "change" — deliberately
+  replicated for exact parity, not "cleaned up" into something
+  different, and called out explicitly in the code comment).
+PARITY GAP, explicitly documented not glossed over (CLAUDE.md Rule 13):
+  the Python pipeline built vehicle-frame axes via device-frame
+  Gram-Schmidt against a FIXED, KNOWN mounting (the offline dataset's
+  phone never moved relative to the car). MlVelocityRepository instead
+  supplies forward/lateral/up computed by projecting WORLD-frame linear
+  acceleration onto an alignment-corrected heading — mathematically
+  similar under the "phone yaw tracks vehicle yaw once aligned"
+  assumption, NOT bit-identical to what training saw. A true
+  cross-language output-parity test (CLAUDE.md Rule 20) isn't yet
+  possible; tracked as a real, known gap.
+Connected to: MlVelocityRepository -> FeatureExtractor -> VelocityModel
 
-VelocityModel.kt / MotionClassifierModel.kt
+android/app/src/main/kotlin/com/sih26168/idr/ml/VelocityModel.kt
+Status: IMPLEMENTED (Slice 6, 2026-08-25) — motion classifier
+  (MotionClassifierModel.kt) still PLANNED, blocked on
+  train_motion_classifier.py (itself blocked on self-captured data).
+Purpose: ONNX Runtime Mobile wrapper for the trained velocity
+  regression model. Loads `models/velocity_v1.onnx` (bundled as an
+  Android asset — gitignored like the rest of the model artifacts,
+  see .gitignore/models/README.md for the regenerate-and-copy step)
+  once, then runs single-row inference per tick.
+Inputs: FloatArray(13) from FeatureExtractor, matching order.
+Outputs: Float (predicted forward velocity, m/s).
+Important concepts/assumptions: input/output ONNX tensor names
+  ("input" / "variable") were VERIFIED directly against the exported
+  model file via onnxruntime's Python API
+  (`session.get_inputs()/get_outputs()`) before hardcoding — "variable"
+  is skl2onnx's default regressor output name, not guessed (CLAUDE.md
+  Rule 13). Threading: this class does not manage threading itself —
+  CLAUDE.md Android Rule 7 requires the caller (MlVelocityRepository)
+  to invoke predict() off the main thread, which it does via the same
+  coroutine-collector pattern as BaselineDeadReckoningRepository.
+Connected to: FeatureExtractor -> VelocityModel -> MlVelocityRepository
+
+MotionClassifierModel.kt
 Status: PLANNED
-Purpose: On-device ONNX/LiteRT inference wrappers for the two trained
-  models (PRD.md Sections 13/14).
-Connected to: FeatureExtractor -> {VelocityModel, MotionClassifierModel}
-  -> StateEstimator
+Purpose: On-device ONNX/LiteRT inference wrapper for the motion
+  classifier (PRD.md Section 14). Blocked on train_motion_classifier.py
+  (itself blocked on self-captured Pothole/Phone-Moved data per the
+  Phase 4 findings) — no model exists yet to wrap.
+Connected to: FeatureExtractor -> MotionClassifierModel -> StateEstimator
+
+android/app/src/main/kotlin/com/sih26168/idr/ml/MlPositionIntegrator.kt
+Status: IMPLEMENTED (2026-08-25, follow-up to initial Slice 6 wiring)
+Purpose: Integrates the ML-predicted forward speed directly into a 2D
+  WORLD-frame position estimate, per PRD.md Section 16's
+  `dx=v*cos(heading)*dt, dy=v*sin(heading)*dt` — using ML velocity
+  instead of dr/BaselinePhysicsIntegrator.kt's physics-fallback path.
+  This is what actually completes PRD.md Section 16's "v[t] =
+  VelocityModel(features[t])" — MlVelocityRepository previously only
+  displayed the scalar speed for comparison; this makes it produce a
+  real position.
+Inputs: dtSeconds, velocityMps (from VelocityModel), headingRad (the
+  SAME alignment-corrected heading used to build the features that
+  velocity was predicted from — using a different heading here would
+  silently misdirect the position relative to what the model actually
+  predicted), isStationary (from dr/StationaryDetector.kt, reused).
+Outputs: MlDeadReckoningState(positionEastM, positionNorthM).
+Important concepts/assumptions: unlike BaselinePhysicsIntegrator, there
+  is NO acceleration-integration state/momentum here — each tick's
+  position delta depends only on THAT tick's model-predicted speed and
+  heading, not on velocity carried from the previous tick, since the
+  model predicts speed directly rather than us inferring it from
+  double-integrated acceleration. Non-holonomic constraint is satisfied
+  BY CONSTRUCTION (the model never predicts a lateral component, so
+  there's nothing to suppress) — dr/NonHolonomicConstraint.kt is NOT
+  needed or used here, unlike the physics path.
+REAL ON-DEVICE FINDING (2026-08-25) — see MlVelocityRepository.kt's
+  entry below for the full writeup: this "no momentum" design means
+  ZUPT here gates a full, unbounded per-tick prediction rather than a
+  small, bounded, carried delta — making this integrator measurably
+  MORE sensitive to brief real or false-positive "non-stationary"
+  moments than BaselinePhysicsIntegrator is for an identical
+  disturbance. Observed on the real S24 FE: a ~1.6m position jump over
+  ~45s while the phone was ostensibly stationary, while the physics
+  position stayed flat the whole time. Documented as a known, deferred
+  limitation (explicit product decision), not fixed reflexively.
+Unit tests: tests/.../ml/MlPositionIntegratorTest.kt (7 cases) — zero/
+  negative dt is a no-op; heading north/east move purely
+  north/east respectively (basic trig sanity, each independently
+  checked); isStationary forces effective velocity to zero regardless
+  of the predicted speed passed in; position accumulates correctly
+  across multiple ticks; negative (reverse) velocity moves the opposite
+  direction; reset() clears state. Note these unit tests, all using
+  synthetic inputs, could NOT have caught the real on-device finding
+  above — that only showed up from real sensor noise interacting with
+  the (correctly-implemented, per these tests) no-momentum design,
+  exactly the kind of gap between "unit-tested" and "verified on real
+  hardware" this project's whole slice-by-slice on-device verification
+  discipline exists to catch.
+
+android/app/src/main/kotlin/com/sih26168/idr/ml/MlVelocityRepository.kt
+Status: IMPLEMENTED (Slice 6, 2026-08-25; position integration added
+  2026-08-25 in a follow-up change)
+Purpose: The Android/coroutine glue wiring SensorRepository +
+  GnssModeRepository's streams through AlignmentEstimator,
+  WorldFrameAcceleration (reused from Slice 3/5), FeatureExtractor,
+  VelocityModel, and (follow-up) MlPositionIntegrator, republishing the
+  live ML-predicted velocity AND an ML-driven WORLD-frame position as
+  its own StateFlow. Deliberately a SEPARATE, PARALLEL repository to
+  BaselineDeadReckoningRepository (CLAUDE.md Rule 5) — does NOT modify
+  or replace the physics position integrator; Slice 5's tested physics
+  pipeline is completely untouched. Both run and display side by side,
+  so the ML-vs-physics comparison PRD.md Section 30 wants for the demo
+  is directly visible on-device, not just a desktop-measured claim.
+Outputs: StateFlow<MlVelocityUiState> — {predictedVelocityMps,
+  isAligned, yawOffsetDeg, alignmentSampleCount, positionEastM,
+  positionNorthM}.
+Important concepts/assumptions: yaw rate for the gyro feature is
+  computed by rotating the RAW gyro vector into world frame the same
+  way as accel (angular velocity transforms as a vector under a pure
+  rotation) and taking its Up component directly — heading-independent,
+  unlike forward/lateral, so no alignment-offset projection needed for
+  that one; lateral acceleration's SIGN convention is a fixed,
+  internally-consistent choice (forward rotated -90 degrees) that was
+  never independently verified against ground truth the way forward's
+  sign was in ml/feature_extraction.py — documented as an open,
+  unverified assumption, not asserted as correct; elapsed-since-last-fix
+  is clamped to 999s if no fix has ever been received, guarding against
+  feeding a near-infinite value to the model (a minimal stand-in for
+  PRD.md Section 13's "fall back if input is out of distribution," not
+  full out-of-distribution detection). Reuses SensorRepository's own
+  StationaryDetector class (a NEW, separate instance from
+  BaselineDeadReckoningRepository's — see MlPositionIntegrator.kt's
+  entry below for why two independent instances, given identical
+  inputs, still produced very different real-world position behavior).
+REAL FINDING from on-device testing (2026-08-25) — position drift
+  asymmetry, not a coding bug: while the phone sat stationary during
+  verification, the physics position stayed flat (sub-0.05 m the whole
+  time, matching Slice 5's earlier result) but the ML-based position
+  jumped by ~1.6 m over roughly 45 seconds, then flattened out again
+  (near-zero growth for the following ~15s) — a burst, not a steady
+  leak. Root cause: physics ZUPT zeroes a CARRIED MOMENTUM state
+  (BaselinePhysicsIntegrator's velocity only grows by accel*dt each
+  tick it's not gated, so a brief few-hundred-ms non-stationary blip
+  before StationaryDetector re-triggers only injects a tiny position
+  delta). MlPositionIntegrator has NO momentum concept — every tick
+  the gate is open, it applies the model's FULL predicted speed for
+  that tick (not a small incremental delta), so the exact same brief
+  disturbance (plausibly the phone/table being nudged during active
+  ADB/screenshot commands) can inject a position jump an order of
+  magnitude larger than the physics path produces for an identical
+  disturbance. The code does exactly what it was designed to do — this
+  is a real DESIGN limitation of "ZUPT-gate a raw per-tick prediction"
+  vs "ZUPT-zero a carried momentum," not a bug to patch blindly.
+  DELIBERATELY NOT FIXED YET (explicit product decision, 2026-08-25):
+  candidate fixes considered — a minimum-speed deadband (ignore
+  predictions below some cutoff even when not strictly "stationary"),
+  smoothing/low-pass-filtering the model's raw output before
+  integrating, or a stricter/longer StationaryDetector dwell time for
+  this specific path — none implemented yet, since picking the right
+  one needs more thought than a reflexive patch; documented here as a
+  known, measured, honest limitation instead of silently shipped or
+  silently ignored.
+Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity (Compose UI)
 
 StateEstimator.kt
 Status: PLANNED
@@ -796,28 +1145,277 @@ Purpose: Live map + status header (GNSS state, speed, motion class,
 
 ```
 inspect_dataset.py
-Status: PLANNED
-Purpose: First Phase-4 task — inspect IO-VNBD structure, sensors,
-  labels, sampling rate, and identify gaps vs. live phone data
-  (PRD.md Section 24). Findings get written back into this file once
-  known.
+Status: IMPLEMENTED
+Purpose: Walks every smartphone trip CSV under IO-VNBD's "Categorised
+  IOVNB Dataset" tree, validates schema by column POSITION (not by
+  string-matching the raw header text, which is inconsistently
+  byte-encoded — see Phase 4 findings above), computes observed sample
+  rate, flags anomalies, and writes a reusable manifest. Turns the
+  manual Phase 4 inspection into a rerunnable script (CLAUDE.md Rule 18).
+Inputs: --dataset-root (default: data/raw/IO-VNBD/extracted/.../
+  Categorised IOVNB Dataset — deliberately NOT the sibling
+  "Uncategorised..." tree, see below), --output.
+Outputs: data/processed/io_vnbd_smartphone_manifest.csv (gitignored,
+  reproducible from raw/) — per-trip row count, schema variant,
+  observed Hz, duration, satellite-parse-failure count, vehicle-file
+  pairing status, and free-text notes for anything flagged. Also prints
+  a human-readable summary to stdout.
+Important functions: _load_smartphone_csv (position-based column
+  renaming against SMARTPHONE_COLUMNS_24 / the 20-column
+  no-orientation-or-magnetometer variant documented for Driver F's
+  trips), _observed_hz (median timestamp delta, not mean — robust to
+  the occasional GPS-outage-related timestamp gap the dataset's own
+  documentation mentions), _observed_gps_fix_interval_s (median time
+  between actual gps_latitude_deg value CHANGES, not assumed from the
+  documented 1 Hz — see the real finding below, this is what caught the
+  1 Hz claim being wrong), _count_satellite_parse_failures (the
+  "GPS SATELLITES IN RANGE" column is formatted "USED / VISIBLE", e.g.
+  "27 / 28", not a plain number).
+Real finding while building this (2026-08-25): IO-VNBD's "Categorised
+  IOVNB Dataset" and "Uncategorised IOVNB Dataset" folders both contain
+  the SAME 72 underlying trips (confirmed by diffing a sample pair —
+  identical row counts, identical values modulo float64 repr noise from
+  a re-export, only the column header text differs cosmetically, e.g.
+  "GYROSCOPE Yaw/Pitch/Roll" vs "GYROSCOPE X/Y/Z" for the exact same
+  numbers). A naive recursive scan over the dataset root finds 144
+  files and would silently duplicate every trip — a real risk of
+  train/val leakage per PRD.md Section 25, not a hypothetical one. Fixed
+  by scanning only "Categorised..." by default, which is also
+  structurally better (S-/V- pairs live in the same subfolder there,
+  which this script's vehicle-file pairing depends on). Also found: a
+  small number of rows (up to 800 in one trip) have their
+  "GPS SATELLITES IN RANGE" field corrupted into date strings like
+  "Dec-14" — a classic Excel auto-date-conversion artifact from some
+  point in the dataset's preparation, not a parsing bug in this script;
+  harmless for us since satellite count isn't a feature either model
+  will use. Also found (second pass, same day): the documented "1 Hz"
+  GPS update rate is wrong — measured across the real data, GPS fixes
+  actually only change ~every 9.0 seconds (68/72 trips consistent; the
+  remaining trips are dedicated stationary/parked recordings where the
+  fix never changes at all — expected there, not a gap in the
+  measurement). Same "requested rate != delivered rate" lesson our own
+  Android app already learned in Slice 1. Real implication: PRD.md
+  Section 13's "elapsed time since last GNSS fix" feature must use this
+  measured ~9s interval, not the documented 1s.
+Unit tests: tests/ml/test_inspect_dataset.py (7 cases, pure helpers
+  only, synthetic data — no dependency on the real gitignored download,
+  so they run anywhere) — verifies median-not-mean Hz calculation
+  against a synthetic outlier gap, satellite-format regex including the
+  real "Dec-14" artifact as a test case, empty/single-row edge cases,
+  and the GPS-fix-interval measurement (including the "fix never
+  changes" zero case).
+Real run against the actual downloaded dataset (2026-08-25): 72 unique
+  trips, 1,070,745 total rows, 25.1 hours, all 24-column schema, all
+  within the [8, 12] Hz tolerance, all correctly paired with a vehicle
+  file, median measured GPS fix interval 9.0s across 70 non-stationary
+  trips, 68/72 trips flagged for that interval mismatch plus 12 for the
+  harmless satellite-format issue above (some trips flagged for both).
+  `python -m pytest tests/ml/test_inspect_dataset.py` — 7/7 pass.
 
 feature_extraction.py
-Status: PLANNED
-Purpose: Python mirror of the Kotlin FeatureExtractor logic, used for
-  training. Any divergence between this and FeatureExtractor.kt is a
-  top project risk (PRD.md Section 31) and must be tested.
+Status: IMPLEMENTED
+Purpose: Turns each IO-VNBD smartphone trip into a per-tick table of
+  VEHICLE-frame windowed features (PRD.md Section 11) + a GPS-speed
+  ground-truth label, ready for training the velocity model. Python
+  mirror of the still-PLANNED Kotlin FeatureExtractor.kt — any
+  divergence between the two is a top project risk (PRD.md Section 31)
+  and must eventually be tested via output-parity (CLAUDE.md Rule 20)
+  once the Kotlin side exists.
+Inputs: --dataset-root (default: same Categorised tree as
+  inspect_dataset.py), --output.
+Outputs: data/processed/io_vnbd_features.parquet (gitignored,
+  reproducible) — one row per original 10 Hz sample, per trip:
+  vehicle-frame accel (forward/lateral/up, m/s^2) and gyro (yaw/pitch/
+  roll rate, rad/s) plus windowed mean/std/energy/jerk/zero-crossing-
+  rate statistics (1.0s trailing window, WINDOW_SAMPLES=10 — a default,
+  not yet empirically tuned), elapsed_since_last_gnss_fix_s,
+  previous_gps_speed_mps, and the label_gps_speed_mps target.
+Important functions: _vehicle_frame_axes / rotate_to_vehicle_frame
+  (pure, vectorized numpy — the Gram-Schmidt vehicle-frame construction
+  from the module's docstring), extract_trip_features (one trip),
+  build_dataset (all trips, tags each row with trip_name/driver_group
+  so a downstream split can respect trip boundaries per PRD.md
+  Section 25), _elapsed_since_last_gps_fix_s (reused concept from
+  inspect_dataset.py's measured-not-assumed GPS timing finding).
+REAL BUG CAUGHT AND FIXED (2026-08-25, before any model was trained):
+  the dataset's own figure (Phase 4 finding above) suggested
+  +device-Y is the forward/direction-of-travel axis. Built the vehicle-
+  frame rotation on that assumption, then sanity-checked it against
+  real GPS ground truth (correlate windowed forward-acceleration
+  against the ACTUAL speed change at the next real GPS fix, across all
+  72 trips, 13,902-13,905 fix-to-fix segments) before trusting it for
+  training — correlation came out NEGATIVE (-0.136 to -0.137 depending
+  on exact windowing), i.e. accelerating correlated with SLOWING DOWN,
+  backwards from physics. Root-caused to the figure's arrow simply not
+  matching the actual sign in the data (a diagram is a claim, not a
+  verified fact — CLAUDE.md Rule 13). Fixed by flipping the forward
+  axis to -device-Y; re-ran the same correlation check and got +0.137,
+  matching physical expectation. (A separate, smaller finding along the
+  way: Android's gravity/accelerometer convention reports the reaction
+  force, already pointing "up" — an intermediate version of this code
+  negated it unnecessarily; turned out to be mathematically a no-op for
+  the forward axis specifically, since Gram-Schmidt's projection term
+  is sign-invariant in the axis being projected against, but was still
+  fixed for correct up/lateral labeling.) This whole investigation is
+  exactly what CLAUDE.md Rule 18's "prototype small, verify against
+  real data" and Rule 19's "test before anything downstream relies on
+  it" are for — caught before `train_velocity_model.py` was ever
+  written, not discovered later as a mysteriously bad model.
+Unit tests: tests/ml/test_feature_extraction.py (6 cases) — flat-phone
+  and tilted-phone (30 degree, hand-derived expected vector) Gram-Schmidt
+  cases for the corrected forward axis, orthogonality/unit-norm
+  self-consistency of the {forward,lateral,up} basis for an arbitrary
+  skewed gravity vector, and the GPS-fix-interval helper. All pass;
+  none of these unit tests alone could have caught the sign error above
+  (they verify internal self-consistency, not which real-world direction
+  is "correct") — that required the real-data correlation check, which
+  is exactly why that check was necessary and is recorded here, not
+  just the unit tests.
+Real run against the actual downloaded dataset (2026-08-25):
+  1,070,745 rows, 72 trips, all succeeded. `python -m pytest
+  tests/ml/test_feature_extraction.py` — 6/6 pass.
 
-train_velocity_model.py / train_motion_classifier.py
+train_velocity_model.py
+Status: IMPLEMENTED (velocity model only — train_motion_classifier.py still PLANNED, Slice 6 continues)
+Purpose: Trains a RandomForestRegressor on feature_extraction.py's
+  output and measures it against the SAME naive physics-integration +
+  ZUPT baseline the Android app ships (a Python re-implementation of
+  dr/BaselinePhysicsIntegrator.kt + dr/StationaryDetector.kt's
+  thresholds, kept in sync manually — CLAUDE.md Rule 3: ML is only
+  justified once measured against the real physics baseline, not
+  assumed better).
+Inputs: --features (default: data/processed/io_vnbd_features.parquet).
+Outputs: printed MAE/RMSE (overall + per-trip, deduplicated to real GPS
+  fix changes) + feature importances. No model artifact saved by THIS
+  script — that's export_model.py's job (now IMPLEMENTED too, see
+  below), gated on this result being good enough to justify shipping
+  (it is, see below).
+Important functions: split_trips (by trip_name, not row — PRD.md
+  Section 25 no-leakage requirement; fixed seed=42 for reproducibility,
+  PRD.md Section 27), physics_baseline_velocity (the comparison
+  baseline), evaluate_deduplicated_by_fix (a second, more
+  independent-samples-honest metric alongside the full per-row one,
+  since ~90 consecutive rows share one label — see the leakage note
+  below).
+IMPORTANT — feature leakage avoided, not just noted: PRD.md Section 13
+  lists "previous velocity estimate" as a candidate input, and
+  feature_extraction.py computes previous_gps_speed_mps, but this
+  script does NOT use it as a training feature. Reason: since GPS is
+  held for ~90 rows (Phase 4 finding), previous_gps_speed_mps equals
+  the CURRENT label exactly for ~89/90 rows — training on it would let
+  the model just copy a near-answer and score deceptively well without
+  learning anything from the IMU. Excluded here; the live-deployment
+  version of "previous velocity" (the model's own prior prediction
+  during an outage) is a different, legitimate feature to revisit once
+  real on-device autoregression exists.
+REAL MEASURED RESULT (2026-08-25, S24 driver-shuffle seed=42, 58 train /
+  14 val trips): **ML model MAE=1.244 m/s, RMSE=1.593 m/s** vs.
+  **Physics+ZUPT baseline MAE=5.205 m/s, RMSE=6.345 m/s** — the ML
+  model is ~4.2x more accurate overall. Per-trip (deduplicated to real
+  GPS fix changes), ML beat the physics baseline on 13 of 14 held-out
+  trips, sometimes by a wide margin (e.g. S-Vw14b: 1.619 vs 6.337); the
+  one exception, S-Vtb3, physics actually won (0.496 vs 1.014) — not
+  investigated further yet, flagged as a follow-up (possibly a short/
+  low-speed trip where naive integration hasn't drifted much yet).
+  This satisfies CLAUDE.md Rule 3 with a real, not assumed, comparison
+  — ML is justified for the velocity model.
+  Feature importance finding, reported honestly rather than omitted:
+  `accel_up_std_mps2` (vertical-axis acceleration std within the
+  window) dominates at 0.672 importance — far above any accel_forward
+  feature. This is plausibly a real, legitimate signal (road/engine
+  vibration amplitude scales with speed — a known technique in
+  phone-based speed estimation, and exactly why naive forward-accel
+  integration alone drifts so badly), not necessarily a red flag, but
+  it does mean the model may be leaning on a "how much is this phone
+  vibrating" proxy more than a kinematic forward-acceleration
+  relationship — a plausible generalization risk (different road
+  surfaces/vehicles/mounts might vibrate differently) worth keeping in
+  mind, not yet tested.
+  Evaluation-scope caveat (CLAUDE.md Rule 13 — stating what was NOT
+  measured, not just what was): this MAE measures per-tick regression
+  accuracy against GPS-labeled speed, including ticks where GPS was
+  available. It does NOT yet simulate sustained multi-minute
+  GNSS-outage position drift the way the deployed app would actually
+  experience it (Section 16's dx/dy integration compounds velocity
+  error over time in a way a single-tick MAE doesn't capture) — that
+  end-to-end drift measurement is Slice 9's job, not this script's.
+Unit tests: tests/ml/test_train_velocity_model.py (14 cases, added
+  2026-08-25 — this file initially shipped with zero tests, only
+  validated by one real run; CLAUDE.md Rule 19 requires the math be
+  tested before anything relies on it, not just observed working once)
+  — split_trips: no train/val overlap, union covers every trip,
+  deterministic with a fixed seed, different seeds CAN differ, val
+  fraction respected, at-least-one-val-trip edge case;
+  physics_baseline_velocity: constant acceleration matches hand-
+  calculated Euler integration, ZUPT zeroes velocity when stationary,
+  high gyro ALONE prevents ZUPT even when accel alone would satisfy it
+  (verifies the AND, not just that ZUPT fires at all), non-positive dt
+  holds the previous value rather than integrating garbage;
+  evaluate: MAE/RMSE against hand-calculated values; 
+  evaluate_deduplicated_by_fix: only evaluates at real label-change
+  rows, returns None when a label never changes; a real
+  training-reproducibility test (PRD.md Section 27 — two
+  RandomForestRegressors trained on identical data with the same fixed
+  seed produce byte-identical predictions, not just "looked the same
+  once"). Also re-ran `python ml/train_velocity_model.py` against the
+  real dataset a second time and confirmed identical MAE/RMSE
+  (1.244/1.593 m/s) to the first run — real-data reproducibility, not
+  just synthetic-data unit tests. `python -m pytest
+  tests/ml/test_train_velocity_model.py` — 14/14 pass.
+
+train_motion_classifier.py
 Status: PLANNED
-Purpose: Train + evaluate the two models (PRD.md Sections 13/14/25),
-  report metrics per PRD.md Section 28, export to ONNX/LiteRT.
+Purpose: Train + evaluate the motion classifier (PRD.md Section 14 —
+  Stationary/Pothole/Turning/Phone Moved/etc.), report metrics per
+  PRD.md Section 28. Blocked on the self-captured supplementary data
+  the Phase 4 findings above call for (Pothole/Phone Moved have no
+  ground-truth signal in IO-VNBD) — Stationary alone could proceed now
+  via weak-labeling from GPS speed ≈ 0, but the other classes cannot.
 
 export_model.py
-Status: PLANNED
-Purpose: Convert trained models to ONNX/LiteRT and run an output-parity
-  check against the on-device inference path (CLAUDE.md Rule 20).
-```
+Status: IMPLEMENTED (velocity model only — motion classifier export
+  waits on train_motion_classifier.py)
+Purpose: Retrains the velocity model on ALL 72 trips (not just the
+  58-trip train split train_velocity_model.py used for honest
+  evaluation — standard practice once the approach is already
+  validated: ship a model trained on every available example, but
+  report accuracy from the held-out evaluation, never from a
+  full-data model's training score), exports it to ONNX via skl2onnx,
+  and runs a real output-parity check (CLAUDE.md Rule 20) between the
+  sklearn prediction path and ONNX Runtime — not just "it exported
+  without an exception."
+Inputs: --features, --output (default: models/velocity_v1.onnx,
+  matching models/README.md's `<model>_v<N>.onnx` convention),
+  --parity-sample-size (default 5000).
+Outputs: models/velocity_v1.onnx (gitignored per models/README.md —
+  verified via `git check-ignore`; only this convention doc is
+  committed, not the binary). Exits non-zero if parity fails, so this
+  is a real gate, not just an informational print.
+Important functions: check_parity (runs the SAME rows through both the
+  sklearn model and an onnxruntime InferenceSession, compares outputs
+  directly — PARITY_TOLERANCE_MPS = 1e-3 m/s, since ONNX Runtime
+  computes in float32 while sklearn's RandomForest is exact in
+  float64, so tiny numerical drift is expected and not itself a
+  failure).
+Real result (2026-08-25): exported model is 20.7 MB (100 trees,
+  max_depth=12) — within PRD.md Section 9's "low tens of MB at most"
+  target but not "far less," worth revisiting (fewer/shallower trees)
+  once on-device latency is actually measured (Section 26, not done
+  yet — this is a desktop-only number so far, CLAUDE.md Rule 12 forbids
+  calling on-device performance "done" from a desktop measurement).
+  Parity check on 5,000 held-out rows: max abs diff 0.000001 m/s, mean
+  0.000000 m/s, 5000/5000 within the 0.001 m/s tolerance — passed
+  cleanly. `python ml/export_model.py` exits 0.
+Unit tests: tests/ml/test_export_model.py (2 cases, added 2026-08-25) —
+  a fast, real (not mocked) sklearn -> ONNX -> onnxruntime round-trip
+  on a tiny synthetic model, so this doesn't depend on the real
+  gitignored dataset or the multi-minute full training run: (1)
+  export + parity on a matching model passes; (2) a deliberately
+  MISMATCHED model (trained on different synthetic labels) checked
+  against the first model's ONNX export correctly FAILS parity — this
+  proves check_parity actually detects a real mismatch, not just that
+  it never fires (a parity check that can't fail isn't a check).
+  `python -m pytest tests/ml/test_export_model.py` — 2/2 pass.
 
 ### data/, models/, tests/, scripts/
 
@@ -829,14 +1427,159 @@ regression can be traced to a specific model version.
 
 ---
 
-## Open questions to resolve in Phase 4 (dataset inspection)
+## Phase 4 — Dataset inspection findings (2026-08-25)
 
-- Exact IO-VNBD sensor channels, units, and sampling rate vs. our
-  target ~10 Hz.
-- Whether IO-VNBD includes labels usable for the motion classifier
-  (pothole, phone-moved) or only for velocity/position ground truth.
-- Whether self-captured supplementary data will be needed (PRD.md
-  Section 24) — record the decision here once made.
+IO-VNBD downloaded (Synchronised V+S set, ~194 MB via Git LFS — see
+`data/README.md` for the re-download command) and inspected directly:
+360 files total on disk (paired `S-<trip>.csv` smartphone +
+`V-<trip>.csv` vehicle ECU/GPS + a route-map `.jpg` per trip), plus the
+dataset's own data descriptor PDF (`README_1.pdf`, Onyekpe et al. 2020)
+read in full for authoritative column/units/setup documentation rather
+than guessed from the CSVs alone. **Correction, found while building
+`ml/inspect_dataset.py`**: those 360 files are NOT 72 unique trips —
+the archive contains the same 72 trips twice, once under "Categorised
+IOVNB Dataset" and once under "Uncategorised IOVNB Dataset" (see that
+script's entry under `## Planned File Map` -> `ml/` below for the full
+detail). The actual usable dataset is **72 unique trips, 1,070,745
+rows, 25.1 hours** — smaller than this section originally implied, and
+importantly, training must use only the "Categorised" tree or risk
+duplicating every trip across a train/val split. Findings below,
+resolving the three questions this section used to ask, are otherwise
+unaffected (schema, axis convention, and label availability are
+properties of the trip data itself, not of which tree it's read from):
+
+- **Sensor channels, units, rate**: Smartphone CSVs have 24 columns
+  (verified against a real file, `S-S1.csv`): GPS lat/lon/altitude/
+  speed(km/h)/accuracy(m)/orientation(deg)/satellites-in-range
+  ("27 / 28" format, not a plain number), a millisecond
+  "TIME SINCE START" counter, a human-readable date string,
+  accelerometer XYZ (m/s²), gravity XYZ (m/s², Android's TYPE_GRAVITY
+  virtual sensor — recorded separately from raw accel, unlike our app
+  which only has a fixed STANDARD_GRAVITY_MPS2 constant; see risk note
+  below), gyroscope "Yaw/Pitch/Roll" (rad/s — NOT labeled X/Y/Z, see
+  axis-convention finding below), magnetic field XYZ (µT — we don't
+  read the magnetometer at all yet), and phone-computed orientation
+  Yaw/Pitch/Roll (degrees — directly comparable to our own
+  OrientationMath output as an on-device sanity check). Confirmed
+  sample interval from real timestamp deltas (2922ms -> 3022ms ->
+  3121ms) is ~100ms, i.e. ~10 Hz, matching PRD.md Section 11's target.
+  Row count for one ~86-minute trip (S-S1) is 51,747 — consistent with
+  ~10 Hz over that duration. **Correction (measured by
+  `ml/inspect_dataset.py`, not just trusted from the PDF)**: GPS does
+  NOT update at 1 Hz as documented — the gps_latitude_deg column only
+  actually CHANGES value roughly every 9.0 seconds (measured across
+  68/72 trips consistently, not an isolated anomaly; a handful of
+  dedicated stationary/parked trips show 0.0s because the fix never
+  changes at all, which is expected there, not a measurement failure).
+  Ten intervening 10 Hz rows share an identical held GPS
+  speed/lat/lon value between each real fix. This is the same lesson
+  our own Android app already learned the hard way in Slice 1
+  (CLAUDE.md Rule 10): a requested rate is not a delivered rate: the
+  paper's "1 Hz" was evidently the AndroSensor app's requested rate,
+  not what the phone's GPS provider actually delivered. Real
+  implication for Slice 6: "elapsed time since last GNSS fix"
+  (PRD.md Section 13's listed velocity-model input) must be computed
+  from ACTUAL fix-change timestamps, not assumed to be ~1s; and
+  training row/label independence needs care, since ~90 consecutive
+  10 Hz rows share one ground-truth GPS speed value, not 90 independent
+  ground-truth readings.
+  Vehicle CSVs have 29 columns (GPS, wheel speeds, steering angle, yaw
+  rate, indicated accelerations, gear, brake/clutch/accelerator state,
+  etc.) also at 10 Hz via a Racelogic VBOX CAN-bus logger — this is
+  external-hardware ground truth we don't have live, useful only for
+  offline training/validation, never for the on-device app.
+
+- **CRITICAL axis-convention finding (device-frame mismatch)**:
+  extracted and viewed the dataset's own Figure 2 (smartphone sensor
+  axis diagram) directly from the PDF rather than assuming. It shows
+  the phone lying flat, and its labeled X/Y/Z axes do NOT match
+  Android's standard SensorEvent device-frame convention that our own
+  `sensors/SensorSample.kt` uses (device X = right edge, Y = toward top
+  of screen, Z = out of the screen face). In the dataset's diagram: the
+  axis they call "Y" points along the direction of travel (out the
+  right edge of the phone as mounted) and is explicitly labeled
+  "Direction of travel" in the figure; the axis they call "X" points
+  straight up out of the screen face; the axis they call "Z" runs along
+  the phone's long edge. This means IO-VNBD's accelerometer/gyroscope
+  X/Y/Z columns are a PERMUTED relabeling relative to raw Android
+  SensorEvent axes, not the same convention — training a model directly
+  on IO-VNBD's raw X/Y/Z (or Yaw/Pitch/Roll) columns without accounting
+  for this would silently mismatch our live device-frame samples
+  (CLAUDE.md Rule 9/14's exact concern). Practical implication for
+  Slice 6: `FeatureExtractor.kt` must not feed raw device-frame columns
+  from either source into the same model un-reconciled — either remap
+  IO-VNBD's columns to Android's SensorEvent convention during
+  preprocessing, or better, compute features in a mounting-convention-
+  independent frame. **RESOLVED (2026-08-25)**: `ml/feature_extraction.py`
+  took the "mounting-convention-independent frame" path (device-frame
+  Gram-Schmidt against gravity, not raw axis remapping); the Kotlin
+  `features/FeatureExtractor.kt` sidesteps the question entirely by
+  receiving ALREADY vehicle-frame-rotated input from
+  `ml/MlVelocityRepository.kt` (a different, WORLD-frame-heading-based
+  rotation — see that file's entry for the resulting, honestly-
+  documented parity gap between the two approaches). This is actually
+  a second, independent reason PRD.md Section 11's planned vehicle-frame
+  transform is necessary before feature extraction, not just a
+  nice-to-have — it launders away exactly this kind of raw-axis
+  mismatch between training data and live
+  device data). Also confirms the dataset's own smartphone was mounted
+  in a fixed, known, consistent orientation throughout collection (a
+  windshield-mounted holder, per the setup photo also extracted from the
+  PDF) — i.e. IO-VNBD implicitly assumes a solved phone-to-vehicle
+  alignment, which our live app does not have yet (PRD.md Section 15,
+  still PLANNED).
+
+- **Motion-classifier labels**: NO per-timestamp event labels exist in
+  the CSVs (no "Pothole"/"Turning"/"Phone Moved"/"Stationary" column
+  with a 0/1 or class value per row). The PDF's Appendix tables (A1-1
+  through A7) instead give TRIP-LEVEL scenario tags in a free-text
+  "Features" column (e.g. "Hard Brake, Round-About (x9), Reverse (x5),
+  Hilly Road... Potholes" for one whole ~86-minute trip) — these say
+  what happened SOMEWHERE during that drive, not when. This directly
+  answers PRD.md Section 24's open question: IO-VNBD is well-suited to
+  the velocity regression model (GPS/wheel-speed ground truth exists at
+  every timestamp) but NOT directly usable as-is for Section 14's
+  per-sample motion classifier (Stationary/Pothole/Turning/Phone Moved)
+  without either (a) weak/heuristic labeling from other columns for
+  some classes (e.g. Stationary is derivable from GPS speed ≈ 0 — the
+  dataset even includes 20+ minutes of dedicated "Stationary (No
+  Motion)" trips, e.g. V-Vw1/V-Vw15, explicitly recorded for sensor-bias
+  estimation, which is directly useful for validating/tuning
+  `dr/StationaryDetector.kt`'s thresholds against real recorded noise),
+  or (b) self-captured supplementary data for classes with no clean
+  derivable signal (Pothole, Phone Moved have no dedicated ground-truth
+  channel at all). **Decision**: proceed with IO-VNBD as primary for
+  the velocity model and for Stationary-class weak-labeling; plan a
+  short self-captured recording specifically for Pothole/Phone-Moved
+  examples before Slice 6's classifier training, per PRD.md Section 24's
+  anticipated fallback — this is not yet done, flagged for Slice 6.
+
+- **Other findings not previously anticipated, worth recording**:
+  (1) the PDF documents that Driver F's trips (S-T1...S-T11) are
+  missing orientation/magnetic-field data (a 20-column variant) — but
+  the "Synchronised V and S datasets" archive we actually downloaded
+  only contains Drivers A, B, D, and E (`ml/inspect_dataset.py`'s real
+  run confirms: 72/72 trips are the full 24-column schema, zero
+  20-column files found). Driver F/G/H's independently-captured trips
+  (Table A7) live only in the separate "Unsynchronised V and S Dataset"
+  archive, which is NOT downloaded — `inspect_dataset.py` still handles
+  the 20-column variant defensively (in case that archive is ever
+  added), but it's currently dead code against our actual data, not
+  something we've verified against real files. (2) 4 drivers present
+  (not 8 — the other 4 from Table 1 only appear in non-synchronised or
+  vehicle-only recordings we don't have), 3 "Defensive" (A, B, D) +
+  1 "Aggressive" (Driver E) — Driver E alone contributes the large
+  Vta/Vtb/Vw/Vf families of trips (most of the 72), so a naive random
+  train/val split could accidentally concentrate aggressive-driving
+  examples in one split; PRD.md Section 25's "split respects trip/
+  session boundaries" already guards against within-trip leakage, but
+  driver-level stratification is a related concern worth considering
+  during actual training, given how driver-imbalanced this subset is.
+  (3) recorded across multiple UK regions per the PDF's per-trip city
+  listings, with real GPS-loss periods noted in an accompanying txt
+  file (not yet located/inspected in our download) — potentially
+  directly useful as real, non-simulated GNSS-outage examples for later
+  validation, worth locating in Slice 9.
 
 ## Change log
 
@@ -983,3 +1726,254 @@ regression can be traced to a specific model version.
   motion classifier wired in) — requires Phase 4 dataset inspection
   (PRD.md Section 24) first, since no training data has been looked at
   yet.
+- Phase 4 (dataset inspection) done (2026-08-25): downloaded IO-VNBD's
+  Synchronised V+S dataset (~194 MB, Git LFS — see `data/README.md` for
+  the exact re-download command and checksum) into `data/raw/IO-VNBD/`
+  (gitignored, verified via `git check-ignore`), extracted it, and read
+  360 files on disk plus the dataset's own descriptor PDF in full. See
+  `## Phase 4 — Dataset inspection findings` above for the complete
+  writeup. Headline results: (1) confirmed real 10 Hz smartphone / 1 Hz
+  GPS sampling matching our target; (2) found a real, concrete
+  axis-convention mismatch between IO-VNBD's smartphone accelerometer/
+  gyroscope columns and Android's raw SensorEvent device frame (verified
+  by extracting and viewing the dataset's own axis diagram from the
+  PDF, not assumed) — this must be reconciled before Slice 6's
+  FeatureExtractor.kt exists; (3) confirmed IO-VNBD has no per-timestamp
+  motion-event labels, only trip-level free-text scenario tags — good
+  enough for the velocity model and Stationary-class weak labeling
+  (including 20+ minutes of dedicated stationary/bias-estimation
+  recordings, useful for tuning StationaryDetector's thresholds against
+  real data), not enough for Pothole/Phone-Moved without self-captured
+  supplementary data, which is now planned before Slice 6 classifier
+  training rather than assumed unnecessary. `data/README.md` updated
+  with the re-download procedure. Next: Slice 6 (ML inference), now
+  unblocked, starting with `ml/inspect_dataset.py` (turning this manual
+  inspection into a reproducible script) and `ml/feature_extraction.py`
+  (which must apply the axis-convention fix found here).
+- `ml/inspect_dataset.py` implemented (2026-08-25), and in writing it,
+  corrected the Phase 4 entry above: the 360 files on disk are NOT 72
+  unique trips — the download contains the same 72 trips duplicated
+  across "Categorised IOVNB Dataset" and "Uncategorised IOVNB Dataset"
+  (confirmed by diffing a sample pair: identical data modulo float64
+  repr noise and cosmetic header-name differences). A naive recursive
+  scan would have silently duplicated every trip across a future train/
+  val split — caught before any training happened, not after. Script
+  now scans only "Categorised..." by default and documents why.
+  Installed the rest of `ml/requirements.txt` (pandas/numpy/sklearn
+  were already present in this environment; onnx/onnxruntime/skl2onnx/
+  matplotlib/jupyter/pytest were not). Real run against the actual
+  downloaded dataset: 72 unique trips, 1,070,745 rows, 25.1 hours, all
+  24-column schema (Driver F's documented 20-column variant turns out
+  to not be present in this archive at all — it only exists in the
+  separate, not-downloaded "Unsynchronised" archive, corrected in the
+  Phase 4 findings above), all within Hz tolerance, all correctly
+  paired with a vehicle file. Also found (not previously known): ~800
+  rows in one trip have their satellite-count field corrupted into
+  date-like strings ("Dec-14") by what looks like an Excel auto-date-
+  conversion artifact somewhere in the dataset's prep — harmless for us
+  since satellite count isn't a feature either model uses. Also
+  corrected the Phase 4 findings' driver-count claim from 8 to 4 (only
+  Drivers A/B/D/E are present in the archive we have; the dataset PDF's
+  Table 1 describes all 8 drivers across BOTH archives). Added
+  `tests/ml/test_inspect_dataset.py` (5 cases, synthetic data, no
+  dependency on the real download) for the pure helper functions.
+  `python -m pytest tests/ml/test_inspect_dataset.py` — 5/5 pass.
+  Manifest written to `data/processed/io_vnbd_smartphone_manifest.csv`
+  (gitignored, reproducible). Next: `ml/feature_extraction.py`.
+- Second correction, same day (2026-08-25): while sanity-checking label
+  design ahead of `feature_extraction.py`, spot-checked whether GPS
+  speed genuinely updates every 10 Hz row and found it doesn't — the
+  `gps_latitude_deg`/`gps_speed_kmh` columns are held constant for ~90
+  consecutive rows (~9s) between real fix updates, not 1 Hz as
+  README_1.pdf documents. Verified across 4 different trips/drivers
+  before trusting it as systemic rather than a one-off. Added
+  `_observed_gps_fix_interval_s` to `inspect_dataset.py` (measures from
+  actual value-change timestamps) plus 2 new unit tests, reran against
+  the full dataset: 68/72 trips confirm ~9.0s, matching the earlier
+  spot-check. Corrected the Phase 4 findings and `inspect_dataset.py`'s
+  file entry above accordingly. This directly changes how
+  `feature_extraction.py` must compute PRD.md Section 13's "elapsed
+  time since last GNSS fix" feature (from measured ~9s intervals, not
+  assumed ~1s) and how training labels should be constructed (many
+  consecutive rows share one ground-truth value, not 90 independent
+  readings) — caught before writing that script, not after.
+  `python -m pytest tests/ml/test_inspect_dataset.py` — 7/7 pass. Next:
+  `ml/feature_extraction.py`, now designed with the correct GPS-timing
+  assumption from the start.
+- `ml/feature_extraction.py` implemented (2026-08-25) — vehicle-frame
+  windowed features via per-timestamp Gram-Schmidt against the recorded
+  gravity vector (see that file's entry above for the full design and
+  math). Before writing `train_velocity_model.py` against this output,
+  sanity-checked it by correlating windowed forward-acceleration against
+  real GPS speed changes across all 72 trips (13,902 segments) — found
+  it NEGATIVE (-0.136), backwards from physics. Root cause: the
+  dataset's own figure (trusted in the Phase 4 findings above) had the
+  forward-axis sign wrong relative to the actual data — the figure was
+  a claim, checking it against real ground truth is what caught it
+  (CLAUDE.md Rule 13). Fixed by flipping the forward axis to -device-Y;
+  re-verified correlation flips to +0.137 across the same 13,905
+  segments. Updated the Phase 4 findings above and this file's
+  `feature_extraction.py` entry with the correction. All 6 unit tests
+  updated to match the corrected sign and still pass; note the unit
+  tests alone (self-consistency checks) could never have caught this —
+  it required checking against real, independent ground truth. This is
+  exactly why CLAUDE.md Rule 18 says prototype small and verify before
+  building a large abstraction on an unverified assumption: a wrong
+  sign here would have silently produced a velocity model trained
+  backwards, likely undetected until real-world testing much later.
+  Next: `train_velocity_model.py`, now building on a vehicle-frame
+  feature set actually validated against real ground truth, not just
+  assumed correct from a diagram.
+- `train_velocity_model.py` implemented (2026-08-25) — RandomForest
+  velocity regressor, trip-level train/val split, evaluated against a
+  Python re-implementation of the app's own physics+ZUPT baseline on
+  the same held-out trips (CLAUDE.md Rule 3). Deliberately excluded
+  previous_gps_speed_mps as a feature despite PRD.md Section 13 listing
+  it — it's near-identical to the label itself given this dataset's
+  ~90-row GPS hold pattern, which would have let the model cheat by
+  copying it rather than learning from the IMU (caught before training,
+  not after seeing suspiciously perfect numbers). **Real result: ML
+  MAE=1.244 m/s vs Physics+ZUPT MAE=5.205 m/s — ~4.2x more accurate**,
+  winning on 13/14 held-out trips. See that file's entry above for the
+  full writeup including the one trip where physics won, the dominant
+  `accel_up_std_mps2` feature-importance finding (plausibly a real
+  vibration-based speed proxy, not necessarily a bug, but a
+  generalization risk worth flagging honestly), and the evaluation-scope
+  caveat (this measures per-tick accuracy, not simulated multi-minute
+  outage drift — that's Slice 9). This is the project's first real,
+  measured ML-vs-baseline comparison — CLAUDE.md Rule 3 is satisfied:
+  ML is justified for the velocity model, not assumed. Next:
+  `export_model.py` (ONNX export + parity check) now that there's a
+  result worth exporting.
+- `export_model.py` implemented (2026-08-25) — retrains on all 72
+  trips, exports to `models/velocity_v1.onnx` (20.7 MB, gitignored),
+  runs a real output-parity check (sklearn vs onnxruntime on 5,000 held-
+  out rows, not just "did it export"): max diff 0.000001 m/s, passed.
+  CLAUDE.md Rule 20 satisfied for the velocity model. On-device
+  latency/size are still unmeasured (desktop-only so far, CLAUDE.md
+  Rule 12) — that needs Slice 6's Kotlin VelocityModel.kt to exist
+  first. Slice 6's ml/ half (dataset inspection, feature extraction,
+  velocity model training + export) is now complete and real —
+  `train_motion_classifier.py` remains PLANNED (blocked on self-
+  captured Pothole/Phone-Moved data per the Phase 4 findings), and the
+  Kotlin half (FeatureExtractor.kt, AlignmentEstimator.kt,
+  VelocityModel.kt, wiring into BaselineDeadReckoningRepository) is
+  entirely still PLANNED — Slice 6 is not finished, only its Python
+  training pipeline is.
+- Test coverage hardening pass (2026-08-25), requested before starting
+  the Kotlin half of Slice 6: `train_velocity_model.py` and
+  `export_model.py` had shipped with zero unit tests, only validated by
+  one real run each — a real gap against CLAUDE.md Rule 19 ("gets a
+  unit test before it is relied upon"). Added
+  `tests/ml/test_train_velocity_model.py` (14 cases, including a real
+  training-reproducibility test per PRD.md Section 27 — two models
+  trained on identical data with the same seed produce byte-identical
+  predictions) and `tests/ml/test_export_model.py` (2 cases, a real
+  sklearn->ONNX->onnxruntime round-trip on a tiny synthetic model,
+  including a negative test proving the parity check can actually
+  detect a real mismatch, not just that it never fires). One test's
+  hand-derived expectation was initially wrong (mental model of which
+  row's acceleration produces which row's velocity was off by one) —
+  caught by the test failing against the real function, fixed the test
+  not the function. Also re-ran `python ml/train_velocity_model.py`
+  against the real dataset a second time and got byte-identical MAE/
+  RMSE to the first run, and re-ran the full Kotlin `./gradlew test`
+  suite to confirm nothing on the Android side had regressed. Combined
+  suite: 29 Python ML tests + 46 Kotlin tests, all passing. This is the
+  testing checkpoint before starting the Kotlin half of Slice 6
+  (FeatureExtractor.kt, AlignmentEstimator.kt, VelocityModel.kt, and
+  wiring `models/velocity_v1.onnx` into the actual app).
+- Slice 6 Kotlin wiring implemented (2026-08-25): built the on-device
+  half of Slice 6. Key design decision made up front: since Android's
+  rotation-vector sensor already fuses gravity into azimuth/pitch/roll,
+  PRD.md Section 15's only genuinely missing piece is the YAW offset
+  between device compass heading and true vehicle direction of travel —
+  `alignment/AlignmentEstimator.kt` estimates exactly that (circular-
+  mean of device-azimuth-minus-GNSS-course during straight, fast
+  driving), backed by `alignment/YawRate.kt`'s angle-unwrap-aware
+  turning-rate math. `features/{RollingWindow,FeatureExtractor}.kt`
+  mirrors `ml/feature_extraction.py`'s windowed statistics, including
+  two genuinely easy-to-miss parity details replicated on purpose:
+  pandas' rolling `.std()` is SAMPLE std (ddof=1, not population std),
+  and the zero-crossing-rate calculation inherits a pandas NaN-
+  comparison quirk that counts the very first sample as a "change."
+  `ml/VelocityModel.kt` wraps ONNX Runtime Mobile — its input/output
+  tensor names ("input"/"variable") were verified against the actual
+  exported file via onnxruntime's Python API before hardcoding, not
+  guessed. `ml/MlVelocityRepository.kt` wires it all together as a
+  repository PARALLEL to (not replacing) BaselineDeadReckoningRepository,
+  so the ML-vs-physics comparison is directly visible on-device, not
+  just a desktop claim — this also means the physics position estimate
+  and Slice 5's test coverage were completely untouched by this change.
+  Copied `models/velocity_v1.onnx` into `android/app/src/main/assets/`
+  (gitignored, like the rest of the model artifacts — documented
+  re-copy step added to `.gitignore`).
+  3 test bugs caught and fixed during development, each by the test
+  failing against otherwise-correct code: a sign error in
+  `AlignmentEstimatorTest`'s hand-derived wrap-around expectation
+  (179 vs -179 degrees) — caught by cross-checking with Python's
+  `math.atan2` before trusting it; two `FeatureExtractorTest` cases
+  that forgot the rolling window mixes in earlier ticks' values rather
+  than reflecting only the latest instantaneous one. `./gradlew test` —
+  all 76 tests pass (46 + 29 new, net of the fixes).
+  On-device (2026-08-25, same S24 FE): `./gradlew installDebug`, no
+  crash, ONNX Runtime loaded the bundled model and produced live
+  predictions (0.11-0.74 m/s observed while stationary — plausible
+  small noise floor). Found a real Compose bug while verifying: the
+  screen's Column had no scroll modifier, so as content had grown
+  across Slices 4-6 it silently overflowed past the bottom edge with
+  NO way to reach it — confirmed by swiping, which did nothing (proof
+  it wasn't scrollable, not that a different gesture was needed). This
+  meant Slice 6's entire ML section was in the composition but
+  genuinely invisible. Fixed with `.verticalScroll(rememberScrollState())`;
+  re-verified by scrolling to and screenshotting the previously-hidden
+  section, which showed the live ML velocity prediction and an honest
+  "alignment not yet established" status (correct, given stationary +
+  no GNSS fix indoors). A real lesson recorded here deliberately: a
+  successful build and a non-crashing app are not the same as "the
+  content is actually visible" — only looking at the real device caught
+  this. Also swept the rest of `docs/PROJECT_MAP.md` for now-stale
+  "still PLANNED" references to files this change just implemented
+  (found and fixed 5 of them) — a build.gradle.kts scaffold note, a
+  WorldFrameAcceleration.kt note, a Phase-4-findings note, and a
+  train_velocity_model.py note, per CLAUDE.md's "never leave it
+  describing something that no longer exists."
+  Slice 1-6 (Kotlin half included) now fully verified end-to-end on
+  real hardware. Explicitly not done: ML velocity is comparison-only,
+  not fed into the position integrator; the motion classifier; a true
+  cross-language feature-parity test (a known, documented gap — see
+  FeatureExtractor.kt's and MlVelocityRepository's entries). Next:
+  either wire ML velocity into the actual position integrator, or
+  Slice 7 (GNSS/DR fusion) — not yet decided.
+- ML velocity wired into an actual position integrator (2026-08-25,
+  follow-up — user chose to wire ML velocity into position tracking
+  over starting Slice 7). Added `ml/MlPositionIntegrator.kt`
+  (PRD.md Section 16's `v[t]=VelocityModel(...)` propagation, no
+  momentum/acceleration state — position depends only on each tick's
+  predicted speed + heading; non-holonomic constraint satisfied by
+  construction since no lateral component is ever predicted) and wired
+  it into `MlVelocityRepository.kt` alongside a reused
+  `dr/StationaryDetector.kt` instance for ZUPT — same GNSS-mode-gated
+  reset as the physics path, for a directly comparable readout. Added
+  `MlVelocityUiState.positionEastM/positionNorthM` and a new UI section
+  in `MainActivity.kt`. `./gradlew test` — all 83 tests pass (76 + 7
+  new `MlPositionIntegratorTest` cases). Installed on the same S24 FE:
+  no crash, both position readouts visible and updating.
+  REAL FINDING from on-device testing, not from the unit tests: the
+  physics position stayed flat at rest (matching Slice 5's earlier
+  result) but the ML-based position jumped ~1.6m over ~45s in a burst,
+  then flattened again — traced to a genuine design asymmetry (ZUPT
+  zeroes a bounded, carried momentum for physics, but only gates an
+  unbounded per-tick prediction for the ML path, since that path has
+  no momentum concept at all) rather than a coding bug. Discussed with
+  the user; explicit decision made to document this now and defer a
+  fix (deadband, smoothing, or stricter dwell time were all considered
+  candidates) rather than reflexively patch it without more thought.
+  See `ml/MlPositionIntegrator.kt` and `ml/MlVelocityRepository.kt`'s
+  entries above for the full technical writeup. This is exactly the
+  kind of gap that only shows up from real sensor noise on real
+  hardware, not from synthetic unit tests — all 7 new unit tests pass
+  cleanly despite the integrator having this real sensitivity, because
+  the tests (correctly) verify the design does what it was built to
+  do; they can't by themselves reveal that the design choice itself
+  has this consequence under real-world noise.
