@@ -37,12 +37,13 @@ data class GnssModeTransition(
  * next transition is considered, matching PRD.md Section 18's diagram.
  *
  * TRANSITION/REACQUISITION here are state-machine bookkeeping only —
- * they do NOT yet blend GNSS and dead-reckoned position estimates
- * together (PRD.md Section 18's "freeze/average" and "blend DR toward
- * new GNSS fix" behavior). That blending is Slice 7 (Fusion /
- * re-alignment on GNSS reacquisition, per CLAUDE.md's slice order) —
- * this slice's job is only to detect the outage and transition state
- * correctly and honestly, not to fuse positions yet.
+ * this class itself does NOT blend GNSS and dead-reckoned position
+ * estimates together (PRD.md Section 18's "freeze/average" and "blend DR
+ * toward new GNSS fix" behavior). That blending is
+ * fusion/PositionFusion.kt (Slice 7, driven by fusion/StateEstimator.kt
+ * off this class's mode output) — this class's job stays only to detect
+ * the outage and transition state correctly and honestly, not to fuse
+ * positions itself.
  */
 class GnssOutageDetector(
     private val outageEnterDwellMs: Long = 2_000L,

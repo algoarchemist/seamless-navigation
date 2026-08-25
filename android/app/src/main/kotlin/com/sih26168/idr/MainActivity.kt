@@ -3,6 +3,7 @@ package com.sih26168.idr
 import android.Manifest
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -11,17 +12,25 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import com.sih26168.idr.capture.SensorRecorder
 import com.sih26168.idr.dr.BaselineDeadReckoningRepository
 import com.sih26168.idr.dr.DeadReckoningState
+import com.sih26168.idr.fusion.DrSource
+import com.sih26168.idr.fusion.FusedPositionUiState
+import com.sih26168.idr.fusion.StateEstimator
 import com.sih26168.idr.gnss.GnssModeRepository
 import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.gnss.LocationRepository
@@ -30,12 +39,19 @@ import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.ml.VelocityModel
 import com.sih26168.idr.sensors.SensorRepository
 import com.sih26168.idr.sensors.SensorUiState
+import com.sih26168.idr.ui.screens.DriveScreen
+import com.sih26168.idr.ui.theme.IdrTheme
+import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
- * Slice 1+2+3+4+5+6 (per CLAUDE.md's slice order): reads live
+ * Slice 1+2+3+4+5+6+7 (per CLAUDE.md's slice order): reads live
  * accelerometer, gyroscope, and rotation-vector-derived orientation via
  * [SensorRepository]; reads GNSS fixes via [LocationRepository] and runs
  * the GNSS_AIDED/TRANSITION/DEAD_RECKONING/REACQUISITION hysteresis
@@ -43,18 +59,32 @@ import kotlinx.coroutines.flow.asStateFlow
  * [BaselineDeadReckoningRepository] for a WORLD-frame physics position
  * estimate corrected by ZUPT and a non-holonomic constraint; ALSO feeds
  * sensors + GNSS into [MlVelocityRepository] for a live ML-predicted
- * velocity, displayed side by side with the physics estimate (Slice 6
- * — see that class's doc for why it's parallel, not a replacement, yet).
+ * velocity (now bias-corrected against GNSS speed, Slice 7), displayed
+ * side by side with the physics estimate (Slice 6 — see that class's doc
+ * for why it's parallel, not a replacement). Slice 7 additionally feeds
+ * [GnssModeRepository], [BaselineDeadReckoningRepository], and
+ * [MlVelocityRepository] into [StateEstimator], which actually blends
+ * GNSS and DR positions together on TRANSITION/REACQUISITION (freeze /
+ * blend-toward-fix, per PRD.md Section 18) — the fused readout is a
+ * fourth, additional position display, not a replacement for the other
+ * two (same "show it side by side" philosophy as Slice 6).
  * Orientation is DEVICE-relative-to-WORLD frame only (CLAUDE.md
  * Rule 9/14) — no vehicle-frame alignment for the position estimate
  * (AlignmentEstimator only feeds the ML feature path so far).
  */
+data class RecordingUiState(
+    val isRecording: Boolean = false,
+    val recordedCount: Int = 0,
+    val lastSavedFileName: String? = null,
+)
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var sensorRepository: SensorRepository
     private lateinit var deadReckoningRepository: BaselineDeadReckoningRepository
     private lateinit var locationRepository: LocationRepository
     private lateinit var gnssModeRepository: GnssModeRepository
+    private lateinit var stateEstimator: StateEstimator
     private var mlVelocityRepository: MlVelocityRepository? = null
     private var velocityModel: VelocityModel? = null
 
@@ -64,6 +94,18 @@ class MainActivity : ComponentActivity() {
     // asset per docs/PROJECT_MAP.md) and should be visible on screen.
     private val _mlModelLoadError = MutableStateFlow<String?>(null)
     private val mlModelLoadError: StateFlow<String?> = _mlModelLoadError.asStateFlow()
+
+    // One-off data-capture tool (capture/SensorRecorder.kt) — gathers
+    // real, physically-moved-phone sensor data for the "self-captured
+    // Pothole/Phone-Moved data" docs/PROJECT_MAP.md lists as blocking
+    // train_motion_classifier.py. Deliberately NOT wired into any of the
+    // position/fusion pipeline above — it only reads sensorRepository's
+    // stream, same as any other consumer.
+    private val sensorRecorder = SensorRecorder()
+    private val _recordingState = MutableStateFlow(RecordingUiState())
+    private val recordingState: StateFlow<RecordingUiState> = _recordingState.asStateFlow()
+    private var recorderCollectJob: Job? = null
+    private var lastProcessedRecorderAccelTimestampNs: Long? = null
 
     // Must be registered before the activity reaches STARTED — a property
     // initializer (runs during construction, before onCreate) satisfies that.
@@ -97,13 +139,44 @@ class MainActivity : ComponentActivity() {
             _mlModelLoadError.value = e.message ?: e::class.simpleName ?: "unknown error"
         }
 
+        // Constructed after the try/catch above so it sees the FINAL
+        // mlVelocityRepository value (null if the ONNX model failed to
+        // load) — StateEstimator falls back to physics-only fusion in
+        // that case rather than crashing (CLAUDE.md Rule 13's resilience
+        // pattern, same as everywhere else the ML half is optional).
+        stateEstimator = StateEstimator(gnssModeRepository, deadReckoningRepository, mlVelocityRepository, lifecycleScope)
+
         setContent {
             val uiState by sensorRepository.state.collectAsState()
             val drState by deadReckoningRepository.state.collectAsState()
             val gnssState by gnssModeRepository.state.collectAsState()
             val mlState by (mlVelocityRepository?.state ?: MutableStateFlow(MlVelocityUiState())).collectAsState()
+            val fusedState by stateEstimator.state.collectAsState()
             val mlError by mlModelLoadError.collectAsState()
-            IdrSensorScreen(uiState, drState, gnssState, mlState, mlError, sensorRepository.hasRequiredSensors())
+            val recState by recordingState.collectAsState()
+            var showDebugScreen by remember { mutableStateOf(false) }
+            BackHandler(enabled = showDebugScreen) { showDebugScreen = false }
+
+            IdrTheme {
+                if (showDebugScreen) {
+                    IdrSensorScreen(
+                        uiState, drState, gnssState, mlState, fusedState, mlError, recState,
+                        sensorRepository.hasRequiredSensors(),
+                        onStartRecording = ::startRecording,
+                        onStopRecording = ::stopRecordingAndSave,
+                    )
+                } else {
+                    DriveScreen(
+                        drState = drState,
+                        gnssState = gnssState,
+                        mlState = mlState,
+                        fusedState = fusedState,
+                        mlModelLoadError = mlError,
+                        onRecalibrate = { mlVelocityRepository?.resetAlignment() },
+                        onShowDebugScreen = { showDebugScreen = true },
+                    )
+                }
+            }
         }
     }
 
@@ -123,9 +196,51 @@ class MainActivity : ComponentActivity() {
         // (Slice 5) reads an already-ticking mode, not just the default.
         deadReckoningRepository.start()
         mlVelocityRepository?.start()
+        // Started last — it reads deadReckoningRepository's and
+        // mlVelocityRepository's latest .value each tick, so both must
+        // already be ticking (Slice 7).
+        stateEstimator.start()
+
+        // Always collecting (same lifecycle-tied start/stop convention as
+        // every other repository here) — whether a tick actually gets
+        // appended is gated by RecordingUiState.isRecording inside the
+        // loop, toggled by the Start/Stop button.
+        lastProcessedRecorderAccelTimestampNs = null
+        recorderCollectJob = lifecycleScope.launch {
+            sensorRepository.state.collect { sensorUiState ->
+                if (!_recordingState.value.isRecording) return@collect
+                val accel = sensorUiState.latestAccel ?: return@collect
+                val gyro = sensorUiState.latestGyro ?: return@collect
+                val orientation = sensorUiState.latestOrientation ?: return@collect
+                // Same dedup guard as BaselineDeadReckoningRepository/
+                // MlVelocityRepository — SensorRepository's StateFlow
+                // re-emits on every gyro/orientation update too, not just
+                // accel, so without this each real tick would be recorded
+                // 2-3x with near-identical values.
+                if (accel.timestampNs == lastProcessedRecorderAccelTimestampNs) return@collect
+                lastProcessedRecorderAccelTimestampNs = accel.timestampNs
+
+                sensorRecorder.record(
+                    timestampNs = accel.timestampNs,
+                    accelXMps2 = accel.xMps2,
+                    accelYMps2 = accel.yMps2,
+                    accelZMps2 = accel.zMps2,
+                    gyroXRadPerSec = gyro.xRadPerSec,
+                    gyroYRadPerSec = gyro.yRadPerSec,
+                    gyroZRadPerSec = gyro.zRadPerSec,
+                    azimuthRad = orientation.azimuthRad,
+                    pitchRad = orientation.pitchRad,
+                    rollRad = orientation.rollRad,
+                )
+                _recordingState.value = _recordingState.value.copy(recordedCount = sensorRecorder.recordedCount)
+            }
+        }
     }
 
     override fun onPause() {
+        recorderCollectJob?.cancel()
+        recorderCollectJob = null
+        stateEstimator.stop()
         mlVelocityRepository?.stop()
         gnssModeRepository.stop()
         locationRepository.stop()
@@ -138,6 +253,29 @@ class MainActivity : ComponentActivity() {
         velocityModel?.close()
         super.onDestroy()
     }
+
+    private fun startRecording() {
+        sensorRecorder.reset()
+        lastProcessedRecorderAccelTimestampNs = null
+        _recordingState.value = RecordingUiState(isRecording = true, recordedCount = 0)
+    }
+
+    // Writing the JSON off the main thread (Dispatchers.IO) — CLAUDE.md
+    // Android Rule 7's "don't block the UI thread" spirit, even though a
+    // single capture's file is small; the write happens after
+    // isRecording flips to false so no new ticks race with it.
+    private fun stopRecordingAndSave() {
+        _recordingState.value = _recordingState.value.copy(isRecording = false)
+        val json = sensorRecorder.toJsonArray()
+        val fileName = "capture_${System.currentTimeMillis()}.json"
+        lifecycleScope.launch(Dispatchers.IO) {
+            val file = File(getExternalFilesDir(null), fileName)
+            file.writeText(json)
+            withContext(Dispatchers.Main) {
+                _recordingState.value = _recordingState.value.copy(lastSavedFileName = fileName)
+            }
+        }
+    }
 }
 
 @Composable
@@ -146,8 +284,12 @@ private fun IdrSensorScreen(
     drState: DeadReckoningState,
     gnssState: GnssModeUiState,
     mlState: MlVelocityUiState,
+    fusedState: FusedPositionUiState,
     mlModelLoadError: String?,
+    recordingState: RecordingUiState,
     hasRequiredSensors: Boolean,
+    onStartRecording: () -> Unit,
+    onStopRecording: () -> Unit,
 ) {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
@@ -158,7 +300,25 @@ private fun IdrSensorScreen(
                     .padding(24.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text(text = "IDR MVP — Slice 6: + ML velocity + ML position (side by side with physics)")
+                Text(text = "IDR MVP — Slice 7: + GNSS/DR position fusion + ML velocity bias calibration")
+
+                Button(onClick = if (recordingState.isRecording) onStopRecording else onStartRecording) {
+                    Text(text = if (recordingState.isRecording) "Stop recording" else "Start recording")
+                }
+                Text(
+                    text = if (recordingState.isRecording) {
+                        "Recording live sensor data... %d samples captured so far.".format(
+                            recordingState.recordedCount,
+                        )
+                    } else if (recordingState.lastSavedFileName != null) {
+                        "Last capture: %d samples saved to %s (app-external-files dir)".format(
+                            recordingState.recordedCount, recordingState.lastSavedFileName,
+                        )
+                    } else {
+                        "Not recording. Move the phone after tapping Start — accel/gyro/orientation " +
+                            "are logged with millisecond timestamps to a JSON file on Stop."
+                    },
+                )
 
                 if (!hasRequiredSensors) {
                     Text(text = "This device is missing an accelerometer, gyroscope, or rotation-vector sensor.")
@@ -251,13 +411,20 @@ private fun IdrSensorScreen(
                     Text(text = "ML velocity model failed to load: $mlModelLoadError")
                 } else {
                     Text(
-                        text = if (mlState.predictedVelocityMps != null) {
-                            "ML predicted forward speed: %.2f m/s (compare to physics DR velocity above)".format(
-                                mlState.predictedVelocityMps,
+                        text = if (mlState.predictedVelocityCorrectedMps != null) {
+                            "ML predicted forward speed: %.2f m/s corrected (raw=%.2f, learned bias=%.2f)".format(
+                                mlState.predictedVelocityCorrectedMps,
+                                mlState.predictedVelocityRawMps,
+                                mlState.velocityBiasMps,
                             )
                         } else {
                             "ML predicted forward speed: waiting for first inference..."
                         },
+                    )
+                    Text(
+                        text = "^ bias is an online correction learned from GNSS speed while " +
+                            "GNSS_AIDED (PRD Section 17) — held constant, still applied, during " +
+                            "an outage; 0.00 until GNSS has been good and moving above ~18 km/h.",
                     )
                     Text(
                         text = "ML-based DR position (WORLD frame, m since GNSS last good): " +
@@ -280,7 +447,50 @@ private fun IdrSensorScreen(
                                 "straight-line driving above ~18 km/h with GNSS available)"
                         },
                     )
+                    Text(
+                        text = if (mlState.isCruising) {
+                            "Motion state: CRUISING (looks physically still, but the raw model " +
+                                "still predicts real speed — ZUPT skipped this tick)"
+                        } else {
+                            "Motion state: not overridden to cruising this tick"
+                        },
+                    )
+                    Text(
+                        text = "^ deterministic stand-in for PRD Section 14's Stationary/Cruising " +
+                            "classes (not the trained classifier — see MotionStateClassifier.kt), " +
+                            "ML-only so the physics baseline above stays untouched.",
+                    )
+                    Text(
+                        text = if (mlState.potholeShockDetectedThisTick) {
+                            "Pothole/shock: DETECTED this tick — forward/lateral accel discounted " +
+                                "before feature extraction (and in the physics path too)"
+                        } else {
+                            "Pothole/shock: none detected this tick"
+                        },
+                    )
+                    Text(
+                        text = "^ deterministic vertical-accel threshold, PRD Section 14's Pothole " +
+                            "effect — NOT validated against real pothole data (none exists yet).",
+                    )
                 }
+
+                Text(
+                    text = "Fused position (state estimator, WORLD frame, m since GNSS last good): " +
+                        "east=%.2f north=%.2f, DR source=%s".format(
+                            fusedState.fusedEastM, fusedState.fusedNorthM, fusedState.drSourceUsed,
+                        ),
+                )
+                Text(
+                    text = if (fusedState.secondsSinceLastGnssAided == Float.MAX_VALUE) {
+                        "^ no GNSS_AIDED fix yet this run — fusion has no anchor to reference."
+                    } else {
+                        "^ %.1fs since GNSS was last aided — frozen during TRANSITION, blended " +
+                            "toward the new fix over REACQUISITION; this is a raw elapsed-time " +
+                            "figure, not a formal confidence/uncertainty estimate (Slice 7).".format(
+                                fusedState.secondsSinceLastGnssAided,
+                            )
+                    },
+                )
             }
         }
     }

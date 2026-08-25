@@ -2,6 +2,7 @@ package com.sih26168.idr.dr
 
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
+import com.sih26168.idr.motion.PotholeShockDetector
 import com.sih26168.idr.sensors.SampleRate
 import com.sih26168.idr.sensors.SensorRepository
 import kotlin.math.sqrt
@@ -26,16 +27,33 @@ import kotlinx.coroutines.launch
  * Deliberately a separate class from SensorRepository (CLAUDE.md
  * Rule 5 — one clearly stated responsibility per file): SensorRepository
  * owns raw sensor IO only; this owns turning that raw stream into a
- * corrected physics position estimate. Still no ML (Slice 6) and no
- * actual GNSS/DR position fusion (Slice 7, TRANSITION/REACQUISITION
- * blending) — see [BaselinePhysicsIntegrator]'s doc for what remains
- * uncorrected even after this slice.
+ * corrected physics position estimate. This class itself still does no
+ * ML and no GNSS/DR position fusion — TRANSITION/REACQUISITION blending
+ * (Slice 7) lives in fusion/PositionFusion.kt + fusion/StateEstimator.kt,
+ * which read this repository's position as one of two possible DR
+ * inputs rather than this class doing any blending itself — see
+ * [BaselinePhysicsIntegrator]'s doc for what remains uncorrected in the
+ * physics estimate specifically.
+ *
+ * Motion-classification stand-in: [potholeShockDetector] discounts
+ * East/North linear accel on a detected vertical shock before it reaches
+ * [integrator], per PRD.md Section 14's `Pothole` effect — same
+ * detector/logic [com.sih26168.idr.ml.MlVelocityRepository] applies to
+ * its own feature path, applied here too since discounting one sample
+ * doesn't touch the FROZEN Slice 3 baseline measurement already reported
+ * in docs/PROJECT_MAP.md (that number came from [BaselinePhysicsIntegrator.update]
+ * alone, with no corrections at all) — it only affects this LIVE display,
+ * exactly like ZUPT/non-holonomic already do. Not separately surfaced in
+ * the UI here (see MainActivity's ML section instead) — applying the same
+ * discount twice on screen for what is fundamentally one event would be
+ * redundant.
  */
 class BaselineDeadReckoningRepository(
     private val sensorRepository: SensorRepository,
     private val gnssModeRepository: GnssModeRepository,
     private val scope: CoroutineScope,
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
+    private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
 ) {
     private val integrator = BaselinePhysicsIntegrator()
 
@@ -99,10 +117,18 @@ class BaselineDeadReckoningRepository(
                 )
                 val linearAccel = WorldFrameAcceleration.removeGravity(worldAccel)
 
+                // PRD.md Section 14's Pothole effect: discount East/North
+                // (forward-ish) accel on a detected vertical shock so it
+                // doesn't get misread as forward acceleration — the Up
+                // component that triggered detection is left untouched.
+                val potholeShockDetectedThisTick = potholeShockDetector.isShock(linearAccel[2])
+                val linearAccelEastMps2 = if (potholeShockDetectedThisTick) 0.0 else linearAccel[0].toDouble()
+                val linearAccelNorthMps2 = if (potholeShockDetectedThisTick) 0.0 else linearAccel[1].toDouble()
+
                 integrator.update(
                     dtSeconds = dtSeconds,
-                    linearAccelEastMps2 = linearAccel[0].toDouble(),
-                    linearAccelNorthMps2 = linearAccel[1].toDouble(),
+                    linearAccelEastMps2 = linearAccelEastMps2,
+                    linearAccelNorthMps2 = linearAccelNorthMps2,
                 )
 
                 // ZUPT / non-holonomic correction — see StationaryDetector

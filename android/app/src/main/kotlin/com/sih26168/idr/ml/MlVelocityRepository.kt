@@ -4,8 +4,11 @@ import com.sih26168.idr.alignment.AlignmentEstimator
 import com.sih26168.idr.dr.StationaryDetector
 import com.sih26168.idr.dr.WorldFrameAcceleration
 import com.sih26168.idr.features.FeatureExtractor
+import com.sih26168.idr.fusion.VelocityBiasCalibrator
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
+import com.sih26168.idr.motion.MotionStateClassifier
+import com.sih26168.idr.motion.PotholeShockDetector
 import com.sih26168.idr.sensors.SampleRate
 import com.sih26168.idr.sensors.SensorRepository
 import kotlin.math.cos
@@ -19,12 +22,21 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 data class MlVelocityUiState(
-    val predictedVelocityMps: Float? = null,
+    /** The ONNX model's raw output, before Slice 7's bias correction. */
+    val predictedVelocityRawMps: Float? = null,
+    /** [predictedVelocityRawMps] + [velocityBiasMps] — what actually feeds the position integrator. */
+    val predictedVelocityCorrectedMps: Float? = null,
+    /** Currently learned bias (see VelocityBiasCalibrator) — 0 until at least one GNSS_AIDED sample above the speed gate. */
+    val velocityBiasMps: Float = 0f,
     val isAligned: Boolean = false,
     val yawOffsetDeg: Float? = null,
     val alignmentSampleCount: Int = 0,
     val positionEastM: Double = 0.0,
     val positionNorthM: Double = 0.0,
+    /** MotionStateClassifier overrode a physically-still tick to NOT ZUPT, because the raw model still predicts real speed. */
+    val isCruising: Boolean = false,
+    /** PotholeShockDetector fired this tick — forward/lateral accel was discounted before feature extraction. */
+    val potholeShockDetectedThisTick: Boolean = false,
 )
 
 // If no GNSS fix has ever been received, fixAgeMs is Long.MAX_VALUE —
@@ -64,6 +76,24 @@ private const val MAX_ELAPSED_SINCE_FIX_S = 999f
  * fixed, known mounting). See FeatureExtractor.kt's doc for the full
  * explanation of why, and why a true cross-language parity test isn't
  * possible yet.
+ *
+ * Slice 7 addition: PRD.md Section 17's online velocity-bias calibration.
+ * [biasCalibrator] learns a running offset between this model's raw
+ * output and GNSS's own speed reading while GNSS is trustworthy, and that
+ * learned offset is what actually feeds [positionIntegrator] (not the raw
+ * prediction) — see [VelocityBiasCalibrator]'s doc for why this is a
+ * simple EWMA correction, not a Kalman filter.
+ *
+ * Motion-classification stand-ins: [motionStateClassifier] resolves
+ * StationaryDetector's own documented "can't tell stationary from
+ * cruising" ambiguity using this model's raw prediction as a
+ * corroborating signal (deliberately ML-only — the physics-only
+ * [com.sih26168.idr.dr.BaselineDeadReckoningRepository] baseline stays
+ * untouched by any ML signal, per CLAUDE.md Rule 3); [potholeShockDetector]
+ * discounts forward/lateral accel on a detected vertical shock before it
+ * reaches [featureExtractor], per PRD.md Section 14's `Pothole` effect.
+ * Both are deterministic stand-ins, not the trained PRD Section 14
+ * classifier — see their own class docs for why.
  */
 class MlVelocityRepository(
     private val sensorRepository: SensorRepository,
@@ -74,6 +104,9 @@ class MlVelocityRepository(
     private val featureExtractor: FeatureExtractor = FeatureExtractor(),
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
     private val positionIntegrator: MlPositionIntegrator = MlPositionIntegrator(),
+    private val biasCalibrator: VelocityBiasCalibrator = VelocityBiasCalibrator(),
+    private val motionStateClassifier: MotionStateClassifier = MotionStateClassifier(),
+    private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
 ) {
     private val _state = MutableStateFlow(MlVelocityUiState())
     val state: StateFlow<MlVelocityUiState> = _state.asStateFlow()
@@ -83,6 +116,7 @@ class MlVelocityRepository(
 
     fun start() {
         positionIntegrator.reset()
+        biasCalibrator.reset()
         lastProcessedAccelTimestampNs = null
 
         collectJob = scope.launch {
@@ -127,6 +161,18 @@ class MlVelocityRepository(
                 )
                 val linearAccel = WorldFrameAcceleration.removeGravity(worldAccel)
 
+                // PRD.md Section 14's Pothole effect: "discount the
+                // acceleration sample(s) so a vertical/shock spike doesn't
+                // get misread as forward acceleration." Checked BEFORE the
+                // forward/lateral projection below, so a detected shock
+                // discounts exactly the East/North components that
+                // projection turns into accelForwardMps2/accelLateralMps2
+                // — the Up component itself (what triggered the detection)
+                // and gyro are left untouched, matching PRD's wording.
+                val potholeShockDetectedThisTick = potholeShockDetector.isShock(linearAccel[2])
+                val discountedLinearAccelEast = if (potholeShockDetectedThisTick) 0f else linearAccel[0]
+                val discountedLinearAccelNorth = if (potholeShockDetectedThisTick) 0f else linearAccel[1]
+
                 // Project onto the alignment-corrected heading to get
                 // vehicle-frame forward/lateral — same projection
                 // technique as dr/NonHolonomicConstraint.kt, applied to
@@ -137,7 +183,8 @@ class MlVelocityRepository(
                 val vehicleHeadingRad = orientation.azimuthRad - (alignment.yawOffsetRad ?: 0f)
                 val forwardEast = sin(vehicleHeadingRad.toDouble())
                 val forwardNorth = cos(vehicleHeadingRad.toDouble())
-                val accelForwardMps2 = (linearAccel[0] * forwardEast + linearAccel[1] * forwardNorth).toFloat()
+                val accelForwardMps2 =
+                    (discountedLinearAccelEast * forwardEast + discountedLinearAccelNorth * forwardNorth).toFloat()
                 // Lateral = forward rotated -90 degrees (a fixed, internally-
                 // consistent right-hand convention — its SIGN was never
                 // independently verified against ground truth the way
@@ -146,7 +193,8 @@ class MlVelocityRepository(
                 // either; only forward's sign was empirically corrected).
                 val lateralEast = forwardNorth
                 val lateralNorth = -forwardEast
-                val accelLateralMps2 = (linearAccel[0] * lateralEast + linearAccel[1] * lateralNorth).toFloat()
+                val accelLateralMps2 =
+                    (discountedLinearAccelEast * lateralEast + discountedLinearAccelNorth * lateralNorth).toFloat()
                 val accelUpMps2 = linearAccel[2]
 
                 // Yaw rate: rotate the RAW gyro vector into world frame the
@@ -177,7 +225,18 @@ class MlVelocityRepository(
                     elapsedSinceLastGnssFixS = elapsedSinceLastGnssFixS,
                 )
 
-                val predictedVelocityMps = velocityModel.predict(features)
+                val rawPredictedVelocityMps = velocityModel.predict(features)
+
+                // Slice 7 (PRD.md Section 17): while GNSS is trustworthy,
+                // learn the running offset between this model's raw output
+                // and GNSS's own speed reading. Deliberately gated on the
+                // SAME mode boundary the position integrators reset on
+                // (GNSS_AIDED) — that's exactly when there's real ground
+                // truth to calibrate against.
+                if (gnssState.mode == GnssMode.GNSS_AIDED && fix?.speedMps != null) {
+                    biasCalibrator.update(gnssSpeedMps = fix.speedMps, rawPredictedVelocityMps = rawPredictedVelocityMps)
+                }
+                val correctedVelocityMps = biasCalibrator.correctedVelocity(rawPredictedVelocityMps)
 
                 // ZUPT for the ML position path — see MlPositionIntegrator.kt's
                 // doc for why this is still needed even though the model was
@@ -197,26 +256,35 @@ class MlVelocityRepository(
                         gyro.zRadPerSec * gyro.zRadPerSec,
                 )
                 val nowBootTimeMs = accel.timestampNs / 1_000_000L
-                val stationary = stationaryDetector.evaluate(
+                val physicallyStill = stationaryDetector.evaluate(
                     nowBootTimeMs,
                     linearAccelMagnitudeMps2,
                     gyroMagnitudeRadPerSec,
                 )
+                // Motion-classification stand-in: physicallyStill alone can't
+                // tell "truly at rest" from "smoothly cruising" (see
+                // MotionStateClassifier's doc) — corroborate with the raw
+                // model prediction before deciding whether to ZUPT.
+                val motionClassification = motionStateClassifier.classify(physicallyStill, rawPredictedVelocityMps)
 
                 val positionState = positionIntegrator.update(
                     dtSeconds = dtSeconds,
-                    velocityMps = predictedVelocityMps,
+                    velocityMps = correctedVelocityMps,
                     headingRad = vehicleHeadingRad,
-                    isStationary = stationary,
+                    isStationary = motionClassification.isStationary,
                 )
 
                 _state.value = MlVelocityUiState(
-                    predictedVelocityMps = predictedVelocityMps,
+                    predictedVelocityRawMps = rawPredictedVelocityMps,
+                    predictedVelocityCorrectedMps = correctedVelocityMps,
+                    velocityBiasMps = biasCalibrator.currentBiasMps,
                     isAligned = alignment.isAligned,
                     yawOffsetDeg = alignment.yawOffsetRad?.let { Math.toDegrees(it.toDouble()).toFloat() },
                     alignmentSampleCount = alignment.sampleCount,
                     positionEastM = positionState.positionEastM,
                     positionNorthM = positionState.positionNorthM,
+                    isCruising = motionClassification.isCruising,
+                    potholeShockDetectedThisTick = potholeShockDetectedThisTick,
                 )
             }
         }
@@ -225,5 +293,20 @@ class MlVelocityRepository(
     fun stop() {
         collectJob?.cancel()
         collectJob = null
+    }
+
+    /**
+     * PRD.md Section 15's "Ongoing validation... Phone Moved... flag for
+     * recalibration" / Section 31/32's manual "hold phone flat, tap to
+     * calibrate" fallback — Slice 8's recalibrate button calls this
+     * through MainActivity. Discards the accumulated yaw-alignment
+     * estimate so [alignmentEstimator] re-converges from scratch on the
+     * next sustained straight-line GNSS-aided segment, exactly like the
+     * automatic "Phone Moved" re-trigger AlignmentEstimator.reset() was
+     * already built for (see that class's doc) — this is just a second,
+     * manual caller of the same reset.
+     */
+    fun resetAlignment() {
+        alignmentEstimator.reset()
     }
 }
