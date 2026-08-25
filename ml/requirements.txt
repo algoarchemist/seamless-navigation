@@ -1,0 +1,15 @@
+# ml/ offline pipeline dependencies (PRD.md Section 23/25).
+# Tree-ensemble models are the primary path; torch is listed only because
+# PRD.md Section 25 keeps a small MLP as a fallback if trees prove
+# insufficient once real data is inspected in Phase 4 — not installed
+# speculatively beyond being declared here.
+
+numpy
+pandas
+scikit-learn
+matplotlib
+onnx
+onnxruntime
+skl2onnx
+jupyter
+pytest

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Intelligent Dead Reckoning</string>
+    <string name="placeholder_scaffold_notice">Scaffold only — Slice 1 (live sensor display) not yet implemented.</string>
+</resources>

@@ -1,0 +1,34 @@
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/captures/
+android/.cxx/
+# Wrapper jar (~43 KB) IS committed on purpose — it lets any teammate
+# clone-and-build with `./gradlew` immediately, no Android Studio sync
+# required first. Do not add it here.
+
+# Python / ml
+ml/.venv/
+ml/__pycache__/
+**/__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Datasets and model artifacts — versioned deliberately via naming
+# convention (see models/README.md), not via git, since IO-VNBD and
+# exported models are large binary files.
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+models/*.onnx
+models/*.tflite
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
