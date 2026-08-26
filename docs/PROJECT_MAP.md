@@ -597,6 +597,56 @@ root environment — this test session never had a solid outdoor
 GNSS_AIDED lock, so marginal/indoor accuracy readings keep exercising
 every one of these edge cases.
 
+**UPDATE (2026-08-26, real on-device test — map stuck on placeholder
+tiles + can't manually pan, both found + fixed)**: user asked for
+screenshots to check why the map wasn't loading. `logcat` (osmdroid
+debug logging re-enabled briefly, removed after) showed the requested
+tile viewport jumping across 5 unrelated map areas within 34 seconds —
+each jump abandoning whatever tiles were still mid-download for the
+previous one, so almost none ever completed and the screen stayed
+mostly on osmdroid's built-in "tile unavailable" placeholder. Root
+cause in `ui/map/StreetMapView.kt`: the `AndroidView` `update` block
+called `view.controller.animateTo(point)` unconditionally on EVERY
+recomposition (the ~10Hz live sensor/GNSS tick this file's own Slice 8b
+"black tiles" bug already named as a recurring hazard), not just when
+the position actually moved — and a genuine GNSS_AIDED -> TRANSITION ->
+DEAD_RECKONING flip mid-capture (switching which position source
+`MapScreen.kt` feeds in, real vs. drifted-DR) confirmed one concrete
+trigger. Fixed by gating the recenter on a new
+`MIN_RECENTER_DISTANCE_M` (3.0m) threshold against the last centered
+point, so near-zero movement no longer re-triggers a viewport reset —
+this does not fix the underlying position-source jump itself (a
+separate, already-flagged issue), only the redundant/wasteful
+re-centering that was making tile loading far worse than it needed to
+be.
+
+That same unconditional `animateTo` was also why manual panning felt
+broken ("can't scroll through the map, it just resurfaces at the same
+location") — panning itself was never disabled
+(`setMultiTouchControls(true)` already gives real one/two-finger
+drag-to-pan and pinch-to-zoom), the live position update was just
+re-centering the viewport out from under any manual pan on the very
+next tick. Fixed with the standard "follow me" vs. "user is browsing"
+pattern: a `MapListener.onScroll` callback turns off
+`isFollowingLocation` on a real user gesture (distinguished from the
+app's own recentering via an `isProgrammaticMove` flag checked inside
+that same callback), and a new small recenter button (bottom-end of the
+map, `ic_recenter` — reused, not a new drawable) appears only while not
+following, turning it back on and snapping straight back to the live
+position on tap. `animateTo` (animated, async — fires `onScroll` after
+the flag would already be reset) was switched to `setCenter` (instant)
+specifically so `isProgrammaticMove` can be set/cleared synchronously
+around one call and reliably suppress the resulting scroll event.
+HONEST LIMITATION: the new recenter button had to be pushed to 96dp
+bottom padding (not the usual 16dp) — at 16dp it rendered fully hidden
+behind `StatusOverlayContent`'s existing vehicle-mode-selector/
+recalibrate row, which draws on top of this view in `MapScreen.kt`'s
+Box z-order; confirmed on-device both ways (hidden at 16dp, both
+buttons distinguishable at 96dp). Both fixes confirmed on-device via
+screenshot + a simulated pan gesture: tiles now load fully (real road
+names/buildings visible), a pan gesture stays put instead of snapping
+back, and the new button correctly resumes following and re-centers.
+
 ---
 
 ## How to read this file

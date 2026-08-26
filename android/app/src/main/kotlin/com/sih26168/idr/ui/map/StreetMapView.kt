@@ -4,20 +4,33 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.DashPathEffect
 import android.graphics.Paint
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.sih26168.idr.R
 import com.sih26168.idr.gnss.GnssMode
+import com.sih26168.idr.ui.components.FloatingIconButton
 import com.sih26168.idr.ui.theme.AccentBlue
 import com.sih26168.idr.ui.theme.AccentBlueLight
 import com.sih26168.idr.ui.theme.CtaRed
 import org.osmdroid.config.Configuration
+import org.osmdroid.events.MapListener
+import org.osmdroid.events.ScrollEvent
+import org.osmdroid.events.ZoomEvent
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
@@ -66,6 +79,13 @@ import org.osmdroid.views.overlay.TilesOverlay
  * the way switching tile sources does.
  */
 private val STREET_TILE_SOURCE = TileSourceFactory.MAPNIK
+
+// Engineering default (CLAUDE.md Rule 13) — not measured against a
+// specific tile-loading benchmark, just picked well under one tile's
+// real-world width at the zoom levels this screen uses (a zoom-18 tile
+// is roughly 150m wide near the equator, smaller nearer the poles) so a
+// genuine several-meter walk still re-centers promptly.
+private const val MIN_RECENTER_DISTANCE_M = 3.0
 
 /**
  * One-time osmdroid setup (tile cache location + required user-agent —
@@ -204,6 +224,41 @@ fun StreetMapView(
     val context = LocalContext.current
     val overlay = remember { CurrentPositionOverlay() }
     val routePolyline = remember { Polyline().apply { color = CtaRed.toArgb(); width = 12f } }
+    // REAL BUG FIX (2026-08-26, on-device test — map stuck showing mostly
+    // osmdroid's "tile unavailable" placeholder): `update` below re-runs on
+    // EVERY recomposition, i.e. every ~10Hz live sensor/GNSS tick (the
+    // exact hazard this file's Slice 8b "black tiles" bug, above, already
+    // named) — not just when currentLatDeg/currentLonDeg actually change.
+    // Unconditionally calling `view.controller.animateTo(point)` every
+    // single tick was re-centering the viewport dozens of times a second
+    // for near-zero real movement, each call abandoning whatever tiles
+    // were still mid-download for the previous center. logcat confirmed
+    // this: a genuine mode flip (GNSS_AIDED -> TRANSITION -> DEAD_RECKONING,
+    // switching which position source MapScreen.kt feeds in — see that
+    // file's currentLatDeg/currentLonDeg selection) jumped the requested
+    // tiles across 5 unrelated map areas within 34 seconds, so almost none
+    // of them ever finished downloading. Gated on [MIN_RECENTER_DISTANCE_M]
+    // below so only a REAL move re-centers the map; this does not fix the
+    // underlying GNSS_AIDED-vs-drifted-DR position source jump itself
+    // (a separate, already-flagged issue), only the redundant/wasteful
+    // re-centering that was making every jump worse for tile loading.
+    val lastCenteredPoint = remember { mutableStateOf<GeoPoint?>(null) }
+    // REAL BUG FIX (2026-08-26, user report: "can't scroll through the
+    // map, it just resurfaces at the same location"): panning itself was
+    // never disabled (setMultiTouchControls(true) below already gives real
+    // one/two-finger drag-to-pan and pinch-to-zoom) — the live position
+    // update above was simply re-centering the viewport out from under any
+    // manual pan on the very next tick, since it never knew the user had
+    // just moved the map by hand. [isFollowingLocation] tracks whether the
+    // map should keep auto-centering on the live position; a real user
+    // gesture (detected via the MapListener below) turns it off, and the
+    // small recenter button that then appears (bottom-end of the map)
+    // turns it back on — the same "follow me" vs. "user is browsing"
+    // pattern every turn-by-turn map app uses. [isProgrammaticMove]
+    // distinguishes OUR OWN recentering calls from a real user gesture in
+    // that same onScroll callback, since osmdroid fires it for both.
+    var isFollowingLocation by remember { mutableStateOf(true) }
+    val isProgrammaticMove = remember { mutableStateOf(false) }
     val mapView = remember {
         configureOsmdroid(context)
         MapView(context).apply {
@@ -222,6 +277,16 @@ fun StreetMapView(
             controller.setZoom(18.0)
             overlays.add(routePolyline)
             overlays.add(overlay)
+            addMapListener(object : MapListener {
+                override fun onScroll(event: ScrollEvent?): Boolean {
+                    if (!isProgrammaticMove.value) {
+                        isFollowingLocation = false
+                    }
+                    return false
+                }
+
+                override fun onZoom(event: ZoomEvent?): Boolean = false
+            })
         }.also(onMapViewReady)
     }
 
@@ -260,29 +325,79 @@ fun StreetMapView(
         }
     }
 
-    AndroidView(
-        modifier = modifier.fillMaxSize(),
-        factory = { mapView },
-        update = { view ->
-            routePolyline.setPoints(routeGeometry ?: emptyList())
-            overlay.mode = mode
-            overlay.anchor = if (anchorLatDeg != null && anchorLonDeg != null) {
-                GeoPoint(anchorLatDeg, anchorLonDeg)
-            } else {
-                null
-            }
-            // Heading-up rotation while navigating (headingDeg != null),
-            // north-up (0 degrees) otherwise. osmdroid rotates the MAP
-            // clockwise by the given degrees, so to make the device's own
-            // heading point "up" the map must be rotated by the OPPOSITE
-            // (negative) amount.
-            view.setMapOrientation(if (headingDeg != null) -headingDeg else 0f)
-            if (currentLatDeg != null && currentLonDeg != null) {
-                val point = GeoPoint(currentLatDeg, currentLonDeg)
-                overlay.position = point
-                view.controller.animateTo(point)
-            }
-            view.invalidate()
-        },
-    )
+    Box(modifier = modifier.fillMaxSize()) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { mapView },
+            update = { view ->
+                routePolyline.setPoints(routeGeometry ?: emptyList())
+                overlay.mode = mode
+                overlay.anchor = if (anchorLatDeg != null && anchorLonDeg != null) {
+                    GeoPoint(anchorLatDeg, anchorLonDeg)
+                } else {
+                    null
+                }
+                // Heading-up rotation while navigating (headingDeg != null),
+                // north-up (0 degrees) otherwise. osmdroid rotates the MAP
+                // clockwise by the given degrees, so to make the device's
+                // own heading point "up" the map must be rotated by the
+                // OPPOSITE (negative) amount.
+                view.setMapOrientation(if (headingDeg != null) -headingDeg else 0f)
+                if (currentLatDeg != null && currentLonDeg != null) {
+                    val point = GeoPoint(currentLatDeg, currentLonDeg)
+                    overlay.position = point
+                    val previousCenter = lastCenteredPoint.value
+                    val shouldRecenter = isFollowingLocation &&
+                        (previousCenter == null || previousCenter.distanceToAsDouble(point) >= MIN_RECENTER_DISTANCE_M)
+                    if (shouldRecenter) {
+                        // setCenter (instant), not animateTo (animated over
+                        // several frames) — the animated version would fire
+                        // onScroll callbacks asynchronously AFTER this flag
+                        // is reset below, so the MapListener above couldn't
+                        // tell those apart from a real user gesture
+                        // mid-animation. Trades away the smooth pan for a
+                        // reliable follow/user-pan distinction, an honest
+                        // simplification given this map already jumps
+                        // around from real GNSS/DR position-source changes
+                        // (see the fix above).
+                        isProgrammaticMove.value = true
+                        view.controller.setCenter(point)
+                        isProgrammaticMove.value = false
+                        lastCenteredPoint.value = point
+                    }
+                }
+                view.invalidate()
+            },
+        )
+
+        if (!isFollowingLocation) {
+            FloatingIconButton(
+                icon = painterResource(R.drawable.ic_recenter),
+                contentDescription = "Resume following current location",
+                onClick = {
+                    isFollowingLocation = true
+                    val point = overlay.position
+                    if (point != null) {
+                        isProgrammaticMove.value = true
+                        mapView.controller.setCenter(point)
+                        isProgrammaticMove.value = false
+                        lastCenteredPoint.value = point
+                    } else {
+                        // No live position yet to snap to — just let the
+                        // next real position update (the `update` block
+                        // above) recenter as soon as one arrives.
+                        lastCenteredPoint.value = null
+                    }
+                },
+                // Bottom-end, like most map apps' recenter button, but
+                // pushed up well clear of MapScreen.kt's own bottom row
+                // (StatusOverlayContent's vehicle-mode selector + its
+                // recalibrate button, drawn ON TOP of this view in that
+                // screen's Box z-order) — REAL on-device finding: at the
+                // default 16dp padding this button was fully hidden behind
+                // that existing bottom row, not just visually close to it.
+                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 96.dp),
+            )
+        }
+    }
 }
