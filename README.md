@@ -1,0 +1,185 @@
+# IDR — Intelligent Dead Reckoning
+
+**"Your phone doesn't lose navigation when GPS disappears."**
+
+Smart India Hackathon · Problem Statement **26168** · ISRO
+A real Android app that keeps navigating through tunnels, underpasses, multi-level parking, and urban canyons — using only the sensors already in the phone.
+
+---
+
+## The problem
+
+Every consumer navigation app fails the same way in the same places: the
+moment GNSS signal is lost — a highway tunnel, an underground parking ramp,
+a metro underpass, a dense hill road cut through granite — the blue dot
+either freezes, jumps, or silently extrapolates with a naive dead-reckoning
+guess that drifts within seconds. ISRO's Problem Statement 26168 asks a
+direct question: **can a smartphone, with no external hardware, keep
+telling the truth about its own position through that gap** — by fusing
+IMU data with GNSS/INS techniques, applying AI/ML for speed estimation,
+filtering vibration/road noise, auto-aligning phone-to-vehicle, applying
+non-holonomic constraints, and handing back a seamless GNSS↔DR transition?
+
+**Official target** (illustrative, per the problem statement): drift under
+10% of distance travelled during a blackout — under 5 m over 50 m in under
+a minute; under 100 m over 1 km at 60 km/h.
+
+## The solution
+
+IDR is a real Android app, not a slide deck. Underneath a full navigation
+UI (real street maps, destination search, turn-by-turn routing) sits a
+positioning engine that:
+
+1. Reads accelerometer, gyroscope, and orientation at ~10 Hz.
+2. Runs a **physics baseline** — semi-implicit Euler integration, corrected
+   by zero-velocity updates (ZUPT) when genuinely still and a non-holonomic
+   constraint (a car can't drift sideways, so the estimate isn't allowed to
+   either).
+3. Runs a **trained ML velocity model in parallel**, on-device, that beats
+   the physics baseline by a measured 4.2× on real held-out driving data —
+   this is what actually carries position through a GNSS gap.
+4. Drives all of this through a **hysteresis-gated state machine**
+   (`GNSS_AIDED → TRANSITION → DEAD_RECKONING → REACQUISITION`) so a single
+   noisy GPS sample can never flip the whole system, and blends the
+   dead-reckoned guess back toward GPS the instant the sky reopens —
+   measuring the real drift at that exact instant instead of assuming a
+   number.
+
+No feature exists "because AI/ML is in the title" — see [`PRD.md`](PRD.md)
+Section 30 (SIH WOW Factor) for the reasoning behind each one.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Live GNSS/DR status overlay](docs/screenshots/01-drive-status.png) **Live status overlay** — GNSS mode, speed, motion state, and phone-to-vehicle alignment, all reading from the same real pipeline described above. | ![Real destination search](docs/screenshots/02-destination-search.png) **Real destination search** — OpenStreetMap/Nominatim, no mock data, no API key. |
+| ![Real computed route](docs/screenshots/03-route-preview.png) **Real turn-by-turn routing** — an actual OSRM-computed route (14.7 km / 20 min) with real street-name steps. | ![Live turn-by-turn navigation](docs/screenshots/04-live-navigation.png) **Live "Go" navigation** — the next-turn distance keeps counting down using physics + ML fusion, so it doesn't freeze mid-outage like a normal map app. |
+| ![Real measured drift history](docs/screenshots/05-drift-history.png) **Honest drift log** — every number here is measured at the instant GPS was reacquired, not simulated or invented. | |
+
+## How it works
+
+```
+   GNSS_AIDED  ──degraded≥2s──▶  TRANSITION  ──still degraded──▶  DEAD_RECKONING
+        ▲                                                              │
+        │                                                              │ fix reacquired
+        └──────────────────  REACQUISITION  ◀───────────────────────────┘
+             (blends DR guess toward the new fix,
+              measures the real drift at this instant)
+```
+
+- **`GNSS_AIDED`** — fix is fresh and accurate; position comes straight from GPS.
+- **`TRANSITION`** — signal degrading; the last good position is frozen, not extrapolated blindly.
+- **`DEAD_RECKONING`** — no usable fix; the physics baseline and the trained ML model carry the position forward, in parallel, so they can be compared honestly.
+- **`REACQUISITION`** — the dead-reckoned position blends back toward the new GPS fix over a short window, and the gap between "where DR thought we were" and "where GPS says we actually are" is captured as a real, on-screen drift number.
+
+Every transition is logged with its trigger condition, so a test run can be
+replayed and the timing verified after the fact instead of just trusted.
+
+## Real, measured results
+
+No number below is assumed or invented — see [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md) for the full derivation of each.
+
+| Metric | Result |
+|---|---|
+| ML velocity model vs. physics+ZUPT baseline | **4.2× more accurate** (MAE 1.244 m/s vs. 5.205 m/s, RMSE 1.593 vs. 6.345 m/s — IO-VNBD dataset, held-out trips) |
+| Recurring service cost | **₹0** — OpenStreetMap tiles, Nominatim search, and OSRM routing are all free and keyless |
+| Test device | Samsung Galaxy S24 FE (Android 16 / One UI 8.5) — every number above was measured on real hardware, not a simulator |
+| At-rest drift after ZUPT | Reduced from several metres to near-zero over 15+ seconds of real stationary testing |
+
+## Tech stack
+
+**Android app** — Kotlin, Jetpack Compose, coroutines/`StateFlow`
+- **Sensors**: Android `SensorManager` (accelerometer, gyroscope, rotation vector) at ~10 Hz, on a dedicated background thread
+- **On-device ML inference**: [ONNX Runtime Mobile](https://onnxruntime.ai/) (`onnxruntime-android`)
+- **Maps**: [osmdroid](https://github.com/osmdroid/osmdroid) rendering real OpenStreetMap tiles (via CartoDB's free endpoint)
+- **Geocoding**: [OpenStreetMap Nominatim](https://nominatim.org/) — free destination search, no API key
+- **Routing**: [OSRM](http://project-osrm.org/) — free turn-by-turn routing, no API key
+- **Location**: Google Play Services `FusedLocationProviderClient`
+
+**ML training pipeline** — offline, Python
+- `scikit-learn` (`RandomForestRegressor`) for the velocity model — the lightest model that met the accuracy bar, not a deep model reached for by default
+- `onnx` / `skl2onnx` for export, with an explicit output-parity check against the on-device ONNX Runtime path before it's trusted
+- Trained and evaluated against the real **IO-VNBD** dataset
+
+No paid API, SDK, or backend anywhere in the stack — deliberately, so
+nothing here is blocked on a credential or a billing account.
+
+## SIH requirement coverage
+
+| Requirement | Status |
+|---|---|
+| Smartphone IMU-based dead reckoning | ✅ Built, measured |
+| GNSS + INS fusion | ✅ Built (hysteresis state machine + blend-on-reacquisition) |
+| AI/ML-based speed estimation | ✅ Built, measured 4.2× improvement over physics |
+| IMU noise/vibration filtering | ✅ ZUPT + non-holonomic constraint, measured |
+| Pothole/bump detection | ✅ Deterministic vertical-shock detector (real, not yet ML-trained — see Honest Limitations) |
+| Non-holonomic constraints | ✅ Built, with an explicit Walking-mode exception |
+| Seamless GNSS ↔ DR transition | ✅ Built, every transition logged and replayable |
+| Real-time mobile navigation UI | ✅ Full app — search, routing, turn-by-turn, offline tiles |
+| Lightweight edge-deployable inference | ✅ Random Forest → ONNX, running live on-device |
+| Preliminary testing on IO-VNBD | ✅ Done — see measured results above |
+| Automatic phone-to-vehicle alignment | ✅ Built (GNSS-aided initialization window) + manual recalibrate fallback |
+| Map matching | 🔜 Not built — see Honest Limitations |
+
+## Getting started
+
+```bash
+git clone https://github.com/algoarchemist/seamless-navigation.git
+cd seamless-navigation/android
+```
+
+Create `android/local.properties` (gitignored, machine-specific):
+
+```properties
+sdk.dir=/path/to/your/Android/Sdk
+```
+
+Then either open `android/` in Android Studio, or build from the CLI:
+
+```bash
+./gradlew assembleDebug
+```
+
+No API keys, no signup, no billing account needed anywhere in the build.
+The ONNX velocity model is already bundled in the repo
+(`android/app/src/main/assets/velocity_v1.onnx`) — if it's ever missing,
+the app degrades gracefully to physics-only and says so on screen, it does
+not crash.
+
+## Project structure
+
+```
+android/    Kotlin app — sensors, fusion, state machine, ML inference, UI
+ml/         Python training/export pipeline (RandomForest → ONNX)
+models/     Versioned exported model artifacts
+data/       Dataset convention docs (IO-VNBD is not redistributed here)
+docs/       PROJECT_MAP.md — the living, file-by-file source of truth
+```
+
+- **[`PRD.md`](PRD.md)** — full product requirements and scope decisions
+- **[`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md)** — exactly what's implemented, what's tested, and what's honestly not done yet, file by file
+- **[`CLAUDE.md`](CLAUDE.md)** — the engineering rules this project holds itself to (no fabricated numbers, no faked outages in the shipped path, every coordinate frame named explicitly)
+
+## Honest limitations
+
+This project would rather show two honest columns than one impressive
+overstatement:
+
+- **Trained motion classifier** (pothole / turning / cruising) — blocked on
+  more self-captured labeled driving data. Deterministic stand-ins are
+  wired in and clearly labeled as such, not presented as the real thing.
+- **Map matching / road-snapping** — not built. Positions are shown as
+  measured, not snapped to the nearest road.
+- **A real multi-minute outdoor GNSS outage during an actual drive** —
+  validated so far by unit tests and one real outdoor walking test, not
+  yet a full live tunnel/underpass drive test.
+- **Heading-up map rotation while navigating** — implemented, not yet
+  confirmed against a live compass outdoors.
+
+Every one of these is tracked with the same specificity in
+[`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md) — nothing here is a vague
+"future work" placeholder.
+
+## Team
+
+Built by **algoarchemist** for Smart India Hackathon, Problem Statement 26168 (ISRO).
