@@ -488,6 +488,115 @@ exported binaries" instinct still stands for any future/larger model
 version — this is a documented, reasoned exception for this one file,
 not a reversal of the convention.
 
+**UPDATE (2026-08-26, real bug found + fixed: CARTO tile source now
+paywalled — "API key required")**: the user reported the Map tab showing
+no street imagery. Root cause confirmed by fetching a tile directly with
+`curl` and inspecting the returned PNG (not assumed from a log message,
+since the response was a normal HTTP 200 — osmdroid had no error to
+detect or log): `ui/map/StreetMapView.kt`'s CARTO tile source
+(`a/b/c.basemaps.cartocdn.com/{dark,light}_all/`) now serves a baked-in
+"API KEY REQUIRED — carto.com/basemaps/apikey" watermark image in place
+of real tiles. This endpoint was free and anonymous when Slice 8b first
+verified it (curl 200 + real device confirmation, see that update above)
+— CARTO has evidently locked it behind an account/key since. Fixed by
+switching `STREET_TILE_SOURCE` to osmdroid's own
+`TileSourceFactory.MAPNIK` (the standard openstreetmap.org tile server —
+free, no account/key, the same principle this file's `StreetMapView.kt`
+doc comment already committed to when osmdroid was chosen over Google
+Maps/Mapbox in Slice 8b). Mapnik ships only one (light) style, so the
+separate CARTO dark tile source was retired entirely; dark mode is now
+osmdroid's built-in `TilesOverlay.INVERT_COLORS` color filter applied
+over the one real tile source instead — this also incidentally resolves
+the Slice 8b "black tiles" bug's underlying fragility, since toggling a
+color filter doesn't rebuild osmdroid's tile-provider modules the way
+`setTileSource` does, so there is no in-flight-fetch interruption risk
+left to guard against. HONEST LIMITATION (CLAUDE.md Rule 13): the
+inverted dark-mode palette is a naive RGB invert, not a purpose-built
+dark map style — functionally correct (real street data, confirmed
+on-device: "Retteri Lake", "Ibengo" and correct road/water geometry
+rendered near a real Chennai GNSS fix) but visually unusual (green
+parks read as magenta) compared to the old CARTO dark style; light mode
+is unaffected and renders normally (confirmed on-device: correct
+country/city labels — Cameroun, Gabon, Congo — at a zoomed-out view).
+Not yet re-verified against a live outdoor drive this session, only a
+real indoor/stationary GNSS-aided fix.
+
+**UPDATE (2026-08-26, real indoor on-device test — noisy GNSS speed
+bug found + fixed)**: user reported the speed/motion chips reading
+"Moving" at 15.1 m/s while the phone sat stationary on a desk. Debug
+screen comparison (`IdrSensorScreen`) at that exact tick showed every
+other sensor agreeing the phone was still — accel ≈ (0, 0, 9.79) m/s²
+(gravity only), gyro ≈ 0 rad/s, and the ZUPT-gated physics DR velocity
+at 0.00/0.00 m/s — while `gnssState.latestFix.speedMps` alone reported
+~15 m/s. Root cause: `ui/screens/StatusOverlayContent.kt`'s
+`estimateSpeedMps()` trusted `Location.speedMps` unconditionally
+whenever `gnssState.mode == GnssMode.GNSS_AIDED`, with no check that
+the reading was plausible. `speedMps` is Doppler-derived and is a
+different, uncorrelated measurement from position accuracy — a fix can
+pass `GnssQuality`'s 25m/3s accuracy+age bar (so mode reads
+GNSS_AIDED) while its speed component is pure indoor-multipath noise.
+Fixed by rejecting `gnssSpeed` specifically when it contradicts a
+ZUPT-confirmed-stationary physics velocity (`physicsSpeedMps <
+STATIONARY_SPEED_EPSILON_MPS` but `gnssSpeed >=` it), falling through
+to the next priority source (ML, then physics) instead — same epsilon
+constant the chip-consistency fix above already introduced. Covered by
+a new `app/src/test/kotlin/.../ui/screens/StatusOverlayContentTest.kt`
+(CLAUDE.md Rule 19): agreement case still trusts GNSS speed, the
+contradiction case falls through, and the ML/physics/no-fix fallback
+branches are locked in too.
+
+Also separately investigated this same session (found, not yet fixed):
+real on-device slow street-tile loading. `logcat` with
+`Configuration.isDebugMode`/`isDebugTileProviders` temporarily enabled
+(removed again after diagnosis — not shipped) showed an initial burst
+of tile downloads completing, then the online tile provider's queue
+stalling completely for the rest of the capture window despite dozens
+of tiles still `pending`. Leading hypothesis, not yet confirmed: in
+`ui/map/StreetMapView.kt`'s `AndroidView` `update` block,
+`view.controller.animateTo(point)` runs unconditionally on EVERY
+recomposition (not gated to only when the position actually changed),
+which — at the ~10 Hz live sensor/GNSS tick rate this file's own
+Slice 8b "black tiles" bug (above) already identified as a recurring
+hazard — may repeatedly disrupt osmdroid's tile-request bookkeeping the
+same way `setTileSource` used to, just via a different call. Needs
+confirming (e.g. gate `animateTo` on an actual position-change check,
+retest, recapture `logcat`) before treating it as fixed.
+
+**UPDATE (2026-08-26, real on-device test — REACQUISITION/DEAD_RECKONING
+flapping constantly, bug found + fixed)**: user reported the GNSS mode
+badge switching between DEAD_RECKONING and REACQUISITION constantly.
+`logcat` (`GnssOutageDetector` tag, which already logs every transition
+per CLAUDE.md Rule 17) captured 6 consecutive full cycles, each
+DEAD_RECKONING -> REACQUISITION -> DEAD_RECKONING taking almost exactly
+`reacquisitionDwellMs` (1000ms) — REACQUISITION never once reached
+GNSS_AIDED. Root cause in `gnss/GnssOutageDetector.kt`: the
+REACQUISITION -> GNSS_AIDED/DEAD_RECKONING decision used to check
+`gnssGoodNow` only ONCE, at the single instant the dwell timer expired
+— a single noisy sample deciding the whole outcome, which is exactly
+what CLAUDE.md Rule 16 requires hysteresis to prevent, just on
+REACQUISITION's exit side rather than an entry side (which already used
+proper continuous-streak tracking, e.g. DEAD_RECKONING -> REACQUISITION
+itself). With marginal/indoor GNSS accuracy hovering near
+`GnssQuality`'s 25m threshold, that one unlucky sample (often landing
+right on a freshly-arrived, still-marginal fix, given ~1Hz location
+updates) failed on essentially every cycle. Fixed by making
+REACQUISITION bail to DEAD_RECKONING immediately on ANY bad sample
+during the window (fail-fast — no reason to keep blending toward a fix
+already known bad) and only advance to GNSS_AIDED once GNSS has been
+good CONTINUOUSLY for the full dwell period. TRANSITION was
+deliberately left as-is (a fixed-duration freeze/average window by
+design, per PRD.md Section 18 and an existing test asserting it does
+NOT skip its dwell early) — this class's doc comment now states that
+asymmetry explicitly. Covered by two new tests in
+`GnssOutageDetectorTest.kt` (CLAUDE.md Rule 19): a bad sample partway
+through REACQUISITION must bail immediately without waiting for the
+dwell, and a good-then-bad sequence must never retroactively reach
+GNSS_AIDED. Directly connects to the two prior updates above (drifted
+fused position, noisy GNSS speed): all three trace back to the same
+root environment — this test session never had a solid outdoor
+GNSS_AIDED lock, so marginal/indoor accuracy readings keep exercising
+every one of these edge cases.
+
 ---
 
 ## How to read this file

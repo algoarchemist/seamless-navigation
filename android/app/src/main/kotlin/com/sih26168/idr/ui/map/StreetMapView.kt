@@ -18,13 +18,14 @@ import com.sih26168.idr.ui.theme.AccentBlue
 import com.sih26168.idr.ui.theme.AccentBlueLight
 import com.sih26168.idr.ui.theme.CtaRed
 import org.osmdroid.config.Configuration
-import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.Projection
 import org.osmdroid.views.overlay.Overlay
 import org.osmdroid.views.overlay.Polyline
+import org.osmdroid.views.overlay.TilesOverlay
 
 /**
  * The REAL street-map counterpart to [TrackCanvas]'s abstract local-meter
@@ -41,42 +42,30 @@ import org.osmdroid.views.overlay.Polyline
  * different BASE LAYER over identical marker styling, not a competing
  * visual language.
  *
- * HONEST GAP (CLAUDE.md Rule 13): free CARTO tile usage is rate-limited
- * and meant for light/demo traffic, not production load — acceptable for
- * this MVP demo, not a claim this scales.
+ * HONEST GAP (CLAUDE.md Rule 13): the standard OSM tile server is
+ * rate-limited and meant for light/demo traffic, not production load —
+ * acceptable for this MVP demo, not a claim this scales.
  *
- * UPDATE (2026-08-26): switched from the "_nolabels" tile variants to the
- * labeled "_all" variants (user-requested — street/place names visible,
- * like a conventional map app) and added a LIGHT counterpart alongside
- * the existing dark one, for [StreetMapView]'s new `isDarkTheme` param.
+ * UPDATE (2026-08-26, real bug found + fixed): the CARTO dark_all/light_all
+ * tile source this used to point at (basemaps.cartocdn.com) started
+ * returning an HTTP 200 "API KEY REQUIRED" WATERMARK IMAGE in place of
+ * real tiles — confirmed by fetching a tile directly with curl and
+ * inspecting the PNG, not assumed from a log message, since a 200 status
+ * gives osmdroid no error to detect or log. CARTO's anonymous free-tier
+ * basemap access was evidently locked down after this file was first
+ * written (see the removed DARK/LIGHT XYTileSource entries this replaced).
+ * Rather than replace one paid/key-gated provider with another, this now
+ * points at osmdroid's own [TileSourceFactory.MAPNIK] — the standard
+ * openstreetmap.org tile server, free with no account/key, the same
+ * "no new credential" principle this file's doc comment already commits
+ * to. Since Mapnik ships only one (light) style, dark mode is now
+ * simulated with osmdroid's built-in [TilesOverlay.INVERT_COLORS] color
+ * filter instead of a second tile source — this also sidesteps the
+ * tile-interruption bug documented below (`setTileSource` mid-fetch),
+ * since toggling a color filter doesn't rebuild the tile-provider modules
+ * the way switching tile sources does.
  */
-private val DARK_TILE_SOURCE = XYTileSource(
-    "CartoDBDarkMatterLabels",
-    0,
-    20,
-    256,
-    ".png",
-    arrayOf(
-        "https://a.basemaps.cartocdn.com/dark_all/",
-        "https://b.basemaps.cartocdn.com/dark_all/",
-        "https://c.basemaps.cartocdn.com/dark_all/",
-    ),
-    "© OpenStreetMap contributors © CARTO",
-)
-
-private val LIGHT_TILE_SOURCE = XYTileSource(
-    "CartoDBPositronLabels",
-    0,
-    20,
-    256,
-    ".png",
-    arrayOf(
-        "https://a.basemaps.cartocdn.com/light_all/",
-        "https://b.basemaps.cartocdn.com/light_all/",
-        "https://c.basemaps.cartocdn.com/light_all/",
-    ),
-    "© OpenStreetMap contributors © CARTO",
-)
+private val STREET_TILE_SOURCE = TileSourceFactory.MAPNIK
 
 /**
  * One-time osmdroid setup (tile cache location + required user-agent —
@@ -176,10 +165,10 @@ private class CurrentPositionOverlay : Overlay() {
  * @param anchorLatDeg/[anchorLonDeg] the outage-anchor point the dashed
  *   drift line is drawn back to during DEAD_RECKONING/REACQUISITION —
  *   mirrors [TrackCanvas]'s own anchor-line behavior.
- * @param isDarkTheme selects [DARK_TILE_SOURCE] vs [LIGHT_TILE_SOURCE]
- *   (user-requested light mode, 2026-08-26) — switched live via
- *   `setTileSource` in the `update` block below if the app's theme
- *   toggle changes while this screen is showing.
+ * @param isDarkTheme toggles [TilesOverlay.INVERT_COLORS] over the one real
+ *   [STREET_TILE_SOURCE] (user-requested light mode, 2026-08-26) — switched
+ *   live via a [LaunchedEffect] below if the app's theme toggle changes
+ *   while this screen is showing.
  * @param routeGeometry a REAL computed route's geometry (from
  *   `routing/RoutingRepository.kt`'s OSRM call), drawn as a solid CtaRed
  *   polyline — Figma's own route-line color. Null clears it (no active
@@ -218,7 +207,8 @@ fun StreetMapView(
     val mapView = remember {
         configureOsmdroid(context)
         MapView(context).apply {
-            setTileSource(if (isDarkTheme) DARK_TILE_SOURCE else LIGHT_TILE_SOURCE)
+            setTileSource(STREET_TILE_SOURCE)
+            overlayManager.tilesOverlay.setColorFilter(if (isDarkTheme) TilesOverlay.INVERT_COLORS else null)
             setMultiTouchControls(true)
             // User-reported bug (2026-08-26): osmdroid's default on-screen
             // +/- zoom buttons render bottom-center over this screen's own
@@ -241,16 +231,15 @@ fun StreetMapView(
 
     // BUG FIX (2026-08-26, real on-device test): setTileSource() rebuilds
     // osmdroid's internal tile-provider modules (closes/reopens caches),
-    // which interrupts any tile download already in flight. This used to
-    // run inside AndroidView's `update` block, which re-executes on EVERY
-    // recomposition — i.e. every ~100ms tick from the live sensor/GNSS
-    // StateFlows — so tiles were having their in-flight fetch cancelled
-    // over and over and never finishing, leaving permanently-stuck black
-    // tiles on screen. Moved to a LaunchedEffect keyed ONLY on
-    // [isDarkTheme], so it re-runs solely when the theme toggle actually
-    // changes, not on every unrelated recomposition.
+    // which interrupts any tile download already in flight — a real problem
+    // when this toggled the tile SOURCE on every theme change. Now dark mode
+    // is a color filter over the one real tile source (see the doc comment
+    // above), so there is no tile-provider rebuild to worry about; this
+    // LaunchedEffect only flips the filter and repaints already-cached
+    // tiles in place. Still keyed on [isDarkTheme] alone, not every
+    // recomposition, to keep that guarantee explicit.
     LaunchedEffect(isDarkTheme) {
-        mapView.setTileSource(if (isDarkTheme) DARK_TILE_SOURCE else LIGHT_TILE_SOURCE)
+        mapView.overlayManager.tilesOverlay.setColorFilter(if (isDarkTheme) TilesOverlay.INVERT_COLORS else null)
         mapView.invalidate()
     }
 

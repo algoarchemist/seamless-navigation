@@ -32,9 +32,24 @@ data class GnssModeTransition(
  * Hysteresis (CLAUDE.md Rule 16): leaving GNSS_AIDED requires GNSS to
  * have been continuously bad for [outageEnterDwellMs] (a single bad
  * sample cannot flip the mode); leaving DEAD_RECKONING requires GNSS to
- * have been continuously good for [reacquisitionEnterDwellMs]. TRANSITION
- * and REACQUISITION each have their own minimum dwell time before the
- * next transition is considered, matching PRD.md Section 18's diagram.
+ * have been continuously good for [reacquisitionEnterDwellMs].
+ * TRANSITION is a fixed-duration freeze/average window (PRD.md Section
+ * 18) — it always waits out [transitionDwellMs] in full before deciding,
+ * once, which way to go next, by design (not a single-sample-flip bug:
+ * nothing changes mid-freeze). REACQUISITION is NOT symmetric with this,
+ * and deliberately so: it advances to GNSS_AIDED only once GNSS has been
+ * good CONTINUOUSLY for the full [reacquisitionDwellMs], but bails back
+ * to DEAD_RECKONING the instant GNSS goes bad at any point in that
+ * window, without waiting out the dwell first — there's no reason to
+ * keep blending toward a fix already known bad. REAL BUG FIX
+ * (2026-08-26, on-device test — mode flapping constantly between
+ * DEAD_RECKONING and REACQUISITION): REACQUISITION used to check
+ * gnssGoodNow only ONCE, right at the dwell boundary — exactly the
+ * single-noisy-sample flip Rule 16 prohibits, just on the exit side
+ * instead of the entry side. With marginal/indoor GNSS accuracy hovering
+ * near [GnssQuality]'s threshold, that one unlucky sample failed on
+ * essentially every cycle, so REACQUISITION never once reached
+ * GNSS_AIDED in practice.
  *
  * TRANSITION/REACQUISITION here are state-machine bookkeeping only —
  * this class itself does NOT blend GNSS and dead-reckoned position
@@ -94,12 +109,30 @@ class GnssOutageDetector(
                 }
             }
             GnssMode.REACQUISITION -> {
-                if (nowMs - modeEnteredAtMs >= reacquisitionDwellMs) {
-                    if (gnssGoodNow) {
-                        transitionTo(GnssMode.GNSS_AIDED, nowMs, "REACQUISITION window elapsed, GNSS still good")
-                    } else {
-                        transitionTo(GnssMode.DEAD_RECKONING, nowMs, "GNSS degraded again during REACQUISITION window")
-                    }
+                // REAL BUG FIX (2026-08-26, real on-device test — mode
+                // flapping constantly between DEAD_RECKONING and
+                // REACQUISITION every ~reacquisitionDwellMs): this used to
+                // wait for the dwell timer, then check gnssGoodNow ONCE at
+                // that single instant — exactly the "a single noisy sample
+                // must never flip the mode" case CLAUDE.md Rule 16
+                // prohibits, just on the EXIT side of REACQUISITION rather
+                // than the entry side. With marginal/indoor GNSS accuracy
+                // hovering right at GnssQuality's threshold, that one
+                // unlucky sample (often landing right on a freshly-arrived,
+                // still-marginal fix) failed on every single cycle in
+                // practice, so REACQUISITION never once reached GNSS_AIDED.
+                // Now: bail out to DEAD_RECKONING as soon as GNSS goes bad
+                // at ANY point during the window (fail fast — matches this
+                // branch's own "GNSS degraded again" trigger text, and
+                // there is no reason to keep blending toward a fix that's
+                // already known bad), and only advance to GNSS_AIDED once
+                // GNSS has been good CONTINUOUSLY for the full dwell period
+                // (by construction, since any bad sample bails out
+                // immediately rather than waiting).
+                if (!gnssGoodNow) {
+                    transitionTo(GnssMode.DEAD_RECKONING, nowMs, "GNSS degraded again during REACQUISITION window")
+                } else if (nowMs - modeEnteredAtMs >= reacquisitionDwellMs) {
+                    transitionTo(GnssMode.GNSS_AIDED, nowMs, "REACQUISITION window elapsed with GNSS continuously good")
                 }
             }
         }

@@ -241,11 +241,27 @@ internal fun estimateSpeedMps(
     fusedState: FusedPositionUiState,
 ): Float {
     val gnssSpeed = gnssState.latestFix?.speedMps
+    val physicsSpeedMps = hypot(drState.velocityEastMps, drState.velocityNorthMps).toFloat()
+    // REAL BUG FIX (2026-08-26, indoor on-device test): raw GNSS speed is
+    // Doppler-derived and can report a nonzero "ghost" speed (e.g. 15 m/s)
+    // purely from indoor multipath, even while every other sensor agrees
+    // the phone is stationary (accel ~= gravity only, gyro ~= 0, ZUPT has
+    // already zeroed the physics velocity below STATIONARY_SPEED_EPSILON_MPS).
+    // GNSS position accuracy passing its threshold says nothing about
+    // speed-reading quality, so a GNSS_AIDED fix alone isn't enough reason
+    // to trust gnssSpeed here — reject it specifically when it contradicts
+    // a ZUPT-confirmed-stationary physics state, and fall through to the
+    // next source instead.
+    val gnssSpeedContradictsStationaryPhysics =
+        gnssSpeed != null &&
+            physicsSpeedMps < STATIONARY_SPEED_EPSILON_MPS &&
+            gnssSpeed >= STATIONARY_SPEED_EPSILON_MPS
     return when {
-        gnssState.mode == GnssMode.GNSS_AIDED && gnssSpeed != null -> gnssSpeed
+        gnssState.mode == GnssMode.GNSS_AIDED && gnssSpeed != null && !gnssSpeedContradictsStationaryPhysics ->
+            gnssSpeed
         fusedState.drSourceUsed == DrSource.ML && mlState.predictedVelocityCorrectedMps != null ->
             mlState.predictedVelocityCorrectedMps
-        else -> hypot(drState.velocityEastMps, drState.velocityNorthMps).toFloat()
+        else -> physicsSpeedMps
     }
 }
 

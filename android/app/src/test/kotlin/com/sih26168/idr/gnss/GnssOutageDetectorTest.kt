@@ -111,6 +111,58 @@ class GnssOutageDetectorTest {
         assertEquals(GnssMode.DEAD_RECKONING, detector.mode)
     }
 
+    // REAL BUG FIX (2026-08-26, on-device test — mode flapping constantly
+    // between DEAD_RECKONING and REACQUISITION every cycle, exactly
+    // reacquisitionDwellMs apart, every single time): REACQUISITION used
+    // to check gnssGoodNow only ONCE, at the dwell boundary — a single
+    // noisy sample deciding the whole outcome, which CLAUDE.md Rule 16
+    // says must never happen. With marginal/indoor GNSS, that one sample
+    // failed essentially every cycle. These two tests lock in the fix:
+    // a bad sample bails out immediately (no dwell wait needed to leave),
+    // and GNSS_AIDED is reached only with a GENUINELY continuous good
+    // streak for the whole window, not a lucky single good sample at the end.
+    @Test
+    fun `a bad sample partway through REACQUISITION bails to DEAD_RECKONING immediately, without waiting for the dwell`() {
+        val (detector, now0) = driveToDeadReckoning()
+
+        detector.evaluate(now0 + 1, gnssGoodNow = true)
+        val nowAtReacquisition = now0 + 1 + REACQUISITION_ENTER_DWELL_MS
+        detector.evaluate(nowAtReacquisition, gnssGoodNow = true)
+        assertEquals(GnssMode.REACQUISITION, detector.mode)
+
+        // Well before the REACQUISITION_DWELL_MS window would elapse.
+        val partway = nowAtReacquisition + (REACQUISITION_DWELL_MS / 2)
+        detector.evaluate(partway, gnssGoodNow = false)
+        assertEquals(
+            "a bad sample mid-window must not have to wait out the dwell timer to bail",
+            GnssMode.DEAD_RECKONING,
+            detector.mode,
+        )
+    }
+
+    @Test
+    fun `a good blip followed by bad GNSS never reaches GNSS_AIDED, even at the old dwell boundary`() {
+        val (detector, now0) = driveToDeadReckoning()
+
+        detector.evaluate(now0 + 1, gnssGoodNow = true)
+        val nowAtReacquisition = now0 + 1 + REACQUISITION_ENTER_DWELL_MS
+        detector.evaluate(nowAtReacquisition, gnssGoodNow = true)
+        assertEquals(GnssMode.REACQUISITION, detector.mode)
+
+        // Goes bad partway through, then "recovers" right at the instant
+        // the old single-sample check would have fired — must NOT reach
+        // GNSS_AIDED, since GNSS was not continuously good the whole window.
+        detector.evaluate(nowAtReacquisition + (REACQUISITION_DWELL_MS / 2), gnssGoodNow = false)
+        assertEquals(GnssMode.DEAD_RECKONING, detector.mode)
+
+        detector.evaluate(nowAtReacquisition + REACQUISITION_DWELL_MS, gnssGoodNow = true)
+        assertEquals(
+            "already bailed to DEAD_RECKONING; a late good sample must not retroactively grant GNSS_AIDED",
+            GnssMode.DEAD_RECKONING,
+            detector.mode,
+        )
+    }
+
     @Test
     fun `an intermittently-good streak in DEAD_RECKONING resets the good-dwell timer`() {
         val (detector, now0) = driveToDeadReckoning()
