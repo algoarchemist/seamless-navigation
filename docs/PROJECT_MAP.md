@@ -464,6 +464,30 @@ geocoding bug fix)**:
   Logcat access this session); this fix makes that root cause visible next
   time it happens, which the code could not do before.
 
+**UPDATE (2026-08-26, `velocity_v1.onnx` committed for teammate
+onboarding — explicit user override of the "no binaries in git"
+convention)**: the user asked how a new developer cloning this repo gets
+the ONNX model, since `models/*.onnx` / `android/app/src/main/assets/*.onnx`
+were both gitignored. The honest answer was that a teammate couldn't
+regenerate it themselves either way — the IO-VNBD training data
+(`data/raw/IO-VNBD/`) is also gitignored and not redistributed via git —
+so keeping the one ~21MB artifact that already exists out of version
+control added friction with no real benefit, while leaving `git clone`
+alone insufficient to run the ML half of the app. `.gitignore` now
+explicitly un-ignores `models/velocity_v1.onnx` and
+`android/app/src/main/assets/velocity_v1.onnx` (both files, confirmed
+byte-identical via `cmp`) — 21MB is well under GitHub's 100MB hard limit,
+so no Git LFS needed. `ml/README.md` and `models/README.md` were also
+corrected — both had gone stale, still claiming "nothing implemented/
+exported yet" despite the real training scripts and this real exported
+model already existing (CLAUDE.md's staleness rule technically only names
+`docs/PROJECT_MAP.md`, but the same principle applies: a doc that
+contradicts reality actively misleads the next person who reads it,
+which is exactly what happened here). The general "don't blindly commit
+exported binaries" instinct still stands for any future/larger model
+version — this is a documented, reasoned exception for this one file,
+not a reversal of the convention.
+
 ---
 
 ## How to read this file

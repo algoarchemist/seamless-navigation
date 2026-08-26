@@ -18,20 +18,26 @@ ml/__pycache__/
 *.pyc
 .ipynb_checkpoints/
 
-# Datasets and model artifacts — versioned deliberately via naming
-# convention (see models/README.md), not via git, since IO-VNBD and
-# exported models are large binary files.
+# Datasets — kept out of git regardless (IO-VNBD is large and has its
+# own redistribution terms; see data/README.md for the re-download path).
 data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+
+# Model artifacts: general rule is still "don't commit exported binaries
+# blindly" (future/larger models, alternate versions, etc.), but
+# velocity_v1.onnx (~21MB, well under GitHub's 100MB limit) is committed
+# on purpose as of 2026-08-26 — a teammate cloning this repo cannot
+# regenerate it themselves anyway (the IO-VNBD dataset above isn't
+# shareable via git), so keeping the one artifact that already exists out
+# of version control only adds friction with no real benefit. See
+# docs/PROJECT_MAP.md for the full reasoning.
 models/*.onnx
+!models/velocity_v1.onnx
 models/*.tflite
-# The Android app's bundled copy of the same model (needed at build
-# time for VelocityModel.kt to load from assets) is gitignored for the
-# same reason — regenerate with `python ml/export_model.py` then copy
-# models/velocity_v1.onnx to this path, see docs/PROJECT_MAP.md.
 android/app/src/main/assets/*.onnx
+!android/app/src/main/assets/velocity_v1.onnx
 
 # OS/editor cruft
 .DS_Store
