@@ -115,6 +115,355 @@ and the map layer has no real street geometry (by design, this slice's
 decision). Each entry gets flipped from `PLANNED` to `IMPLEMENTED` (with
 the fields below filled in for real) as it is actually built.
 
+**UPDATE (2026-08-26, Slice 8b — real street map + tab navigation)**: the
+user explicitly asked to bring in a real map dependency ("skip that
+rule [about not adding dependencies], install new dependencies and build
+the street view, maps view, other windows with the same exact ui/ux
+elements from that figma file") — CLAUDE.md Rule 2 discussed and
+overridden for this one decision, same as any explicit user instruction
+overriding a default rule. `org.osmdroid:osmdroid-android:6.1.20` was
+added (real OpenStreetMap street tiles via CartoDB's free dark-tile
+endpoint, `ui/map/StreetMapView.kt`) — chosen over Google Maps
+Compose/Mapbox specifically because it needs no API key/billing account,
+so nothing blocks on a credential this project doesn't have. `INTERNET`/
+`ACCESS_NETWORK_STATE` permissions were added for the tile fetch only —
+no sensor/DR/fusion logic depends on network access; the actual
+positioning pipeline stays fully offline as before (verified: existing
+unit tests all still pass unchanged). `fusion/GeoProjection.kt` gained a
+real algebraic-inverse function, `toLatLon()` (tested in
+`GeoProjectionTest`, round-trips against the existing `toLocalMeters()`),
+so the already-computed fused local-meter position can be placed back
+onto real street tiles. `fusion/StateEstimator.kt`'s `FusedPositionUiState`
+gained `anchorLatDeg`/`anchorLonDeg` (the real-world point local (0,0)
+corresponds to) and `driftHistory` (every REACQUISITION-instant drift
+measurement this run, not just the last one) — both purely additive
+fields with defaults, so nothing that already read this class needed to
+change. Three real screens now exist behind a new `BottomNavBar`
+(Drive/Map/History, `ui/components/BottomNavBar.kt`): `ui/screens/DriveScreen.kt`
+(unchanged behavior, now over the abstract grid as before),
+`ui/screens/MapScreen.kt` (NEW — the real street-map screen, same status
+overlay, different base layer), and `ui/screens/HistoryScreen.kt` (NEW —
+lists the real `driftHistory` log, an HONEST departure from the Figma
+"Timeline" screen's fabricated per-day mileage chart, which has no real
+data source in this codebase — CLAUDE.md Rule 13). The status
+overlay itself (GNSS mode/speed/motion/alignment header + vehicle-mode
+selector/recalibrate/drift-card footer) was extracted out of
+`DriveScreen.kt` into `ui/screens/StatusOverlayContent.kt` so `DriveScreen`
+and `MapScreen` share one implementation instead of two copies drifting
+apart — `DriveScreen.kt`'s own behavior is unchanged by this refactor.
+Real bug caught and fixed during on-device verification: osmdroid's
+`Configuration` needs an explicit `osmdroidBasePath`/`osmdroidTileCache`
+set from the SAME context the app already has — its own default-path
+auto-resolution reaches for a separate internal context reference that's
+null unless `Configuration.getInstance().load(...)` is called, and the
+resulting `NullPointerException` (caught internally by osmdroid, silent
+unless debug logging is enabled) meant tiles never rendered past a
+placeholder checkerboard. Fixed by setting both paths explicitly in
+`configureOsmdroid()`, verified via temporary `isDebugMode`/
+`isDebugTileProviders` logging plus a direct `curl` check against the
+CartoDB tile endpoint (200 OK). Real limitation, same as Slice 7/8's
+already-documented one: fully verifying real street imagery under a real
+position (not just "does it crash / does the pipeline wire up correctly")
+needs an actual outdoor GNSS fix, which has not happened yet this slice —
+indoor testing only confirms the map renders open-ocean tiles near (0,0)
+correctly (no fix = no real center yet), not real street geometry under
+a real marker.
+
+**UPDATE (2026-08-26, real outdoor walking test — bug fixes)**: the
+user's first real outdoor test (walking, not driving) surfaced several
+real bugs, since honestly documented "unvalidated engineering default"
+thresholds finally had real motion data to be checked against:
+- `motion/PotholeShockDetector.kt`'s vertical-shock threshold (4.0 m/s^2)
+  false-positived constantly on ordinary walking bounce — raised to
+  15.0 m/s^2 (still unvalidated against a real in-vehicle pothole strike,
+  which remains blocked on real driving data).
+- `ui/screens/StatusOverlayContent.kt`'s `estimateMotionLabel()` used to
+  recompute speed from raw physics DR velocity independently of the
+  `estimateSpeedMps()` value the chip right above it already displays —
+  the two could visibly contradict each other ("1.2 m/s" next to
+  "Stationary") since ZUPT could zero the physics velocity on a tick
+  where the authoritative speed source said otherwise. Now both chips
+  read from the SAME `speedMps` value; the stationary epsilon was also
+  loosened from 0.05 to 0.3 m/s.
+- Also user-requested and added: a light/dark theme toggle
+  (`ui/theme/Color.kt`'s `IdrPalette`/`DarkIdrPalette`/`LightIdrPalette`
+  + `LocalIdrPalette` CompositionLocal, `IdrTheme.kt`'s new `darkTheme`
+  param) — the light palette is a REASONED EXTENSION, not a Figma import
+  (the source file is dark-theme only). Chrome-only tokens (text, glass
+  surfaces, panel backgrounds) became theme-aware `@Composable get()`
+  properties; map-marker/status-accent colors (AccentBlue, CtaRed, etc.)
+  deliberately stayed constant across themes, matching how real map apps
+  keep their position-dot/route colors fixed regardless of theme.
+
+**UPDATE (2026-08-26, full routing — explicit user override of PRD.md
+Section 7/22)**: the user explicitly asked to build a full conventional
+map-app experience (destination search, real routing, a Start/End flow,
+offline trip download) despite PRD.md's "not a consumer nav app, no
+search/turn-by-turn chrome, no full routing engine" scope — confirmed via
+an explicit AskUserQuestion choice ("Build full routing") rather than
+built silently. New `routing/` package:
+- `routing/GeocodingRepository.kt` — real destination search via
+  OpenStreetMap Nominatim's free public API (no API key, same "no new
+  credential" principle as osmdroid/CartoDB).
+- `routing/RoutingRepository.kt` — real turn-by-turn routing via OSRM's
+  free public demo server (also no API key). Parses OSRM's structured
+  maneuver (type + modifier + street name) into a plain-English
+  instruction — a real derivation from OSRM's own classification, not an
+  invented instruction (CLAUDE.md Rule 13 still respected even while
+  overriding Section 7/22).
+- `routing/OfflineRouteCache.kt` — downloads the active route's map tiles
+  via osmdroid's own `CacheManager` (real progress dialog, osmdroid's
+  built-in UI) and saves the route geometry/steps as JSON to
+  app-external storage — both scoped to ONE trip at a time, per the
+  request ("that particular trip alone"), not a general offline-maps
+  feature.
+- `ui/components/DestinationSearchBar.kt` / `ActiveRouteCard.kt` — real
+  search results and real distance/duration/steps, styled with the
+  existing Figma-derived glass-card/pill-button language (red CtaRed
+  Start/End buttons matching Figma's own route-screen accent).
+- `ui/screens/MapScreen.kt` extended with the idle -> destination-selected
+  -> route-active state machine; `ui/map/StreetMapView.kt` gained a
+  `routeGeometry` param (drawn as a red `Polyline` overlay) and
+  `onMapViewReady` (so the offline-download button can reuse the SAME
+  MapView/tile cache, not a second one).
+- HONEST LIMITATION kept even after this override (CLAUDE.md Rule 13):
+  no live "next turn in X m" banner — this project doesn't track live
+  progress along an active route, so `ActiveRouteCard` shows the full
+  real step list instead of fabricating a live single-instruction banner.
+
+Real bugs caught fixing this on-device, each found by actually running
+it against real network services rather than assuming success:
+- osmdroid's `setTileSource()` was being called inside `AndroidView`'s
+  `update` block, which re-executes on every recomposition (i.e. every
+  ~100ms sensor/GNSS tick) — `setTileSource()` rebuilds osmdroid's
+  internal tile-provider modules, so it was interrupting its own in-flight
+  tile fetches continuously, leaving permanently-stuck black tiles.
+  Fixed by moving it into a `LaunchedEffect(isDarkTheme)`, re-running
+  only when the theme toggle actually changes.
+- The routing "Start" button initially refused to route ("No current
+  position yet") even with a real, recent GNSS fix on screen — the
+  marker-display position logic (correctly) only trusts a fix once
+  `GnssQuality` calls it "good," but a real indoor fix (real coordinates,
+  but 8.8s old / 29.7m accuracy, near a window) legitimately failed that
+  bar. Routing doesn't need that same precision guarantee, so
+  `MapScreen.kt` now has a SEPARATE, more lenient `routingOriginLatDeg/
+  LonDeg` fallback that accepts any available raw fix — the stricter
+  marker/anchor logic used for drift-measurement honesty was left
+  untouched.
+- A newly-computed route could be geographically far from wherever the
+  map camera happened to be centered (e.g. still parked near (0,0) with
+  no quality-passing fix yet), making the drawn route invisible off-
+  screen even though it computed correctly — fixed by zoom-to-fitting the
+  route's own bounding box once per new route
+  (`StreetMapView.kt`'s `LaunchedEffect(routeGeometry)`).
+All of the above were confirmed working end-to-end on the real S24 FE
+against LIVE Nominatim/OSRM services with a real GNSS fix in Chennai:
+real search results, a real ~20.4 km / 24 min route with real street-name
+turn-by-turn steps drawn correctly on real map tiles, and a real offline
+tile download reaching 100%.
+
+**UPDATE (2026-08-26, Pause control + Walking mode + a real live-tracking
+bug fix — explicit user override, "dont care about out of scope in PRD")**:
+
+- **Pause/Resume the live pipeline**: `MainActivity.kt` gained
+  `startPipeline()`/`stopPipeline()` (the exact repository start()/stop()
+  sequence `onResume()`/`onPause()` already used, now extracted so a UI
+  button can trigger it too) and `isPipelinePaused` (a `by mutableStateOf`
+  field, since it's read from both Compose and the non-Composable
+  `onResume()`/`onPause()` lifecycle callbacks). `onResume()` now only
+  auto-restarts the pipeline `if (!isPipelinePaused)`, so a manual pause
+  survives a background/foreground cycle instead of silently resuming.
+  `ui/screens/StatusOverlayContent.kt` gained a "Pause"/"Resume" header
+  button and a "PAUSED" status chip (honest signal that every reading
+  below it is frozen, not live — CLAUDE.md Rule 13's in-app-copy
+  convention). Verified each repository's own `stop()` is idempotent
+  (unregistering an already-unregistered listener / cancelling a null job
+  / quitting a null HandlerThread are all no-ops) before relying on
+  `onPause()` calling `stopPipeline()` unconditionally even when already
+  manually paused.
+- **Walking mode**: `ui/components/VehicleModeSelector.kt`'s `VehicleMode`
+  enum gained `WALKING` (PRD.md Section 6 originally scoped Car/Motorcycle
+  only). Unlike CAR/MOTORCYCLE (still local-UI-state-only),
+  `dr/BaselineDeadReckoningRepository.kt` gained a real
+  `walkingModeEnabled: Boolean` field: `NonHolonomicConstraint`'s "can't
+  move sideways relative to heading" suppression is skipped while walking,
+  since that assumption is vehicle-only (a pedestrian can turn/strafe in
+  place in a way a car physically can't) — the exact mechanism the
+  2026-08-26 real outdoor walking test (see the update above this one)
+  already exposed as a real limitation. ZUPT is unchanged for both modes.
+  `MainActivity.kt` wires the Compose selection to the repository via
+  `LaunchedEffect(vehicleMode)`, same pattern `onRecalibrate` already uses
+  for `mlVelocityRepository.resetAlignment()`. The selector in
+  `StatusOverlayContent.kt` is now always visible/switchable (previously
+  it collapsed to a static, unchangeable chip after one pick) since a rider
+  might plausibly park and walk mid-session now that the mode has a real
+  effect. New hand-drawn `res/drawable/ic_walk.xml`, same honest
+  not-from-Figma convention as `ic_motorcycle.xml`.
+- **REAL BUG FOUND + FIXED (user-reported): "no feature to track my
+  position on the map"**. Root cause: `fusion/StateEstimator.kt` only ever
+  set `outageAnchorLatDeg`/`outageAnchorLonDeg` on a strict `GNSS_AIDED`
+  tick (`GnssQuality`-passing: fix age <3000ms, accuracy <25m). Without
+  that anchor, `ui/screens/MapScreen.kt` has no reference point to project
+  the fused East/North position back to a real lat/lon, so it draws NO
+  marker at all — even while the physics/ML DR fusion underneath was
+  working correctly the whole time. This silently reproduces exactly the
+  real indoor case `MapScreen.kt` already documented for the routing-origin
+  fallback (an 8.8s-old/29.7m-accuracy fix that's real but never passes
+  `GnssQuality`), except unlike routing, the marker path had no lenient
+  fallback at all. Fixed by also setting a PROVISIONAL anchor from the
+  very first fix ever seen this run, of any quality, if no anchor exists
+  yet — a small, bounded approximation no worse than one
+  `BaselineDeadReckoningRepository` already makes (its own integrator's
+  zero-point is "wherever the phone was at app launch," not the instant of
+  the first fix either). Once a real `GNSS_AIDED` fix does arrive, the
+  strict branch still overwrites this with the accurate point (a one-time
+  visual snap-to-fix, same as any nav app when GPS lock improves). This
+  fix, combined with `MapScreen.kt`'s existing `currentLatDeg`/
+  `currentLonDeg` preference order (live GNSS fix while `GNSS_AIDED`, else
+  the fused DR position projected through the anchor) and
+  `StreetMapView.kt`'s existing per-tick `controller.animateTo(point)`, is
+  what makes the marker actually appear and follow the live (possibly
+  DR-only, during an outage) position — this was already the intended
+  design (Slice 7/8b), just unreachable in practice whenever the first fix
+  wasn't a strong one. Not yet re-verified on a real device outdoors this
+  session (CLAUDE.md Rule 13 — noted here so it isn't reported as measured
+  until it is).
+
+**UPDATE (2026-08-26, drift card compaction — user-requested)**:
+`ui/components/DriftSummaryCard.kt` used to be a full bottom-sheet-scale
+`GlassCard` showing the exact "X.X m drift over Y.Y m travelled" plus an
+explanatory line — the user found it "annoying" and asked for it reduced
+to just "drift detected." Rewritten as a small dismissible pill using the
+same `StatusChip` visual language as the GNSS mode/speed/motion chips
+above it, instead of a second, larger card style. The real measured
+number isn't discarded (still real data, per CLAUDE.md Rule 13) — it's
+still shown in full on `ui/screens/HistoryScreen.kt`'s drift log, and this
+chip exposes it via `Modifier.semantics { contentDescription = ... }` for
+accessibility even though it's no longer in the visible text. Confirmed
+on-device: renders as a compact "● Drift detected ✕" pill, and the
+dismiss button works (Compose's automatic 48dp minimum touch target made
+it reliably tappable even though the visual icon is only 20dp).
+
+**UPDATE (2026-08-26, on-device verification of the "Go" button — a real bug
+found and fixed that the earlier fix missed)**: tested live on the S24 FE
+via `adb` (search "SRM Ramapuram" -> select -> Start -> Go -> Exit), with
+screenshots checked at each step.
+- Geocoding fix confirmed working live: "SRM Ramapuram" correctly returns
+  "SRM College Bus Stop, Bharathi Salai, ... Chennai ... 600089, India."
+- Route computation confirmed working live: real OSRM route, 14.7km/20min,
+  real street-name turn-by-turn steps.
+- REAL BUG FOUND (missed by the earlier top-padding fix above): the
+  overlap wasn't in the idle-search or navigating states (those two DID
+  use the 300dp `Column` padding fix and render cleanly) — it was
+  `ActiveRouteCard` itself, the route-preview state with the Go/Download/
+  End buttons. That card sits in a bottom-aligned, UNBOUNDED-height `Box`
+  (`Modifier.align(Alignment.BottomCenter)` with no height cap at all), so
+  its natural wrap-content height (destination name + duration/distance +
+  up-to-160dp step list + Go button + Download/End row) simply grew
+  upward from the bottom until it collided with
+  `StatusOverlayContent`'s top GNSS/speed/motion chips — confirmed
+  visually on the real device, and confirmed the 300dp fix above had NO
+  effect on this specific state since it touches a completely different
+  code path. Real fix: `MapScreen.kt`'s `else` branch now wraps the card
+  in `BoxWithConstraints` to read the actual available screen height and
+  computes `maxCardHeight = maxHeight - 340.dp - 170.dp` (340dp reserved
+  for the top chip stack, 170dp for the existing bottom inset), passed to
+  `ActiveRouteCard` as `Modifier.heightIn(max = maxCardHeight)`.
+  `ActiveRouteCard.kt`'s own `GlassCard` call gained
+  `.verticalScroll(rememberScrollState())` so that when a route's card
+  content is taller than that cap (confirmed: it usually is, given the
+  step list), it scrolls internally to reach the Go/Download/End buttons
+  instead of silently overflowing past the height cap — verified by
+  scrolling the card and successfully tapping Go afterward.
+- With that fix, "Go" was confirmed live end-to-end: the top
+  `NavigationInstructionCard` showed a real live "74 m / Start" with no
+  overlap, the bottom `NavigationEtaBar` showed "20 min / 14.8 km
+  remaining" with no overlap, and "Exit" correctly returned to the idle
+  search state — no crash anywhere in Logcat through the whole flow.
+  Still NOT verified outdoors with real motion (this was all indoor/
+  stationary, so `RouteProgress`'s live distance-to-maneuver tracking as
+  the position actually changes, and the heading-up map rotation, remain
+  unconfirmed against a real drive).
+
+**UPDATE (2026-08-26, same day — three more user-reported bugs)**:
+- osmdroid's default on-screen +/- zoom buttons were rendering bottom-center
+  over `StatusOverlayContent.kt`'s own bottom content (vehicle-mode
+  selector / drift card / `ActiveRouteCard`) — there's no osmdroid API to
+  reposition them independently of that fixed placement, so
+  `ui/map/StreetMapView.kt` now calls `setBuiltInZoomControls(false)`.
+  `setMultiTouchControls(true)` (already set) still gives real pinch-to-zoom,
+  so nothing is lost, only the redundant on-screen buttons.
+- `MainActivity.kt` had no `BackHandler` at all on the normal Drive/Map/
+  History tabs, so the system Back button fell straight through to
+  `ComponentActivity`'s default "finish the Activity" from ANY tab,
+  closing the whole app instead of navigating within it. A second
+  `BackHandler`, enabled whenever `selectedTab != AppTab.DRIVE` (and the
+  debug screen isn't showing, which the existing handler already owns),
+  now returns to Drive first — the same "only the true home tab exits on
+  Back" convention most bottom-nav apps use. Back from Drive itself still
+  falls through to the default exit behavior.
+- The "once I enter either of the two [vehicle] modes I can't select the
+  other one or come out of it" report was already fixed by this same
+  day's earlier update above (`StatusOverlayContent.kt`'s selector used to
+  collapse into a permanent, non-interactive chip after the first pick;
+  it's now always visible/switchable) — confirmed still current, no
+  further code change needed for that part.
+
+**UPDATE (2026-08-26, same day — turn-by-turn navigation + a real
+geocoding bug fix)**:
+
+- **Turn-by-turn navigation ("start mode," user-requested Google-Maps-like
+  behavior)**: new `routing/RouteProgress.kt` (pure Kotlin, unit-tested in
+  `RouteProgressTest.kt` — CLAUDE.md Rule 19) projects the live position
+  onto the real OSRM route polyline (nearest-point-on-segment, standard
+  parametric projection) to compute which step is current, remaining
+  distance to the next maneuver, remaining distance to the destination, and
+  perpendicular distance off-route. Critically, the "live position" fed in
+  is `fusedState.fusedEastM/fusedNorthM` — the SAME physics/ML dead-reckoned
+  position the rest of the app already falls back to during a GNSS outage
+  (via `fusion/StateEstimator.kt`), projected into the route's local frame
+  through the SAME anchor. So turn-by-turn progress keeps counting down
+  through an outage using physics/ML, not just live GNSS — directly
+  answering the "GNSS outage must use physics/AIML" requirement in the same
+  feature. New `ui/components/NavigationBanner.kt` (`NavigationInstructionCard`
+  top / `NavigationEtaBar` bottom, same top/bottom placement convention
+  `DestinationSearchBar`/`ActiveRouteCard` already use) replaces the static
+  step list once entered via `ActiveRouteCard`'s new "Go" button.
+  `ui/map/StreetMapView.kt` gained `headingDeg` (rotates the map
+  "heading-up" via `setMapOrientation` while navigating, north-up
+  otherwise) and zooms to 19 on nav start; `ui/screens/MapScreen.kt` derives
+  the heading from a live GNSS bearing when `GNSS_AIDED`, else the physics
+  DR velocity vector's own heading, else holds the last confident value
+  (avoids spinning the map at near-zero speed). HONEST LIMITATION (CLAUDE.md
+  Rule 13): no live rerouting — `NavigationInstructionCard` flags "off
+  route" past 50m instead of silently recomputing a route it has no engine
+  for. UNVERIFIED ON A REAL DEVICE: the heading-up rotation direction/sign
+  and the whole live-progress-during-an-actual-outdoor-drive path have not
+  been confirmed outdoors yet this session.
+- **REAL BUG FOUND + FIXED: "most places in Chennai are not visible, SRM
+  Ramapuram not showing"**. Curl-testing Nominatim directly (outside the
+  app) for "SRM Ramapuram," "Anna Nagar Chennai," "T Nagar Chennai," etc.
+  all returned correct real results — Nominatim itself works. The actual
+  bug: `routing/GeocodingRepository.kt`'s `search()` collapsed EVERY
+  failure (non-200 HTTP, timeout, malformed JSON, no network) into the
+  exact same empty list a genuine "no matches" produces — on a real device,
+  a 403/429 from Nominatim's abuse throttling (plausible on a shared
+  carrier/CGNAT IP, common on Indian mobile networks) would look
+  identical to a typo, with zero signal why. Fixed by introducing
+  `GeocodeSearchOutcome` (`Success`/`Failure` with a real reason string) and
+  logging every failure (`Log.w`/`Log.e`, same pattern
+  `routing/RoutingRepository.kt` already used for OSRM) — `MapScreen.kt` now
+  shows the real failure reason (or "No matches for …") under the search
+  bar instead of a silent empty dropdown. Also added a soft `viewbox`
+  relevance bias toward greater Chennai + `countrycodes=in` (NOT a hard
+  filter — `bounded` stays off, so a genuine non-Indian match still
+  surfaces, just ranked lower) — a real, disclosed bias reasonable for this
+  ISRO/Chennai-scoped hackathon demo, not a fabricated result. NOT YET
+  CONFIRMED against the user's actual original failure — the true root
+  cause on their specific device/network is still unconfirmed (no on-device
+  Logcat access this session); this fix makes that root cause visible next
+  time it happens, which the code could not do before.
+
 ---
 
 ## How to read this file

@@ -20,6 +20,16 @@ import kotlin.math.abs
  * correctly distinguishes a real pothole from e.g. a speed bump, a curb,
  * or the phone being dropped/bumped. That validation needs real,
  * labeled drive data.
+ *
+ * UPDATE (2026-08-26, real outdoor walking test): the original 4.0 m/s^2
+ * default false-positived constantly on ordinary walking gait -- a phone
+ * carried by hand while walking routinely produces 5-10+ m/s^2 vertical
+ * bounce per step, well above what should be needed to flag a genuine
+ * shock. Raised to 15.0 m/s^2 so casual walking motion no longer trips
+ * it. STILL an unvalidated engineering default (CLAUDE.md Rule 13): this
+ * is now tuned to reject one real observed false-positive source
+ * (walking), not confirmed against a real in-vehicle pothole strike,
+ * which remains blocked on real labeled drive data same as before.
  */
 class PotholeShockDetector(
     private val verticalShockThresholdMps2: Float = DEFAULT_VERTICAL_SHOCK_THRESHOLD_MPS2,
@@ -29,7 +39,7 @@ class PotholeShockDetector(
         // driving vertical noise after gravity removal is typically well
         // under 2 m/s^2 — set well above that to only catch a genuine
         // shock, not routine road texture.
-        const val DEFAULT_VERTICAL_SHOCK_THRESHOLD_MPS2 = 4.0f
+        const val DEFAULT_VERTICAL_SHOCK_THRESHOLD_MPS2 = 15.0f
     }
 
     /** Magnitude-based — a shock can push the Up component either direction (into or out of the seat). */

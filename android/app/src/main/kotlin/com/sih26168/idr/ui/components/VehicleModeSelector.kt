@@ -2,10 +2,12 @@ package com.sih26168.idr.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -22,24 +24,27 @@ import com.sih26168.idr.ui.theme.PillShape
 import com.sih26168.idr.ui.theme.TextPrimary
 import com.sih26168.idr.ui.theme.TextSecondary
 
-/** PRD.md Section 6 (Scope, "User-selected Car / Motorcycle mode") / Section 22. */
-enum class VehicleMode { CAR, MOTORCYCLE }
+/**
+ * PRD.md Section 6 originally scoped this to Car/Motorcycle only. WALKING
+ * was added 2026-08-26 on explicit user request, overriding that scope
+ * (same "explicit override" pattern already used for Slice 8b's map
+ * dependency and the full-routing addition — see docs/PROJECT_MAP.md).
+ * Unlike CAR/MOTORCYCLE, WALKING is NOT local-UI-state-only: selecting it
+ * actually changes dr/BaselineDeadReckoningRepository's behavior (see
+ * that file's `walkingModeEnabled` — the vehicle-only non-holonomic
+ * constraint is skipped for a pedestrian, who can strafe/turn in place in
+ * a way a car physically cannot).
+ */
+enum class VehicleMode { CAR, MOTORCYCLE, WALKING }
 
 /**
- * Two-option segmented control, styled as two adjacent pill buttons on
- * the [com.sih26168.idr.ui.theme.GlassSurface] background (Figma's own
+ * Three-option segmented control, styled as adjacent pill buttons on the
+ * [com.sih26168.idr.ui.theme.GlassSurface] background (Figma's own
  * pill-button convention). `Car` uses res/drawable/ic_car.xml (exported
- * from the Figma file's tab-bar icon set); `Motorcycle` uses
- * res/drawable/ic_motorcycle.xml, a small hand-drawn glyph since no
- * motorcycle icon exists in the Figma file (see that drawable's own doc
- * comment).
- *
- * LOCAL UI STATE ONLY (CLAUDE.md Rule 8): nothing in the pipeline
- * currently branches on vehicle type — PRD Section 6 explicitly excludes
- * automatic car-vs-motorcycle classification, and no manual-selection
- * consumer exists downstream yet either. This is a real, working
- * control that stores a selection; it does not yet change any
- * physics/ML behavior, and is not pretending to.
+ * from the Figma file's tab-bar icon set); `Motorcycle`/`Walking` use
+ * res/drawable/ic_motorcycle.xml / ic_walk.xml, small hand-drawn glyphs
+ * since neither icon exists in the Figma file (see each drawable's own
+ * doc comment).
  */
 @Composable
 fun VehicleModeSelector(
@@ -47,7 +52,14 @@ fun VehicleModeSelector(
     onSelect: (VehicleMode) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Row(modifier = modifier) {
+    // REAL BUG FIX (2026-08-26, found testing on a real S24 FE): three pills
+    // (Car/Motorcycle/Walk) are wider than the phone's screen once the
+    // recenter FloatingIconButton's reserved space (see
+    // StatusOverlayContent.kt's Row, changed in the same fix) is subtracted
+    // — this used to clip/overlap the last pill's label. Scrolls instead of
+    // clipping now, so it stays readable regardless of how many modes this
+    // ever grows to.
+    Row(modifier = modifier.horizontalScroll(rememberScrollState())) {
         VehicleModeOption(
             label = "Car",
             iconRes = R.drawable.ic_car,
@@ -60,6 +72,13 @@ fun VehicleModeSelector(
             iconRes = R.drawable.ic_motorcycle,
             isSelected = selected == VehicleMode.MOTORCYCLE,
             onClick = { onSelect(VehicleMode.MOTORCYCLE) },
+        )
+        Spacer(modifier = Modifier.size(8.dp))
+        VehicleModeOption(
+            label = "Walk",
+            iconRes = R.drawable.ic_walk,
+            isSelected = selected == VehicleMode.WALKING,
+            onClick = { onSelect(VehicleMode.WALKING) },
         )
     }
 }

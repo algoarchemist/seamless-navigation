@@ -34,4 +34,21 @@ object GeoProjection {
         val northM = (latDeg - refLatDeg) * METERS_PER_DEG_LAT
         return eastM to northM
     }
+
+    /**
+     * Exact algebraic inverse of [toLocalMeters] (same flat-earth tangent-
+     * plane approximation, same accuracy caveat) — added so a real street
+     * map (`ui/map/StreetMapView.kt`) can place the already-computed fused
+     * East/North position back onto real-world lat/lon tiles. Round-trips
+     * with [toLocalMeters] to within floating-point precision (see
+     * GeoProjectionTest).
+     *
+     * @return (latDeg, lonDeg) of (eastM, northM) relative to (refLatDeg, refLonDeg).
+     */
+    fun toLatLon(eastM: Double, northM: Double, refLatDeg: Double, refLonDeg: Double): Pair<Double, Double> {
+        val metersPerDegLon = METERS_PER_DEG_LAT * cos(Math.toRadians(refLatDeg))
+        val lonDeg = refLonDeg + eastM / metersPerDegLon
+        val latDeg = refLatDeg + northM / METERS_PER_DEG_LAT
+        return latDeg to lonDeg
+    }
 }

@@ -54,6 +54,14 @@ fun TrackCanvas(
     mode: GnssMode,
     modifier: Modifier = Modifier,
 ) {
+    // Read OUTSIDE the Canvas draw lambda — that lambda is a DrawScope
+    // closure, not a @Composable context, so the theme-aware
+    // ScreenGradientTop/Bottom getters (light/dark mode, 2026-08-26) can't
+    // be called from inside it directly; captured into plain local vals
+    // here instead.
+    val gradientTop = ScreenGradientTop
+    val gradientBottom = ScreenGradientBottom
+
     Canvas(modifier = modifier) {
         val centerX = size.width / 2f
         val centerY = size.height / 2f
@@ -62,7 +70,7 @@ fun TrackCanvas(
         // frame the user pointed at (see ui/theme/Color.kt's note on
         // ScreenGradientTop/Bottom) — a top-to-bottom linear gradient,
         // not the flat DarkBackground this canvas used before.
-        drawRect(Brush.verticalGradient(listOf(ScreenGradientTop, ScreenGradientBottom)))
+        drawRect(Brush.verticalGradient(listOf(gradientTop, gradientBottom)))
 
         // Screen Y grows downward; local North should read "up" on screen,
         // so it's subtracted rather than added (CLAUDE.md Rule 9/14 — this

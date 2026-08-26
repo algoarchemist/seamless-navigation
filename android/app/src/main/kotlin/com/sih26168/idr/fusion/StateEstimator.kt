@@ -28,6 +28,29 @@ data class FusedPositionUiState(
      * whether/when to stop showing it, this class doesn't auto-clear it).
      */
     val driftSummary: DriftSummaryResult? = null,
+    /**
+     * Every REACQUISITION-instant drift measurement this run, oldest
+     * first — same values [driftSummary] snapshots (it always mirrors
+     * this list's last entry), kept as a running log instead of a single
+     * overwritten field so `ui/screens/HistoryScreen.kt` (Slice 8b) can
+     * show a REAL trip/outage history (CLAUDE.md Rule 13) rather than
+     * fabricating one, matching the Figma "Timeline" screen's list
+     * concept with actually-measured data instead of its placeholder
+     * mileage chart.
+     */
+    val driftHistory: List<DriftSummaryResult> = emptyList(),
+    /**
+     * The real-world lat/lon this run's local (0,0) East/North origin
+     * corresponds to — the SAME point [outageAnchorLatDeg]/
+     * [outageAnchorLonDeg] track internally, continuously overwritten
+     * while GNSS_AIDED. Exposed so `ui/map/StreetMapView.kt` can invert
+     * [fusedEastM]/[fusedNorthM] back to real lat/lon via
+     * [GeoProjection.toLatLon] and place a marker on real street tiles.
+     * Null until the first-ever GNSS fix this run (no anchor to convert
+     * against yet).
+     */
+    val anchorLatDeg: Double? = null,
+    val anchorLonDeg: Double? = null,
 )
 
 /**
@@ -86,6 +109,7 @@ class StateEstimator(
     private var lastAidedAtMs: Long? = null
     private var previousMode: GnssMode? = null
     private var lastDriftSummary: DriftSummaryResult? = null
+    private val driftHistory = mutableListOf<DriftSummaryResult>()
 
     private var collectJob: Job? = null
 
@@ -96,6 +120,7 @@ class StateEstimator(
         lastAidedAtMs = null
         previousMode = null
         lastDriftSummary = null
+        driftHistory.clear()
         _state.value = FusedPositionUiState()
 
         collectJob = scope.launch {
@@ -107,6 +132,31 @@ class StateEstimator(
                     outageAnchorLatDeg = fix.latitudeDeg
                     outageAnchorLonDeg = fix.longitudeDeg
                     lastAidedAtMs = nowMs
+                } else if (outageAnchorLatDeg == null) {
+                    // REAL BUG (2026-08-26, user report: "no feature to track
+                    // my position on the map"): without ANY anchor,
+                    // ui/screens/MapScreen.kt has no lat/lon to project the
+                    // fused DR position onto, so it draws NO marker at all --
+                    // even while this class is correctly fusing real
+                    // physics/ML position underneath. That happens whenever
+                    // the FIRST fix this run isn't good enough to pass
+                    // GnssQuality (e.g. MapScreen.kt's own documented real
+                    // case: an 8.8s-old/29.7m-accuracy indoor fix near a
+                    // window) -- mode never reaches GNSS_AIDED, so the strict
+                    // branch above never fires. A PROVISIONAL anchor from the
+                    // very first fix ever seen (any quality) fixes this: it's
+                    // the same small, bounded approximation
+                    // BaselineDeadReckoningRepository's own integrator already
+                    // makes by not resetting until GNSS_AIDED either (its
+                    // zero-point is really "wherever the phone was at app
+                    // launch," which is a few seconds/meters from this first
+                    // fix, not a new source of error). Once a real GNSS_AIDED
+                    // fix does arrive, the strict branch above overwrites this
+                    // with the accurate point -- a one-time visual snap-to-
+                    // fix, same as any nav app's behavior when GPS lock
+                    // improves, not silently kept wrong forever.
+                    outageAnchorLatDeg = fix.latitudeDeg
+                    outageAnchorLonDeg = fix.longitudeDeg
                 }
 
                 val mlState = mlVelocityRepository?.state?.value
@@ -147,6 +197,7 @@ class StateEstimator(
                         gnssEastM = newFixEastM,
                         gnssNorthM = newFixNorthM,
                     )
+                    driftHistory.add(lastDriftSummary!!)
                 }
                 previousMode = gnssState.mode
 
@@ -165,6 +216,9 @@ class StateEstimator(
                     drSourceUsed = if (useMl) DrSource.ML else DrSource.PHYSICS,
                     secondsSinceLastGnssAided = lastAidedAtMs?.let { (nowMs - it) / 1000f } ?: Float.MAX_VALUE,
                     driftSummary = lastDriftSummary,
+                    driftHistory = driftHistory.toList(),
+                    anchorLatDeg = outageAnchorLatDeg,
+                    anchorLonDeg = outageAnchorLonDeg,
                 )
             }
         }

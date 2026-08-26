@@ -2,6 +2,7 @@ package com.sih26168.idr
 
 import android.Manifest
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -9,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -17,6 +19,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -39,7 +42,12 @@ import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.ml.VelocityModel
 import com.sih26168.idr.sensors.SensorRepository
 import com.sih26168.idr.sensors.SensorUiState
+import com.sih26168.idr.ui.components.AppTab
+import com.sih26168.idr.ui.components.BottomNavBar
+import com.sih26168.idr.ui.components.VehicleMode
 import com.sih26168.idr.ui.screens.DriveScreen
+import com.sih26168.idr.ui.screens.HistoryScreen
+import com.sih26168.idr.ui.screens.MapScreen
 import com.sih26168.idr.ui.theme.IdrTheme
 import java.io.File
 import kotlinx.coroutines.Dispatchers
@@ -88,6 +96,13 @@ class MainActivity : ComponentActivity() {
     private var mlVelocityRepository: MlVelocityRepository? = null
     private var velocityModel: VelocityModel? = null
 
+    // 2026-08-26, user-requested Pause button: a `by mutableStateOf`
+    // property (not a plain `var`) so Compose recomposes the Pause/Resume
+    // label and the "PAUSED" chip the moment this changes, even though it's
+    // also read from onResume()/onPause() (non-Composable lifecycle
+    // callbacks) to decide whether the pipeline should auto-restart.
+    private var isPipelinePaused by mutableStateOf(false)
+
     // Reported via a StateFlow rather than a thrown exception surfaced
     // only in Logcat — a missing/corrupt bundled model is a real,
     // demo-relevant failure mode (e.g. forgot to copy the gitignored
@@ -119,6 +134,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // A real outdoor test drive runs minutes at a time with the phone
+        // mounted/handled, not actively tapped — without this the screen
+        // locks mid-run and the live GNSS<->DR transition (the actual
+        // thing being tested) goes unobserved. Demo/test-only convenience,
+        // not a claimed behavior of the shipped navigation logic itself.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         sensorRepository = SensorRepository(applicationContext)
         locationRepository = LocationRepository(applicationContext)
         // GnssModeRepository must exist before BaselineDeadReckoningRepository —
@@ -155,9 +176,37 @@ class MainActivity : ComponentActivity() {
             val mlError by mlModelLoadError.collectAsState()
             val recState by recordingState.collectAsState()
             var showDebugScreen by remember { mutableStateOf(false) }
+            var selectedTab by remember { mutableStateOf(AppTab.DRIVE) }
+            var isDarkTheme by remember { mutableStateOf(true) }
+            var vehicleMode by remember { mutableStateOf<VehicleMode?>(null) }
             BackHandler(enabled = showDebugScreen) { showDebugScreen = false }
+            // User-reported bug (2026-08-26): with no BackHandler at all on
+            // the normal Drive/Map/History tabs, the system back button fell
+            // straight through to ComponentActivity's default behavior
+            // (finish the Activity) from ANY tab, closing the whole app
+            // instead of navigating within it — surprising from Map/History,
+            // where a user expects Back to return to the main Drive screen
+            // first, same as any standard bottom-nav app. Only enabled when
+            // NOT already on Drive (and not on the debug screen, which the
+            // handler above already owns) so Back from Drive itself still
+            // falls through to the normal "exit app" behavior — the
+            // conventional bottom-nav-app convention (only the true home tab
+            // exits on Back).
+            BackHandler(enabled = !showDebugScreen && selectedTab != AppTab.DRIVE) {
+                selectedTab = AppTab.DRIVE
+            }
 
-            IdrTheme {
+            // Walking mode actually changes DR behavior (see
+            // dr/BaselineDeadReckoningRepository.walkingModeEnabled's doc) —
+            // this is the one place that live selection reaches the
+            // repository, same "Compose state -> plain mutable field on a
+            // non-Composable repository" pattern onRecalibrate already uses
+            // for mlVelocityRepository.resetAlignment().
+            LaunchedEffect(vehicleMode) {
+                deadReckoningRepository.walkingModeEnabled = vehicleMode == VehicleMode.WALKING
+            }
+
+            IdrTheme(darkTheme = isDarkTheme) {
                 if (showDebugScreen) {
                     IdrSensorScreen(
                         uiState, drState, gnssState, mlState, fusedState, mlError, recState,
@@ -166,15 +215,52 @@ class MainActivity : ComponentActivity() {
                         onStopRecording = ::stopRecordingAndSave,
                     )
                 } else {
-                    DriveScreen(
-                        drState = drState,
-                        gnssState = gnssState,
-                        mlState = mlState,
-                        fusedState = fusedState,
-                        mlModelLoadError = mlError,
-                        onRecalibrate = { mlVelocityRepository?.resetAlignment() },
-                        onShowDebugScreen = { showDebugScreen = true },
-                    )
+                    // Slice 8b: three tabs (Drive/Map/History) share the SAME
+                    // live state above — switching tabs never re-reads a
+                    // different data source, only changes which screen
+                    // presents it (DriveScreen's abstract grid, MapScreen's
+                    // real street tiles, or HistoryScreen's measured-drift
+                    // log). The tab bar lives outside all three screens so
+                    // each screen's own bottom-aligned content (vehicle
+                    // selector, drift card) never overlaps it.
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        Column(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                            when (selectedTab) {
+                                AppTab.DRIVE -> DriveScreen(
+                                    drState = drState,
+                                    gnssState = gnssState,
+                                    mlState = mlState,
+                                    fusedState = fusedState,
+                                    mlModelLoadError = mlError,
+                                    isDarkTheme = isDarkTheme,
+                                    isPipelinePaused = isPipelinePaused,
+                                    vehicleMode = vehicleMode,
+                                    onToggleTheme = { isDarkTheme = !isDarkTheme },
+                                    onRecalibrate = { mlVelocityRepository?.resetAlignment() },
+                                    onShowDebugScreen = { showDebugScreen = true },
+                                    onTogglePipelinePause = ::togglePipelinePause,
+                                    onVehicleModeChange = { vehicleMode = it },
+                                )
+                                AppTab.MAP -> MapScreen(
+                                    drState = drState,
+                                    gnssState = gnssState,
+                                    mlState = mlState,
+                                    fusedState = fusedState,
+                                    mlModelLoadError = mlError,
+                                    isDarkTheme = isDarkTheme,
+                                    isPipelinePaused = isPipelinePaused,
+                                    vehicleMode = vehicleMode,
+                                    onToggleTheme = { isDarkTheme = !isDarkTheme },
+                                    onRecalibrate = { mlVelocityRepository?.resetAlignment() },
+                                    onShowDebugScreen = { showDebugScreen = true },
+                                    onTogglePipelinePause = ::togglePipelinePause,
+                                    onVehicleModeChange = { vehicleMode = it },
+                                )
+                                AppTab.HISTORY -> HistoryScreen(driftHistory = fusedState.driftHistory)
+                            }
+                        }
+                        BottomNavBar(selected = selectedTab, onSelect = { selectedTab = it })
+                    }
                 }
             }
         }
@@ -183,8 +269,12 @@ class MainActivity : ComponentActivity() {
     // Sensors/GNSS are only active while the activity is visible, so the
     // demo doesn't drain battery/CPU in the background — start/stop is
     // tied to the standard Android lifecycle, not a custom one.
-    override fun onResume() {
-        super.onResume()
+    // 2026-08-26, user-requested Pause button: the exact same repository
+    // start() sequence onResume() already used, extracted so a UI button can
+    // trigger it too, not just the Activity lifecycle. Order preserved
+    // (gnssModeRepository before deadReckoningRepository before
+    // stateEstimator — see the original inline comments this replaced).
+    private fun startPipeline() {
         sensorRepository.start()
         gnssModeRepository.start()
         if (locationRepository.hasLocationPermission()) {
@@ -192,14 +282,45 @@ class MainActivity : ComponentActivity() {
         } else {
             requestLocationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
         }
-        // Started after gnssModeRepository so its GNSS-mode-gated reset
-        // (Slice 5) reads an already-ticking mode, not just the default.
         deadReckoningRepository.start()
         mlVelocityRepository?.start()
-        // Started last — it reads deadReckoningRepository's and
-        // mlVelocityRepository's latest .value each tick, so both must
-        // already be ticking (Slice 7).
         stateEstimator.start()
+    }
+
+    // Mirrors startPipeline() in reverse order (same as the original
+    // onPause() body) — safe to call even if already stopped (each
+    // repository's own stop() is idempotent: unregistering an unregistered
+    // listener / cancelling a null job / quitting a null HandlerThread are
+    // all no-ops), which matters since onPause() calls this unconditionally
+    // even when the user already paused manually via the button.
+    private fun stopPipeline() {
+        stateEstimator.stop()
+        mlVelocityRepository?.stop()
+        gnssModeRepository.stop()
+        locationRepository.stop()
+        deadReckoningRepository.stop()
+        sensorRepository.stop()
+    }
+
+    private fun togglePipelinePause() {
+        if (isPipelinePaused) {
+            isPipelinePaused = false
+            startPipeline()
+        } else {
+            isPipelinePaused = true
+            stopPipeline()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Respects a manual pause across a background/foreground cycle —
+        // without this check, backgrounding the app (which always stops the
+        // pipeline via onPause() below) and returning would silently
+        // resume it even if the user had deliberately paused first.
+        if (!isPipelinePaused) {
+            startPipeline()
+        }
 
         // Always collecting (same lifecycle-tied start/stop convention as
         // every other repository here) — whether a tick actually gets
@@ -240,12 +361,7 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         recorderCollectJob?.cancel()
         recorderCollectJob = null
-        stateEstimator.stop()
-        mlVelocityRepository?.stop()
-        gnssModeRepository.stop()
-        locationRepository.stop()
-        deadReckoningRepository.stop()
-        sensorRepository.stop()
+        stopPipeline()
         super.onPause()
     }
 

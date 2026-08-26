@@ -7,6 +7,13 @@
     <!-- HIGH_SAMPLING_RATE_SENSORS: needed on API 31+ to request faster than
          default accel/gyro delivery, relevant once Slice 1 requests ~10 Hz. -->
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <!-- INTERNET/ACCESS_NETWORK_STATE: osmdroid (ui/map/StreetMapView.kt)
+         fetches real OpenStreetMap street tiles over the network. This is
+         the map BACKGROUND IMAGERY only — no sensor processing, DR math,
+         or fusion logic depends on network access; the app's actual
+         navigation/positioning path stays fully offline as before. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="true" />
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="true" />

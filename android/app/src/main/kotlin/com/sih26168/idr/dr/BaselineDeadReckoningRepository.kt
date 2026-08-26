@@ -57,6 +57,20 @@ class BaselineDeadReckoningRepository(
 ) {
     private val integrator = BaselinePhysicsIntegrator()
 
+    // 2026-08-26, user-requested Walking mode (explicit override of PRD.md
+    // Section 6's Car/Motorcycle-only scope): NonHolonomicConstraint's
+    // "can't move sideways relative to heading" assumption is a VEHICLE
+    // assumption only — a walking pedestrian can strafe/turn on the spot
+    // in a way a car physically cannot, so applying it while walking would
+    // suppress real lateral motion as if it were sensor noise. Plain
+    // mutable field (not a StateFlow) because it's set once per user
+    // selection from the UI thread, read every tick from the same
+    // coroutine this class already collects on — no cross-thread hazard.
+    // ZUPT (StationaryDetector) is UNCHANGED for both modes: a stationary
+    // pedestrian should still get zero-velocity-corrected same as a
+    // stationary vehicle.
+    var walkingModeEnabled: Boolean = false
+
     // null means "no accel sample processed yet this run" — deliberately NOT
     // a 0L sentinel. A prior version used 0L and, on the very first sample,
     // computed dt as (accel.timestampNs - 0L) = the device's entire boot-time
@@ -157,7 +171,7 @@ class BaselineDeadReckoningRepository(
 
                 if (stationary) {
                     integrator.overrideVelocity(0.0, 0.0)
-                } else {
+                } else if (!walkingModeEnabled) {
                     val preConstraint = integrator.currentState()
                     val (forwardEastMps, forwardNorthMps) = NonHolonomicConstraint.suppressLateralVelocity(
                         velocityEastMps = preConstraint.velocityEastMps,
@@ -166,6 +180,8 @@ class BaselineDeadReckoningRepository(
                     )
                     integrator.overrideVelocity(forwardEastMps, forwardNorthMps)
                 }
+                // else: Walking mode — leave integrator's own double-integrated
+                // velocity untouched, no vehicle-only lateral suppression.
 
                 _state.value = integrator.currentState()
             }

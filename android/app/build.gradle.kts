@@ -70,5 +70,13 @@ dependencies {
     // no inference code exists yet, this only makes the dependency available.
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.18.0")
 
+    // osmdroid — real OpenStreetMap street tiles for ui/map/StreetMapView.kt
+    // (Slice 8b). Chosen over Google Maps Compose/Mapbox specifically
+    // because it needs no API key/billing account (nothing to block on),
+    // matching CLAUDE.md Rule 2's "smallest practical stack" once the user
+    // explicitly asked to add a real map dependency. Pure View system, not
+    // Compose-native, so it's wrapped via AndroidView.
+    implementation("org.osmdroid:osmdroid-android:6.1.20")
+
     testImplementation("junit:junit:4.13.2")
 }
