@@ -1,8 +1,10 @@
 package com.sih26168.idr.fusion
 
+import android.util.Log
 import com.sih26168.idr.dr.BaselineDeadReckoningRepository
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
+import com.sih26168.idr.gnss.GnssQuality
 import com.sih26168.idr.ml.MlVelocityRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -10,6 +12,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+
+private const val TAG = "StateEstimator"
 
 /** Which DR source actually fed the fused position on the most recent tick. */
 enum class DrSource { PHYSICS, ML }
@@ -128,7 +132,26 @@ class StateEstimator(
                 val fix = gnssState.latestFix ?: return@collect
                 val nowMs = System.currentTimeMillis()
 
-                if (gnssState.mode == GnssMode.GNSS_AIDED) {
+                // REAL BUG (2026-08-26, user report: "stationary indoors,
+                // still shows tens of kilometres of drift"): this branch used
+                // to trust `gnssState.mode == GNSS_AIDED` alone as proof the
+                // fix was accurate. It isn't -- `mode` defaults to GNSS_AIDED
+                // at cold start (before the first GnssOutageDetector.evaluate()
+                // tick ever runs) AND stays GNSS_AIDED for up to
+                // `outageEnterDwellMs` (2s) after quality actually degrades,
+                // by design (CLAUDE.md Rule 16 hysteresis -- a single bad
+                // sample can't flip the mode). A stale/inaccurate fix landing
+                // in either window (e.g. Play Services' Fused Location
+                // Provider handing back a cached fix from a previous
+                // location, or a low-quality Wi-Fi-based indoor fix) was
+                // silently accepted as the permanent outage anchor with no
+                // independent accuracy/age check -- every later drift number
+                // measured against that wrong anchor was then nonsense.
+                // Re-checking GnssQuality.isGood() here (using the SAME
+                // fixAgeMs/accuracyM this fix was already classified with
+                // upstream) closes that gap: only a fix that is ACTUALLY good
+                // right now can move the anchor.
+                if (gnssState.mode == GnssMode.GNSS_AIDED && GnssQuality.isGood(gnssState.fixAgeMs, fix.accuracyM)) {
                     outageAnchorLatDeg = fix.latitudeDeg
                     outageAnchorLonDeg = fix.longitudeDeg
                     lastAidedAtMs = nowMs
@@ -150,11 +173,12 @@ class StateEstimator(
                     // makes by not resetting until GNSS_AIDED either (its
                     // zero-point is really "wherever the phone was at app
                     // launch," which is a few seconds/meters from this first
-                    // fix, not a new source of error). Once a real GNSS_AIDED
-                    // fix does arrive, the strict branch above overwrites this
-                    // with the accurate point -- a one-time visual snap-to-
-                    // fix, same as any nav app's behavior when GPS lock
-                    // improves, not silently kept wrong forever.
+                    // fix, not a new source of error). Once a fix that is
+                    // BOTH in GNSS_AIDED mode AND passes GnssQuality.isGood()
+                    // arrives, the strict branch above overwrites this with
+                    // the accurate point -- a one-time visual snap-to-fix,
+                    // same as any nav app's behavior when GPS lock improves,
+                    // not silently kept wrong forever.
                     outageAnchorLatDeg = fix.latitudeDeg
                     outageAnchorLonDeg = fix.longitudeDeg
                 }
@@ -198,6 +222,18 @@ class StateEstimator(
                         gnssNorthM = newFixNorthM,
                     )
                     driftHistory.add(lastDriftSummary!!)
+                    // Logged (not just shown in ui/screens/HistoryScreen.kt)
+                    // so a `logcat` capture running during a real demo/test
+                    // drive durably records the actual measured numbers
+                    // (PRD.md Section 28/35) -- the in-app History list is
+                    // in-memory only and is lost the moment the app process
+                    // dies, which is too fragile to be the only record of a
+                    // real measured result.
+                    Log.i(
+                        TAG,
+                        "Outage #${driftHistory.size} drift: ${lastDriftSummary!!.driftMeters}m " +
+                            "over ${lastDriftSummary!!.distanceTravelledMeters}m travelled",
+                    )
                 }
                 previousMode = gnssState.mode
 
