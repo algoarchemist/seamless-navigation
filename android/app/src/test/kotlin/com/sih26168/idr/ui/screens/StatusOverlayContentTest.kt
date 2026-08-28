@@ -49,9 +49,14 @@ class StatusOverlayContentTest {
 
     @Test
     fun `rejected GNSS speed falls through to ML speed when ML is the active DR source`() {
+        // Round 2 (2026-08-28): the displayed ML speed now sources
+        // predictedVelocityDampedMps (VelocityGuard's damped output, what
+        // actually feeds the ML position estimate), not
+        // predictedVelocityCorrectedMps (bias-corrected but pre-damping) —
+        // see StatusOverlayContent.kt's estimateSpeedMps.
         val speed = estimateSpeedMps(
             drState = DeadReckoningState(velocityEastMps = 0.0, velocityNorthMps = 0.0),
-            mlState = MlVelocityUiState(predictedVelocityCorrectedMps = 0.6f),
+            mlState = MlVelocityUiState(predictedVelocityCorrectedMps = 0.6f, predictedVelocityDampedMps = 0.6f),
             gnssState = GnssModeUiState(mode = GnssMode.GNSS_AIDED, latestFix = fix(speedMps = 15.1f)),
             fusedState = FusedPositionUiState(drSourceUsed = DrSource.ML),
         )

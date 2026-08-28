@@ -259,8 +259,12 @@ internal fun estimateSpeedMps(
     return when {
         gnssState.mode == GnssMode.GNSS_AIDED && gnssSpeed != null && !gnssSpeedContradictsStationaryPhysics ->
             gnssSpeed
-        fusedState.drSourceUsed == DrSource.ML && mlState.predictedVelocityCorrectedMps != null ->
-            mlState.predictedVelocityCorrectedMps
+        // Round 2 (2026-08-28): shows the DAMPED value, not the merely
+        // bias-corrected one — this is what actually feeds the ML
+        // position estimate now (VelocityGuard's OOD guard/EMA smoothing),
+        // so the displayed speed matches what's actually driving the dot.
+        fusedState.drSourceUsed == DrSource.ML && mlState.predictedVelocityDampedMps != null ->
+            mlState.predictedVelocityDampedMps
         else -> physicsSpeedMps
     }
 }

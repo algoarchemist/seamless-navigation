@@ -33,6 +33,27 @@ what each file's responsibility, inputs/outputs, and non-obvious
 assumptions are *right now* (CLAUDE.md Rule 21). Read `summary.txt`
 for the story of how it got there.
 
+**Round 2 Day 2 update (2026-08-28):** a real live outage test (GPS
+toggled off mid-drive — Round 2's Day 1 validation run) surfaced a
+position-snap + map-orientation-flip bug on GNSS reacquisition. Four
+fixes landed the same day, all cross-referenced from PRD.md's own
+dated amendments: (1) `alignment/AlignmentRepository.kt` (NEW) hoists
+the yaw-alignment estimate out of `MlVelocityRepository` into its own
+shared repository so `dr/BaselineDeadReckoningRepository` can read the
+SAME estimate — Round 1 only applied alignment to the ML path, leaving
+the physics path's heading unaligned; (2) `fusion/HeadingFusion.kt`
+(NEW) blends heading/map-orientation over REACQUISITION the same way
+`fusion/PositionFusion.kt` already blended position — Round 1 only
+blended position, leaving heading a hard cutover; (3) `ml/VelocityGuard.kt`
+(NEW) adds an OOD sanity clamp + EMA damping between the ML velocity
+model's bias-corrected output and the position integrator; (4)
+`gnss/GnssQuality.confidenceWeight()` (NEW function) + a
+`confidenceWeight` parameter on `fusion/VelocityBiasCalibrator.update()`
+make the GNSS bias-calibration trust a continuous function of fix
+accuracy instead of the pre-existing binary `isGood` gate. See each
+file's own entry below for detail, and PRD.md Section 15/17/18's
+2026-08-28 amendments for the requirements these satisfy.
+
 ---
 
 ## How to read this file
@@ -377,7 +398,8 @@ Inputs: SensorRepository (read-only, via its StateFlow),
 Outputs: StateFlow<DeadReckoningState>.
 Connected to: SensorRepository -> BaselineDeadReckoningRepository -> MainActivity (Compose UI);
   GnssModeRepository -> BaselineDeadReckoningRepository (mode-gated reset);
-  motion/PotholeShockDetector -> BaselineDeadReckoningRepository (2026-08-25)
+  motion/PotholeShockDetector -> BaselineDeadReckoningRepository (2026-08-25);
+  alignment/AlignmentRepository -> BaselineDeadReckoningRepository (Round 2, 2026-08-28, see below)
 Important functions/classes: start()/stop() (lifecycle-tied, same
   pattern as SensorRepository), lastProcessedAccelTimestampNs: Long?
   (guards against reprocessing — SensorRepository's StateFlow re-emits
@@ -404,6 +426,19 @@ Important concepts/assumptions: orientation and accel come from
   surfaced in the UI here — see MlVelocityRepository's matching entry,
   which applies the identical detector to its own path and IS shown on
   screen; showing the same per-tick event twice would be redundant.
+  UPDATE (Round 2, 2026-08-28): now optionally takes an
+  `alignmentRepository: AlignmentRepository?` constructor param
+  (nullable, defaults to null). When present, the non-holonomic
+  constraint's heading input is `orientation.azimuthRad -
+  alignmentRepository.state.value.yawOffsetRad` (falling back to raw
+  azimuth if the offset isn't available yet) instead of raw device
+  azimuth — the SAME correction ml/MlVelocityRepository already applied
+  in Round 1. REAL FINDING (2026-08-28 live outage test): leaving this
+  path unaligned let the physics-derived heading (used by
+  fusion/StateEstimator.kt for the map's heading-up rotation) drift far
+  enough from true vehicle heading to flip the map ~180 degrees on GNSS
+  reacquisition — see alignment/AlignmentRepository.kt's entry above and
+  PRD.md Section 15's 2026-08-28 amendment.
 Bug found + fixed during Slice 4 on-device verification (2026-08-25):
   lastProcessedAccelTimestampNs was originally a Long defaulting to 0L
   as the "no sample yet" sentinel. On the very first accel sample of a
@@ -543,6 +578,20 @@ Connected to: SensorRepository -> MainActivity -> IdrSensorScreen (Compose);
   SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity -> IdrSensorScreen (Slice 6);
   GnssModeRepository, BaselineDeadReckoningRepository, MlVelocityRepository -> fusion/StateEstimator -> MainActivity -> IdrSensorScreen (Slice 7);
   MainActivity -> ui/theme/IdrTheme -> ui/screens/DriveScreen (DEFAULT screen, Slice 8) / IdrSensorScreen (debug toggle)
+UPDATE (Round 2, 2026-08-28): now also instantiates a single
+  `alignment/AlignmentRepository`, constructed right after
+  `gnssModeRepository` and BEFORE `deadReckoningRepository` (so the
+  latter's optional constructor param can reference it) — independent
+  of the ONNX try/catch block, so it works even if the velocity model
+  fails to load. `deadReckoningRepository` and (inside the try block)
+  `mlVelocityRepository` both now take it as a constructor param.
+  `startPipeline()`/`stopPipeline()` start/stop it alongside the other
+  repositories (started before, stopped after, the two DR repositories —
+  both read its `.state.value` synchronously each tick, same ordering
+  rationale as `gnssModeRepository`). Both DriveScreen's and MapScreen's
+  `onRecalibrate` callbacks now call `alignmentRepository.reset()`
+  directly instead of `mlVelocityRepository?.resetAlignment()` (removed
+  — see `alignment/AlignmentRepository.kt`'s entry).
 Important functions/classes: requestLocationPermission
   (registerForActivityResult(RequestPermission()), registered as a
   property initializer since it must be registered before the activity
@@ -1035,6 +1084,14 @@ Connected to: MainActivity (permission) -> LocationRepository ->
   -> StateEstimator is still a PLANNED downstream consumer (Slice 5+,
   once GNSS mode actually gates DR behavior instead of just being
   displayed).
+UPDATE (Round 2, 2026-08-28) — GnssQuality gained a second function,
+  `confidenceWeight(accuracyM, maxAccuracyM)`, returning a continuous
+  [0,1] trust weight (linear falloff from `maxAccuracyM`) rather than
+  `isGood`'s binary accept/reject. `isGood` is UNCHANGED and remains the
+  state machine's own enter/exit trigger (GnssOutageDetector,
+  unaffected); `confidenceWeight` is a separate, additional signal
+  consumed by `fusion/VelocityBiasCalibrator.update()` (PRD.md
+  FR13/Section 17 — see that class's entry).
 
 android/app/src/main/kotlin/com/sih26168/idr/alignment/{YawRate,AlignmentEstimator}.kt
 Status: IMPLEMENTED (Slice 6, 2026-08-25) — see `## Slice 1-6` build
@@ -1069,7 +1126,47 @@ Important concepts/assumptions: engineering-default thresholds
   clean straight-line moving segment with GNSS near trip start; does
   not re-estimate while GNSS is unavailable; no "Phone Moved"
   re-trigger yet.
-Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> AlignmentEstimator
+Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository -> AlignmentEstimator
+UPDATE (Round 2, 2026-08-28): the "Connected to" line above changed —
+  this class is no longer instantiated directly by MlVelocityRepository.
+  See `alignment/AlignmentRepository.kt`'s entry immediately below.
+
+android/app/src/main/kotlin/com/sih26168/idr/alignment/AlignmentRepository.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: Android/coroutine glue wrapping the pure AlignmentEstimator
+  above, publishing ONE canonical live yaw-alignment estimate consumed
+  by BOTH ml/MlVelocityRepository (Round 1 behavior, unchanged) and
+  dr/BaselineDeadReckoningRepository (NEW this round). Round 1 had
+  MlVelocityRepository own and evaluate() an AlignmentEstimator
+  directly; giving the physics repository a SECOND, independent
+  estimator would have evaluated the same sensor tick twice against two
+  separately-accumulating estimators (both repositories' own collectors
+  read the same SensorRepository StateFlow), risking two slightly
+  different yaw offsets instead of one shared truth. Hoisting it out to
+  its own repository — the same "one shared StateFlow, read
+  synchronously by multiple consumers" pattern GnssModeRepository
+  already established — fixes that by construction.
+Inputs: SensorRepository (read-only, via its StateFlow),
+  GnssModeRepository (read-only, via its StateFlow, for the latest GNSS
+  fix's bearing/speed), a CoroutineScope.
+Outputs: StateFlow<AlignmentEstimate> (same type AlignmentEstimator
+  itself returns).
+Important functions/classes: start()/stop() (lifecycle-tied, same
+  pattern as every other repository here); reset() (PRD.md Section 15's
+  manual "Phone Moved... recalibrate" fallback — MainActivity's
+  recalibrate button now calls this directly instead of the old
+  MlVelocityRepository.resetAlignment(), which was removed).
+Important concepts/assumptions: dedups on accel timestamp, evaluates on
+  every accel tick with the latest available orientation + GNSS fix —
+  IDENTICAL trigger cadence and evaluate() arguments to what
+  MlVelocityRepository used in Round 1, so this refactor is
+  behavior-neutral for the ML path; the only new behavior is that
+  dr/BaselineDeadReckoningRepository can now read the same value too.
+Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository
+  -> ml/MlVelocityRepository (reads .state.value each tick);
+  AlignmentRepository -> dr/BaselineDeadReckoningRepository (reads
+  .state.value each tick, Round 2 addition); MainActivity's recalibrate
+  button -> AlignmentRepository.reset()
 
 android/app/src/main/kotlin/com/sih26168/idr/features/{RollingWindow,FeatureExtractor}.kt
 Status: IMPLEMENTED (Slice 6, 2026-08-25)
@@ -1281,10 +1378,82 @@ REAL FINDING from on-device testing (2026-08-25) — position drift
   recalibrate `FloatingIconButton` calls this through `MainActivity`, a
   second (manual) caller of the same reset the automatic Phone-Moved
   re-trigger was already built for.
+  UPDATE (Round 2, 2026-08-28) — REMOVED `resetAlignment()`, REMOVED the
+  owned `AlignmentEstimator` field: this class now takes an
+  `alignmentRepository: AlignmentRepository` constructor param and reads
+  `alignmentRepository.state.value` each tick instead of evaluating its
+  own estimator — see `alignment/AlignmentRepository.kt`'s entry for why
+  (the physics path needed the SAME estimate, not a second independent
+  one). `MainActivity`'s recalibrate button now calls
+  `alignmentRepository.reset()` directly.
+  UPDATE (Round 2, 2026-08-28) — PRD.md FR3/Section 13's damping/OOD
+  guard: after `biasCalibrator.correctedVelocity()`, the result now
+  passes through a new `velocityGuard: VelocityGuard` (see that class's
+  entry below) BEFORE reaching `positionIntegrator.update()`. The
+  bias-corrected-but-undamped value is still published as
+  `predictedVelocityCorrectedMps` (renamed meaning: "before Round 2
+  damping," not "what feeds the integrator" anymore); the guard's output
+  is the NEW `predictedVelocityDampedMps` field, which is what actually
+  feeds the integrator now. `isVelocityOutOfDistribution` surfaces
+  whether the guard rejected this tick's raw prediction. REAL FINDING
+  (2026-08-28 live outage test): a single anomalous ML prediction (e.g. a
+  desk-bump during bench testing) previously reached the position
+  integrator with no smoothing at all — unlike the physics path's
+  double-integration, which has "memory" that absorbs one bad accel
+  sample — producing a visible position jump.
+  UPDATE (Round 2, 2026-08-28) — PRD.md FR13/Section 17's continuous GNSS
+  confidence weighting: the `biasCalibrator.update()` call now passes
+  `confidenceWeight = GnssQuality.confidenceWeight(fix.accuracyM)`
+  instead of relying on `GnssQuality.isGood`'s binary gate alone — see
+  `fusion/VelocityBiasCalibrator.kt`'s entry for the effective-alpha math.
 Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity (Compose UI);
   MlVelocityRepository -> fusion/StateEstimator (Slice 7, reads its position + isAligned);
   motion/MotionStateClassifier, motion/PotholeShockDetector -> MlVelocityRepository (2026-08-25);
-  DriveScreen's recalibrate button -> MainActivity -> MlVelocityRepository.resetAlignment() (Slice 8)
+  alignment/AlignmentRepository -> MlVelocityRepository (Round 2, 2026-08-28, replaces the
+  owned AlignmentEstimator); ml/VelocityGuard -> MlVelocityRepository (Round 2, 2026-08-28);
+  DriveScreen's recalibrate button -> MainActivity -> AlignmentRepository.reset() (Round 2,
+  2026-08-28 — moved off this class)
+
+android/app/src/main/kotlin/com/sih26168/idr/ml/VelocityGuard.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: PRD.md Section 13/FR3's damping + out-of-distribution guard on
+  the ML velocity path, sitting between VelocityBiasCalibrator's
+  bias-corrected output and ml/MlPositionIntegrator. REAL FINDING
+  (2026-08-28 live outage test): dr/BaselinePhysicsIntegrator
+  double-integrates from acceleration, so it has "memory" that absorbs
+  one bad accel sample; MlPositionIntegrator instead applies the model's
+  FULL predicted speed each tick with no such memory (see that class's
+  own documented burst-sensitivity finding from 2026-08-25), so a single
+  anomalous prediction previously reached the position integrator
+  completely unguarded.
+Inputs: rawVelocityMps (here: the bias-corrected, pre-damping
+  prediction) per call to apply().
+Outputs: Result(velocityMps, wasOutOfDistribution) — a data class, not a
+  bare Float, so the caller can surface BOTH the usable value and
+  whether this tick's raw input was rejected.
+Important functions/classes: apply() — two independent corrections in
+  order: (1) OOD rejection — a NaN/infinite prediction, or one exceeding
+  `maxPlausibleSpeedMps` (default 55 m/s, ~200 km/h, deliberately
+  generous) in magnitude, is discarded outright and the last
+  accepted+smoothed value is held instead; (2) damping — an accepted
+  prediction is exponentially smoothed against the previous
+  accepted+smoothed value (`emaAlpha` default 0.3, deliberately more
+  responsive than VelocityBiasCalibrator's 0.05 — this smooths
+  tick-to-tick noise over ~1s at ~10 Hz, not a slowly-varying systematic
+  offset over tens of seconds); reset().
+Important concepts/assumptions: HONEST LIMITATION (CLAUDE.md Rule 13) —
+  this is a coarse sanity clamp, NOT full training-distribution
+  out-of-distribution detection; no per-feature training bounds are
+  exported from the Python training pipeline yet, so a prediction that's
+  merely "unlikely" (not wildly implausible) passes through undetected.
+Connected to: ml/MlVelocityRepository -> VelocityGuard -> ml/MlPositionIntegrator
+Unit tests: tests/.../ml/VelocityGuardTest.kt — first sample accepted
+  as-is; subsequent samples smoothed by a hand-derived EMA value; values
+  beyond the plausible bound (both directions) and NaN/infinite are
+  rejected and the last accepted value is held; a value exactly at the
+  bound is accepted; a rejection before any accepted sample holds zero;
+  reset() clears state so the next accepted sample isn't blended against
+  pre-reset history.
 
 fusion/GeoProjection.kt
 Status: IMPLEMENTED (Slice 7, 2026-08-25)
@@ -1310,10 +1479,22 @@ Purpose: PRD.md Section 17's online velocity-bias calibration — a simple
   speed); the learned bias is held constant (still applied) once GNSS is
   lost, since there's no ground truth left to recalibrate against during
   DEAD_RECKONING.
-Important functions/classes: update(gnssSpeedMps, rawPredictedVelocityMps)
-  (no-ops below the speed gate); correctedVelocity(raw) (adds the learned
-  bias); reset().
-Connected to: ml/MlVelocityRepository -> VelocityBiasCalibrator -> ml/MlPositionIntegrator
+Important functions/classes: update(gnssSpeedMps, rawPredictedVelocityMps,
+  confidenceWeight = 1f) (no-ops below the speed gate); correctedVelocity(raw)
+  (adds the learned bias); reset().
+UPDATE (Round 2, 2026-08-28 — PRD.md FR13/Section 17): `update()` gained
+  the `confidenceWeight` parameter above (defaults to 1, so pre-existing
+  callers/tests are unaffected). The EFFECTIVE alpha for a given sample
+  is `emaAlpha * confidenceWeight.coerceIn(0f, 1f)` — a marginal fix
+  (e.g. right at GnssQuality's 25m threshold, weight near 0) barely
+  moves the bias; a very accurate fix (weight near 1) moves it at the
+  full configured rate. The FIRST-EVER sample still initializes the bias
+  directly regardless of weight (no prior estimate to blend a
+  low-confidence correction against). `ml/MlVelocityRepository` now
+  passes `GnssQuality.confidenceWeight(fix.accuracyM)` here instead of
+  relying on `GnssQuality.isGood`'s binary gate alone.
+Connected to: ml/MlVelocityRepository -> VelocityBiasCalibrator -> ml/MlPositionIntegrator;
+  gnss/GnssQuality.confidenceWeight -> VelocityBiasCalibrator.update (Round 2, 2026-08-28)
 
 fusion/PositionFusion.kt
 Status: IMPLEMENTED (Slice 7, 2026-08-25)
@@ -1343,6 +1524,44 @@ Important functions/classes: update(nowMs, mode, drEastM, drNorthM,
   enforced), falling back to raw DR passthrough if no fix is available
   yet that tick.
 Connected to: fusion/StateEstimator -> PositionFusion -> FusedPositionUiState
+UPDATE (Round 2, 2026-08-28): gained a heading-level sibling,
+  `fusion/HeadingFusion.kt` (see its own entry below) — REACQUISITION
+  used to blend position via this class but leave heading a hard
+  cutover; both are now blended the same way.
+
+fusion/HeadingFusion.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: PRD.md Section 18's REACQUISITION heading/map-orientation
+  blend — the heading-level counterpart to PositionFusion above, same
+  per-mode structure (GNSS_AIDED/TRANSITION/DEAD_RECKONING/REACQUISITION),
+  same `reacquisitionBlendMs` default (read from
+  `PositionFusion.DEFAULT_REACQUISITION_BLEND_MS`, not duplicated).
+  REAL FINDING (2026-08-28 live outage test): Round 1's
+  `ui/screens/MapScreen.kt` computed the map's heading-up rotation ad
+  hoc, with a hard cutover between GNSS bearing and a DR-derived bearing
+  at the GNSS_AIDED/DEAD_RECKONING boundary — no interpolation, which
+  produced a visible ~180 degree map flip on reacquisition whenever the
+  two disagreed (compounded by the physics-heading-alignment gap fixed
+  in dr/BaselineDeadReckoningRepository the same day).
+Inputs: nowMs, mode (GnssMode), drHeadingDeg (live DR-derived compass
+  bearing), newFixHeadingDeg (nullable — the newly reacquired GNSS fix's
+  bearing).
+Outputs: Float (fused compass heading, degrees, 0-360).
+Important functions/classes: update() (per-mode logic, mirrors
+  PositionFusion.update() exactly); lerpDegreesCircular (private) —
+  treats each bearing as a unit vector via sin/cos, linearly blends the
+  VECTORS, then recovers the angle via atan2. This is the standard
+  technique for interpolating angles without a wraparound discontinuity
+  at +-180/0-360 degrees — a plain linear lerp between e.g. 350 deg and
+  10 deg would produce a -340-degree spin the LONG way around instead of
+  the correct +20-degree short way; directly unit-tested for this exact
+  case (HeadingFusionTest's wrap-boundary test).
+Connected to: fusion/StateEstimator -> HeadingFusion -> FusedPositionUiState.fusedHeadingDeg
+  -> ui/screens/MapScreen.kt (StreetMapView's headingDeg param)
+Unit tests: tests/.../fusion/HeadingFusionTest.kt — per-mode behavior
+  mirrors PositionFusionTest's coverage (freeze/passthrough/blend/
+  reset), plus a dedicated 350deg->10deg wrap-boundary case verifying
+  the short-way interpolation.
 
 fusion/StateEstimator.kt
 Status: IMPLEMENTED (Slice 7, 2026-08-25)
@@ -1394,9 +1613,22 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   computed that tick for PositionFusion's own blend — no new sensor
   data or geodesy needed, this is a small reduction over data already
   flowing through this class.
+  UPDATE (Round 2, 2026-08-28): now also owns a `fusion/HeadingFusion`
+  instance and a `lastConfidentHeadingDeg` field (moved here, unchanged
+  in value, from `ui/screens/MapScreen.kt` — same 0.5 m/s
+  confident-bearing threshold, same "hold the last value below that"
+  behavior). Each tick computes `drHeadingDeg` from the PHYSICS velocity
+  vector's bearing (`atan2(physicsState.velocityEastMps,
+  physicsState.velocityNorthMps)`), then blends it against
+  `fix.bearingDeg` via `headingFusion.update()`, publishing the result as
+  the NEW `FusedPositionUiState.fusedHeadingDeg` field. This is now the
+  SINGLE source of truth for the map's heading-up rotation — see
+  `fusion/HeadingFusion.kt`'s entry and `ui/screens/MapScreen.kt`'s
+  UPDATE note for why Round 1's per-screen ad hoc computation was wrong.
 Connected to: GnssModeRepository, BaselineDeadReckoningRepository,
   MlVelocityRepository -> StateEstimator -> MainActivity (Compose UI);
-  fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8)
+  fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8);
+  fusion/HeadingFusion -> StateEstimator.fusedHeadingDeg -> ui/screens/MapScreen.kt (Round 2, 2026-08-28)
 
 fusion/DriftSummary.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)

@@ -1,5 +1,6 @@
 package com.sih26168.idr.dr
 
+import com.sih26168.idr.alignment.AlignmentRepository
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
 import com.sih26168.idr.motion.PotholeShockDetector
@@ -54,6 +55,13 @@ class BaselineDeadReckoningRepository(
     private val scope: CoroutineScope,
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
     private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
+    // Round 2 (2026-08-28): nullable + defaulted to null (rather than
+    // required) so this class stays constructible without pulling in the
+    // whole alignment/GNSS-bearing machinery for a quick test — a null
+    // value degrades to Round 1's behavior (raw, unaligned device
+    // azimuth), the same honest fallback the ML path already uses when
+    // its own alignment estimate isn't converged yet.
+    private val alignmentRepository: AlignmentRepository? = null,
 ) {
     private val integrator = BaselinePhysicsIntegrator()
 
@@ -172,11 +180,27 @@ class BaselineDeadReckoningRepository(
                 if (stationary) {
                     integrator.overrideVelocity(0.0, 0.0)
                 } else if (!walkingModeEnabled) {
+                    // Round 2 (2026-08-28): use the alignment-corrected
+                    // vehicle heading, not raw device azimuth, for the
+                    // non-holonomic projection — same correction the ML
+                    // path (MlVelocityRepository) already applied in
+                    // Round 1. Round 1 left this path unaligned, which let
+                    // the physics-derived heading (used for the map's
+                    // heading-up rotation, ui/screens/MapScreen.kt) drift
+                    // far enough from true heading to flip the map ~180
+                    // degrees on GNSS reacquisition — see
+                    // alignment/AlignmentRepository.kt's doc for the full
+                    // finding. Falls back to raw azimuth (yaw offset 0)
+                    // before alignment converges or if no AlignmentRepository
+                    // was supplied — same accepted approximation the ML
+                    // path already documents.
+                    val yawOffsetRad = alignmentRepository?.state?.value?.yawOffsetRad ?: 0f
+                    val vehicleHeadingRad = orientation.azimuthRad - yawOffsetRad
                     val preConstraint = integrator.currentState()
                     val (forwardEastMps, forwardNorthMps) = NonHolonomicConstraint.suppressLateralVelocity(
                         velocityEastMps = preConstraint.velocityEastMps,
                         velocityNorthMps = preConstraint.velocityNorthMps,
-                        headingRad = orientation.azimuthRad,
+                        headingRad = vehicleHeadingRad,
                     )
                     integrator.overrideVelocity(forwardEastMps, forwardNorthMps)
                 }

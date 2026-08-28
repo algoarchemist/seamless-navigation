@@ -43,8 +43,6 @@ import com.sih26168.idr.ui.components.VehicleMode
 import com.sih26168.idr.ui.map.StreetMapView
 import com.sih26168.idr.ui.theme.CtaRed
 import com.sih26168.idr.ui.theme.TextPrimary
-import kotlin.math.atan2
-import kotlin.math.hypot
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.osmdroid.views.MapView
@@ -186,25 +184,19 @@ fun MapScreen(
     }
 
     // Live heading for the navigation screen's "heading-up" map rotation
-    // (ui/map/StreetMapView.kt's headingDeg param) — prefers a live GNSS
-    // bearing (most accurate while GNSS_AIDED and actually moving), else
-    // falls back to the physics DR velocity vector's own heading (works
-    // through a GNSS outage, same physics/ML fallback theme as the rest of
-    // this app), else holds the last confident heading rather than
-    // spinning the map at near-zero speed (bearing is meaningless when
-    // barely moving — same principle StationaryDetector already applies
-    // to ZUPT).
-    var lastConfidentHeadingDeg by remember { mutableStateOf(0f) }
-    val gnssBearing = gnssState.latestFix?.bearingDeg
-    val speedForHeadingMps = hypot(drState.velocityEastMps, drState.velocityNorthMps)
-    val headingDeg: Float = when {
-        gnssState.mode == GnssMode.GNSS_AIDED && gnssBearing != null -> gnssBearing.also { lastConfidentHeadingDeg = it }
-        speedForHeadingMps > 0.5 -> {
-            val bearingDeg = Math.toDegrees(atan2(drState.velocityEastMps, drState.velocityNorthMps)).toFloat()
-            (if (bearingDeg < 0f) bearingDeg + 360f else bearingDeg).also { lastConfidentHeadingDeg = it }
-        }
-        else -> lastConfidentHeadingDeg
-    }
+    // (ui/map/StreetMapView.kt's headingDeg param).
+    //
+    // Round 2 (2026-08-28): this used to be computed HERE with a hard
+    // cutover between GNSS bearing and a DR-derived bearing at the
+    // GNSS_AIDED/DEAD_RECKONING mode boundary — no interpolation, which
+    // produced a visible ~180 degree map-orientation flip on reacquisition
+    // during the Round 2 Day 1 live outage test whenever the two
+    // disagreed. That computation now lives in
+    // fusion/StateEstimator.kt/HeadingFusion.kt (same file/reasoning as
+    // fusedEastM/fusedNorthM's own blend), so it's a SINGLE source of
+    // truth that's actually blended over REACQUISITION instead of
+    // recomputed ad hoc per screen. See HeadingFusion's doc for the fix.
+    val headingDeg: Float = fusedState.fusedHeadingDeg
 
     // Zoom in tighter the instant navigation starts (Google Maps' own
     // "start mode" behavior) — a one-time camera action, not fought with

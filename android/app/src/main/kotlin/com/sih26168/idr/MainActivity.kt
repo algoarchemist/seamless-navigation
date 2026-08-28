@@ -28,6 +28,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import com.sih26168.idr.alignment.AlignmentRepository
 import com.sih26168.idr.capture.SensorRecorder
 import com.sih26168.idr.dr.BaselineDeadReckoningRepository
 import com.sih26168.idr.dr.DeadReckoningState
@@ -77,8 +78,12 @@ import kotlinx.coroutines.withContext
  * fourth, additional position display, not a replacement for the other
  * two (same "show it side by side" philosophy as Slice 6).
  * Orientation is DEVICE-relative-to-WORLD frame only (CLAUDE.md
- * Rule 9/14) — no vehicle-frame alignment for the position estimate
- * (AlignmentEstimator only feeds the ML feature path so far).
+ * Rule 9/14). (Round 2, 2026-08-28): [AlignmentRepository] is now a
+ * single shared instance feeding BOTH the ML feature path and the
+ * physics DR path's non-holonomic-constraint heading — Round 1 only fed
+ * the former, which is what let the physics-path heading flip the map on
+ * reacquisition (see [AlignmentRepository]'s and
+ * [BaselineDeadReckoningRepository]'s docs).
  */
 data class RecordingUiState(
     val isRecording: Boolean = false,
@@ -89,6 +94,7 @@ data class RecordingUiState(
 class MainActivity : ComponentActivity() {
 
     private lateinit var sensorRepository: SensorRepository
+    private lateinit var alignmentRepository: AlignmentRepository
     private lateinit var deadReckoningRepository: BaselineDeadReckoningRepository
     private lateinit var locationRepository: LocationRepository
     private lateinit var gnssModeRepository: GnssModeRepository
@@ -145,12 +151,30 @@ class MainActivity : ComponentActivity() {
         // GnssModeRepository must exist before BaselineDeadReckoningRepository —
         // Slice 5 wires the DR odometer's reset behavior to the GNSS mode.
         gnssModeRepository = GnssModeRepository(locationRepository, lifecycleScope)
-        deadReckoningRepository = BaselineDeadReckoningRepository(sensorRepository, gnssModeRepository, lifecycleScope)
+        // Round 2 (2026-08-28): ONE shared AlignmentRepository, constructed
+        // before either DR path so both can read it — see that class's doc
+        // for why the physics path needed this and why it's not just a
+        // second AlignmentEstimator instance. Independent of the ONNX
+        // model (below), so the physics path's alignment fix keeps working
+        // even on a build where the model fails to load.
+        alignmentRepository = AlignmentRepository(sensorRepository, gnssModeRepository, lifecycleScope)
+        deadReckoningRepository = BaselineDeadReckoningRepository(
+            sensorRepository,
+            gnssModeRepository,
+            lifecycleScope,
+            alignmentRepository = alignmentRepository,
+        )
 
         try {
             val model = VelocityModel.loadFromAssets(applicationContext)
             velocityModel = model
-            mlVelocityRepository = MlVelocityRepository(sensorRepository, gnssModeRepository, model, lifecycleScope)
+            mlVelocityRepository = MlVelocityRepository(
+                sensorRepository,
+                gnssModeRepository,
+                model,
+                lifecycleScope,
+                alignmentRepository = alignmentRepository,
+            )
         } catch (e: Exception) {
             // Loading a bundled asset / building an ONNX session can fail
             // in ways specific to the model file (missing, truncated,
@@ -201,7 +225,7 @@ class MainActivity : ComponentActivity() {
             // this is the one place that live selection reaches the
             // repository, same "Compose state -> plain mutable field on a
             // non-Composable repository" pattern onRecalibrate already uses
-            // for mlVelocityRepository.resetAlignment().
+            // for alignmentRepository.reset().
             LaunchedEffect(vehicleMode) {
                 deadReckoningRepository.walkingModeEnabled = vehicleMode == VehicleMode.WALKING
             }
@@ -236,7 +260,7 @@ class MainActivity : ComponentActivity() {
                                     isPipelinePaused = isPipelinePaused,
                                     vehicleMode = vehicleMode,
                                     onToggleTheme = { isDarkTheme = !isDarkTheme },
-                                    onRecalibrate = { mlVelocityRepository?.resetAlignment() },
+                                    onRecalibrate = { alignmentRepository.reset() },
                                     onShowDebugScreen = { showDebugScreen = true },
                                     onTogglePipelinePause = ::togglePipelinePause,
                                     onVehicleModeChange = { vehicleMode = it },
@@ -251,7 +275,7 @@ class MainActivity : ComponentActivity() {
                                     isPipelinePaused = isPipelinePaused,
                                     vehicleMode = vehicleMode,
                                     onToggleTheme = { isDarkTheme = !isDarkTheme },
-                                    onRecalibrate = { mlVelocityRepository?.resetAlignment() },
+                                    onRecalibrate = { alignmentRepository.reset() },
                                     onShowDebugScreen = { showDebugScreen = true },
                                     onTogglePipelinePause = ::togglePipelinePause,
                                     onVehicleModeChange = { vehicleMode = it },
@@ -282,6 +306,11 @@ class MainActivity : ComponentActivity() {
         } else {
             requestLocationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
         }
+        // Before deadReckoningRepository/mlVelocityRepository — both read
+        // alignmentRepository.state.value synchronously each tick, so it
+        // must already be collecting (same "GnssModeRepository before
+        // BaselineDeadReckoningRepository" ordering rationale as above).
+        alignmentRepository.start()
         deadReckoningRepository.start()
         mlVelocityRepository?.start()
         stateEstimator.start()
@@ -296,9 +325,10 @@ class MainActivity : ComponentActivity() {
     private fun stopPipeline() {
         stateEstimator.stop()
         mlVelocityRepository?.stop()
+        deadReckoningRepository.stop()
+        alignmentRepository.stop()
         gnssModeRepository.stop()
         locationRepository.stop()
-        deadReckoningRepository.stop()
         sensorRepository.stop()
     }
 
@@ -493,10 +523,11 @@ private fun IdrSensorScreen(
                     ),
                 )
                 Text(
-                    text = "^ ZUPT (zero-velocity when stationary) and a simplified " +
-                        "non-holonomic constraint are applied (Slice 5), but there is " +
-                        "still no accelerometer bias correction and no vehicle-frame " +
-                        "alignment — still expect drift during real motion.",
+                    text = "^ ZUPT (zero-velocity when stationary), a simplified " +
+                        "non-holonomic constraint (Slice 5), and (Round 2, 2026-08-28) the " +
+                        "same phone-to-vehicle yaw alignment the ML path uses are applied — " +
+                        "but there is still no accelerometer bias correction, so still " +
+                        "expect drift during real motion.",
                 )
 
                 Text(text = "GNSS mode: ${gnssState.mode}")
@@ -527,8 +558,9 @@ private fun IdrSensorScreen(
                     Text(text = "ML velocity model failed to load: $mlModelLoadError")
                 } else {
                     Text(
-                        text = if (mlState.predictedVelocityCorrectedMps != null) {
-                            "ML predicted forward speed: %.2f m/s corrected (raw=%.2f, learned bias=%.2f)".format(
+                        text = if (mlState.predictedVelocityDampedMps != null) {
+                            "ML predicted forward speed: %.2f m/s damped (corrected=%.2f, raw=%.2f, learned bias=%.2f)".format(
+                                mlState.predictedVelocityDampedMps,
                                 mlState.predictedVelocityCorrectedMps,
                                 mlState.predictedVelocityRawMps,
                                 mlState.velocityBiasMps,
@@ -540,8 +572,17 @@ private fun IdrSensorScreen(
                     Text(
                         text = "^ bias is an online correction learned from GNSS speed while " +
                             "GNSS_AIDED (PRD Section 17) — held constant, still applied, during " +
-                            "an outage; 0.00 until GNSS has been good and moving above ~18 km/h.",
+                            "an outage; 0.00 until GNSS has been good and moving above ~18 km/h. " +
+                            "\"damped\" (Round 2) is corrected + VelocityGuard's OOD guard/EMA " +
+                            "smoothing — this is what actually feeds the position below now.",
                     )
+                    if (mlState.isVelocityOutOfDistribution) {
+                        Text(
+                            text = "^ OOD GUARD FIRED this tick — raw prediction was implausible " +
+                                "(NaN/infinite or > the plausible-speed bound); held the last " +
+                                "accepted value instead of integrating it.",
+                        )
+                    }
                     Text(
                         text = "ML-based DR position (WORLD frame, m since GNSS last good): " +
                             "east=%.2f north=%.2f".format(mlState.positionEastM, mlState.positionNorthM),

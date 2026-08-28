@@ -56,6 +56,30 @@ class VelocityBiasCalibratorTest {
     }
 
     @Test
+    fun `a low confidenceWeight scales down the second sample's pull on bias`() {
+        val calibrator = VelocityBiasCalibrator(minSpeedForCalibrationMps = 5.0f, emaAlpha = 0.1f)
+        calibrator.update(gnssSpeedMps = 10.0f, rawPredictedVelocityMps = 9.0f) // error = 1.0, bias -> 1.0 (full weight)
+        calibrator.update(gnssSpeedMps = 10.0f, rawPredictedVelocityMps = 8.0f, confidenceWeight = 0.5f) // error = 2.0
+        // effective alpha = 0.1 * 0.5 = 0.05; bias = 1.0 + 0.05 * (2.0 - 1.0) = 1.05
+        assertEquals(1.05f, calibrator.currentBiasMps, 0.0001f)
+    }
+
+    @Test
+    fun `a zero confidenceWeight leaves an already-established bias unchanged`() {
+        val calibrator = VelocityBiasCalibrator(minSpeedForCalibrationMps = 5.0f, emaAlpha = 0.1f)
+        calibrator.update(gnssSpeedMps = 10.0f, rawPredictedVelocityMps = 9.0f) // bias -> 1.0
+        calibrator.update(gnssSpeedMps = 10.0f, rawPredictedVelocityMps = 5.0f, confidenceWeight = 0f) // error = 5.0, but zero weight
+        assertEquals(1.0f, calibrator.currentBiasMps, 0.0001f)
+    }
+
+    @Test
+    fun `the first-ever sample still initializes the bias directly regardless of confidenceWeight`() {
+        val calibrator = VelocityBiasCalibrator(minSpeedForCalibrationMps = 5.0f)
+        calibrator.update(gnssSpeedMps = 10.0f, rawPredictedVelocityMps = 9.0f, confidenceWeight = 0.01f)
+        assertEquals(1.0f, calibrator.currentBiasMps, 0.0001f)
+    }
+
+    @Test
     fun `reset clears both bias and sample count`() {
         val calibrator = VelocityBiasCalibrator(minSpeedForCalibrationMps = 5.0f)
         calibrator.update(gnssSpeedMps = 10.0f, rawPredictedVelocityMps = 9.0f)

@@ -6,6 +6,8 @@ import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
 import com.sih26168.idr.gnss.GnssQuality
 import com.sih26168.idr.ml.MlVelocityRepository
+import kotlin.math.atan2
+import kotlin.math.hypot
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -55,6 +57,17 @@ data class FusedPositionUiState(
      */
     val anchorLatDeg: Double? = null,
     val anchorLonDeg: Double? = null,
+    /**
+     * (Round 2 addition, 2026-08-28 — PRD.md FR8/Section 18) The fused
+     * compass heading (degrees, 0-360) for "heading-up" map rotation
+     * (`ui/map/StreetMapView.kt`). Round 1 had `ui/screens/MapScreen.kt`
+     * compute this itself with a hard cutover between GNSS bearing and a
+     * DR-derived bearing at the GNSS_AIDED/DEAD_RECKONING boundary — see
+     * [HeadingFusion]'s doc for why that produced a visible map flip on
+     * reacquisition. This field is now the single source of truth,
+     * blended the same way [fusedEastM]/[fusedNorthM] already are.
+     */
+    val fusedHeadingDeg: Float = 0f,
 )
 
 /**
@@ -104,6 +117,7 @@ class StateEstimator(
     private val mlVelocityRepository: MlVelocityRepository?,
     private val scope: CoroutineScope,
     private val positionFusion: PositionFusion = PositionFusion(),
+    private val headingFusion: HeadingFusion = HeadingFusion(),
 ) {
     private val _state = MutableStateFlow(FusedPositionUiState())
     val state: StateFlow<FusedPositionUiState> = _state.asStateFlow()
@@ -115,16 +129,26 @@ class StateEstimator(
     private var lastDriftSummary: DriftSummaryResult? = null
     private val driftHistory = mutableListOf<DriftSummaryResult>()
 
+    // Below this speed, a DR-derived bearing (atan2 of a near-zero
+    // velocity vector) is noise, not a real heading — same principle
+    // StationaryDetector already applies to ZUPT. Holding the last
+    // confident heading instead of spinning the map at near-zero speed
+    // matches Round 1's MapScreen.kt behavior exactly (moved here, not
+    // changed) so this refactor is heading-value-neutral by itself.
+    private var lastConfidentHeadingDeg: Float = 0f
+
     private var collectJob: Job? = null
 
     fun start() {
         positionFusion.reset()
+        headingFusion.reset()
         outageAnchorLatDeg = null
         outageAnchorLonDeg = null
         lastAidedAtMs = null
         previousMode = null
         lastDriftSummary = null
         driftHistory.clear()
+        lastConfidentHeadingDeg = 0f
         _state.value = FusedPositionUiState()
 
         collectJob = scope.launch {
@@ -246,6 +270,30 @@ class StateEstimator(
                     newFixNorthM = newFixNorthM,
                 )
 
+                // Round 2 (2026-08-28 — PRD.md FR8/Section 18): DR-derived
+                // bearing from the PHYSICS velocity vector, moved here
+                // unchanged from Round 1's ui/screens/MapScreen.kt (same
+                // 0.5 m/s confidence threshold, same last-confident-heading
+                // hold) — now benefits from BaselineDeadReckoningRepository's
+                // own Round 2 alignment fix (see that class's doc), so this
+                // bearing itself is more accurate than Round 1's, on top of
+                // now being smoothly blended instead of hard-cut.
+                val speedForHeadingMps = hypot(physicsState.velocityEastMps, physicsState.velocityNorthMps)
+                val drHeadingDeg = if (speedForHeadingMps > 0.5) {
+                    val bearingDeg = Math.toDegrees(
+                        atan2(physicsState.velocityEastMps, physicsState.velocityNorthMps),
+                    ).toFloat()
+                    (if (bearingDeg < 0f) bearingDeg + 360f else bearingDeg).also { lastConfidentHeadingDeg = it }
+                } else {
+                    lastConfidentHeadingDeg
+                }
+                val fusedHeadingDeg = headingFusion.update(
+                    nowMs = nowMs,
+                    mode = gnssState.mode,
+                    drHeadingDeg = drHeadingDeg,
+                    newFixHeadingDeg = fix.bearingDeg,
+                )
+
                 _state.value = FusedPositionUiState(
                     fusedEastM = fused.eastM,
                     fusedNorthM = fused.northM,
@@ -255,6 +303,7 @@ class StateEstimator(
                     driftHistory = driftHistory.toList(),
                     anchorLatDeg = outageAnchorLatDeg,
                     anchorLonDeg = outageAnchorLonDeg,
+                    fusedHeadingDeg = fusedHeadingDeg,
                 )
             }
         }

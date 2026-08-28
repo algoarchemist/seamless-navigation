@@ -45,15 +45,31 @@ class VelocityBiasCalibrator(
     var sampleCount: Int = 0
         private set
 
-    /** Call only while GNSS is trustworthy (GNSS_AIDED) with a real GNSS speed reading. */
-    fun update(gnssSpeedMps: Float, rawPredictedVelocityMps: Float) {
+    /**
+     * Call only while GNSS is trustworthy (GNSS_AIDED) with a real GNSS
+     * speed reading.
+     *
+     * @param confidenceWeight (Round 2 addition, 2026-08-28 — PRD.md
+     *   FR13/Section 17) scales the effective EMA alpha for THIS sample,
+     *   typically [com.sih26168.idr.gnss.GnssQuality.confidenceWeight] —
+     *   a very accurate fix pulls the bias toward its error faster than a
+     *   marginal one, instead of every fix that merely passes the binary
+     *   [com.sih26168.idr.gnss.GnssQuality.isGood] gate being trusted
+     *   identically. Defaults to 1 (full trust) so existing callers/tests
+     *   that don't pass it see unchanged behavior. The FIRST sample still
+     *   initializes the bias directly regardless of weight — there is no
+     *   prior estimate to blend a low-confidence correction against, so
+     *   "some estimate" beats "none" even if it's a marginal fix.
+     */
+    fun update(gnssSpeedMps: Float, rawPredictedVelocityMps: Float, confidenceWeight: Float = 1f) {
         if (gnssSpeedMps < minSpeedForCalibrationMps) return
 
         val error = gnssSpeedMps - rawPredictedVelocityMps
         currentBiasMps = if (sampleCount == 0) {
             error // first sample: no prior average to blend with
         } else {
-            currentBiasMps + emaAlpha * (error - currentBiasMps)
+            val effectiveAlpha = emaAlpha * confidenceWeight.coerceIn(0f, 1f)
+            currentBiasMps + effectiveAlpha * (error - currentBiasMps)
         }
         sampleCount++
     }
