@@ -63,7 +63,18 @@ optional TYPE_LINEAR_ACCELERATION/TYPE_GRAVITY listeners (PRD.md
 Section 11), also shown on the debug screen as a cross-check against
 `dr/WorldFrameAcceleration`'s manual gravity subtraction — not adopted
 into the DR pipeline yet, per Section 11's "only if it measures out
-better, decided empirically."
+better, decided empirically." (7) A UI smoothness pass —
+`ui/map/PositionSmoother.kt` (NEW) — fixed the marker/map-rotation
+stepping visibly between GNSS/DR ticks instead of gliding, on both the
+Drive tab (`TrackCanvas.kt`) and Map tab (`StreetMapView.kt`); purely
+cosmetic, no fusion math touched. (8) `fusion/RoadSnap.kt` (NEW) —
+PRD.md Section 19's map-constraint layer, finally implemented: snaps
+the Map tab's displayed marker onto the active route's geometry
+(heading-compatible nearest-segment, not a full map matcher) — the last
+remaining item from the original SIH requirements list that was still
+just PLANNED. Deliberately display-only: `fusion/StateEstimator.kt`'s
+canonical `fusedEastM`/`fusedNorthM` (which feeds the measured drift
+number and route progress) is untouched by this correction.
 
 ---
 
@@ -1827,19 +1838,83 @@ Important concepts/assumptions: not all devices have a barometer —
 Connected to: SensorRepository -> FloorChangeRepository -> MainActivity
   (debug screen only so far — see MainActivity.kt's entry)
 
-MapConstraint.kt
-Status: PLANNED
-Purpose: Snap the estimated position to the nearest plausible road
-  segment (PRD.md Section 19 — MVP-level, not a full map matcher).
+android/app/src/main/kotlin/com/sih26168/idr/fusion/RoadSnap.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28 — supersedes the old
+  `MapConstraint.kt` PLANNED placeholder this entry used to be)
+Purpose: PRD.md Section 19's MVP map-constraint layer — nearest-road
+  snapping, explicitly NOT a full HMM-based map matcher (ruled out by
+  Section 19/34 as Future Work). Pure Kotlin, no Android dependency,
+  unit-testable (CLAUDE.md Rule 19).
+Scope decision (PRD.md Section 19's 2026-08-28 amendment): rather than
+  fetching a general road-network graph (which would need a NEW service,
+  e.g. Overpass API — CLAUDE.md Rule 2's "no new dependency without
+  discussing it first"), this snaps onto the geometry of the user's OWN
+  already-computed active route (`routing/RoutingRepository.kt`, OSRM) —
+  the road the demo is actually driving. Reuses Slice 8b's existing
+  infrastructure, needs no new network call. No active route = nothing
+  to snap to = an honest "no correction," not a crash or a guess.
+Inputs: positionEastM/positionNorthM (local meters, same frame as the
+  route geometry below), headingDeg (nullable — null skips the heading
+  check entirely rather than assuming straight-ahead travel),
+  routeGeometryLocalMeters (the active route's geometry, pre-projected
+  by the CALLER via fusion/GeoProjection.toLocalMeters against the same
+  reference point as the position).
+Outputs: SnapResult(eastM, northM, correctionDistanceM)?, null if no
+  route, no heading-compatible segment nearby, or nothing within range.
+Important functions/classes: snap() — for each route segment, finds the
+  nearest point via standard point-to-segment projection (clamped to the
+  segment, not the infinite line), REJECTS any segment whose own bearing
+  disagrees with the estimated heading by more than
+  DEFAULT_MAX_HEADING_DELTA_DEG (45 deg — "simple nearest-segment +
+  heading-compatibility check, not an HMM," PRD.md Section 19's own
+  wording verbatim), then returns the closest surviving candidate within
+  DEFAULT_MAX_SNAP_DISTANCE_M (25m, comparable to GnssQuality's own
+  max-accuracy threshold). Heading comparison is CIRCULAR-safe (same
+  0/360-wrap technique fusion/HeadingFusion.kt and
+  ui/map/PositionSmoother.kt already use) — a naive linear subtraction
+  would wrongly reject e.g. 359 deg vs. a 0-deg segment as a 359-degree
+  mismatch instead of the true 1-degree one.
+Important concepts/assumptions: engineering defaults (25m/45deg), not
+  yet validated against a real test drive (CLAUDE.md Rule 13).
+  Zero-length segments (duplicate consecutive geometry points) are
+  skipped rather than dividing by zero.
+Connected to: ui/screens/MapScreen.kt -> RoadSnap -> StreetMapView.kt's
+  marker position ONLY — deliberately does NOT correct
+  fusion/StateEstimator.kt's `fusedEastM`/`fusedNorthM` itself, since
+  that value also feeds fusion/DriftSummary.kt's measured drift number
+  and MapScreen's own routeProgress, both of which must stay an HONEST,
+  uncorrected measurement of the DR system's real error (CLAUDE.md
+  Rule 13) rather than an artifact of the snapping algorithm's own
+  assumptions — matches PRD.md Section 16's framing of map-constraint
+  snapping as "a correction... rather than the primary estimator."
+Unit tests: tests/.../fusion/RoadSnapTest.kt — fewer than 2 geometry
+  points returns null; an on-segment position snaps to itself with zero
+  correction; an off-to-the-side position snaps perpendicular onto the
+  segment (hand-derived); a position beyond the segment's endpoint
+  clamps to the endpoint rather than the infinite line; a
+  heading-incompatible segment is rejected even when geometrically
+  closer than a compatible one; a null heading skips the compatibility
+  check; a position beyond the max snap distance returns null even if
+  heading-compatible; among multiple segments the heading-INcompatible
+  closer one is correctly rejected in favor of the farther compatible
+  one; the 0/360 wrap boundary is handled correctly (359 deg vs. a 0-deg
+  segment is a 1-degree delta, not 359); a duplicate consecutive point is
+  skipped without a divide-by-zero.
 
 UI (Compose screens)
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
 Purpose: Live map + status header (GNSS state, speed, motion class,
   alignment confidence), vehicle-mode selector (PRD.md Section 22). See
   the new `ui/theme/`, `ui/components/`, `ui/map/`, `ui/screens/` entries
-  immediately below for the full per-file writeup — `MapConstraint.kt`
-  above is still the only PLANNED piece of PRD.md Section 22's screen
-  (no real road-snapping exists).
+  immediately below for the full per-file writeup.
+UPDATE (Round 2, 2026-08-28): `ui/screens/MapScreen.kt`'s
+  `currentLatDeg`/`currentLonDeg` computation now applies `fusion/RoadSnap`
+  (see its entry above) when an active route exists and the position
+  isn't a live GNSS_AIDED fix — the last remaining PLANNED piece of
+  PRD.md Section 22's screen (real road-snapping) is now real. `activeRoute`'s
+  `remember` declaration was moved earlier in the composable (was
+  previously declared with the rest of the search/routing state, further
+  down) so this computation can read it.
 
 ui/theme/Color.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
