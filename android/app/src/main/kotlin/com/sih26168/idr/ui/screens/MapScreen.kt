@@ -1,14 +1,22 @@
 package com.sih26168.idr.ui.screens
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -20,6 +28,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.sih26168.idr.dr.DeadReckoningState
@@ -29,23 +38,22 @@ import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.routing.GeocodeResult
-import com.sih26168.idr.routing.GeocodeSearchOutcome
-import com.sih26168.idr.routing.GeocodingRepository
 import com.sih26168.idr.routing.OfflineRouteCache
 import com.sih26168.idr.routing.RouteProgress
 import com.sih26168.idr.routing.RouteResult
 import com.sih26168.idr.routing.RoutingRepository
 import com.sih26168.idr.ui.components.ActiveRouteCard
-import com.sih26168.idr.ui.components.DestinationSearchBar
 import com.sih26168.idr.ui.components.NavigationEtaBar
 import com.sih26168.idr.ui.components.NavigationInstructionCard
 import com.sih26168.idr.ui.components.VehicleMode
 import com.sih26168.idr.ui.map.StreetMapView
 import com.sih26168.idr.ui.theme.CtaRed
+import com.sih26168.idr.ui.theme.GlassCardRadius
+import com.sih26168.idr.ui.theme.GlassSurface
 import com.sih26168.idr.ui.theme.TextPrimary
+import com.sih26168.idr.ui.theme.TextSecondary
 import kotlin.math.atan2
 import kotlin.math.hypot
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.osmdroid.views.MapView
 
@@ -143,10 +151,16 @@ fun MapScreen(
     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
 
     // Search/routing state — independent of the GNSS/DR state above.
+    // 2026-08-28, user-requested "search destination like Google Maps,
+    // redirects to map page when searched": the live in-progress query/
+    // results/error used to live here and drive a floating dropdown drawn
+    // over the map. That's now entirely owned by the full-page
+    // ui/screens/SearchScreen.kt instead — this screen only keeps the
+    // FINAL chosen destination (searchQuery here becomes display-only:
+    // the selected place's name, or the collapsed bar's placeholder) plus
+    // whether that full page is currently showing.
     var searchQuery by remember { mutableStateOf("") }
-    var searchResults by remember { mutableStateOf<List<GeocodeResult>>(emptyList()) }
-    var searchError by remember { mutableStateOf<String?>(null) }
-    var isSearching by remember { mutableStateOf(false) }
+    var showSearchScreen by remember { mutableStateOf(false) }
     var selectedDestination by remember { mutableStateOf<GeocodeResult?>(null) }
     var isRouting by remember { mutableStateOf(false) }
     var routingError by remember { mutableStateOf<String?>(null) }
@@ -215,34 +229,11 @@ fun MapScreen(
         }
     }
 
-    // Debounced real Nominatim search — fires ~500ms after typing stops,
-    // not on every keystroke (Nominatim's usage policy caps ~1 req/sec).
-    LaunchedEffect(searchQuery) {
-        if (searchQuery.isBlank()) {
-            searchResults = emptyList()
-            searchError = null
-            return@LaunchedEffect
-        }
-        delay(500)
-        isSearching = true
-        // BUG FIX (2026-08-26, user report: "SRM Ramapuram not showing" /
-        // "most Chennai places not visible") — GeocodingRepository.search
-        // used to collapse every failure into an empty list, identical to a
-        // real "no matches." Now it reports which one actually happened, so
-        // a real cause (bad network, Nominatim rate-limit/403 on this
-        // device's IP, etc.) is visible instead of looking like a typo.
-        when (val outcome = GeocodingRepository.search(searchQuery)) {
-            is GeocodeSearchOutcome.Success -> {
-                searchResults = outcome.results
-                searchError = if (outcome.results.isEmpty()) "No matches for \"$searchQuery\"" else null
-            }
-            is GeocodeSearchOutcome.Failure -> {
-                searchResults = emptyList()
-                searchError = outcome.reason
-            }
-        }
-        isSearching = false
-    }
+    // Back from the full-page search screen returns to the map, same
+    // priority convention MainActivity's own BackHandler already uses for
+    // tab switching — this one is added later/deeper in the composition so
+    // it wins over MainActivity's while the search page is open.
+    BackHandler(enabled = showSearchScreen) { showSearchScreen = false }
 
     Box(modifier = Modifier.fillMaxSize()) {
         StreetMapView(
@@ -292,34 +283,31 @@ fun MapScreen(
         // would be more correct but is more than this fix needs right now.
         if (activeRoute == null) {
             Column(modifier = Modifier.fillMaxWidth().padding(top = 300.dp, start = 16.dp, end = 16.dp)) {
-                DestinationSearchBar(
-                    query = searchQuery,
-                    onQueryChange = {
-                        searchQuery = it
-                        selectedDestination = null
-                        routingError = null
-                        searchError = null
-                    },
-                    results = if (selectedDestination == null) searchResults else emptyList(),
-                    isSearching = isSearching,
-                    onSelectResult = { result ->
-                        selectedDestination = result
-                        searchQuery = result.displayName
-                        searchResults = emptyList()
-                        searchError = null
-                    },
-                )
-                // BUG FIX (2026-08-26): previously a search that matched
-                // nothing AND a search that failed outright (bad network,
-                // Nominatim rate-limiting this device's IP, etc.) both
-                // rendered as "no dropdown appeared," with no way to tell
-                // which one happened. Now the real reason is shown.
-                if (searchError != null && selectedDestination == null) {
+                // 2026-08-28, user-requested "search destination like Google
+                // Maps, redirects to map page when searched": this used to be
+                // a live, typeable DestinationSearchBar with its dropdown
+                // floating directly over the map. Now it's a collapsed,
+                // tappable bar — tapping it (whether idle or to change an
+                // already-chosen destination) opens the full ui/screens/
+                // SearchScreen.kt page; picking a result there closes that
+                // page and lands back here with selectedDestination set,
+                // same as Google Maps returning you to the map after search.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(GlassCardRadius))
+                        .background(GlassSurface, RoundedCornerShape(GlassCardRadius))
+                        .clickable { showSearchScreen = true }
+                        .padding(16.dp),
+                ) {
+                    Icon(Icons.Filled.Search, contentDescription = null, tint = TextSecondary)
                     Text(
-                        text = searchError!!,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = CtaRed,
-                        modifier = Modifier.padding(top = 4.dp, start = 4.dp),
+                        text = selectedDestination?.displayName?.takeIf { it.isNotBlank() }
+                            ?: "Search destination…",
+                        color = if (selectedDestination != null) TextPrimary else TextSecondary,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(start = 12.dp),
                     )
                 }
                 if (selectedDestination != null) {
@@ -424,6 +412,23 @@ fun MapScreen(
                     )
                 }
             }
+        }
+
+        // Full-page search — drawn LAST so it covers the entire map screen
+        // (tiles, status overlay, everything above), same as Google Maps
+        // replacing the whole screen with its search page rather than
+        // layering a dropdown on top of the live map.
+        if (showSearchScreen) {
+            SearchScreen(
+                initialQuery = selectedDestination?.displayName ?: "",
+                onBack = { showSearchScreen = false },
+                onResultSelected = { result ->
+                    selectedDestination = result
+                    searchQuery = result.displayName
+                    routingError = null
+                    showSearchScreen = false
+                },
+            )
         }
     }
 }

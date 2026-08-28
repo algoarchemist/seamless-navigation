@@ -1670,6 +1670,57 @@ Connected to: BaselineDeadReckoningRepository, GnssModeRepository,
   FloatingIconButton/DriftSummaryCard
 ```
 
+```
+ui/screens/MapScreen.kt
+Status: IMPLEMENTED
+Purpose: The MAP tab — real OpenStreetMap tiles (ui/map/StreetMapView),
+  destination search + routing (routing/GeocodingRepository Nominatim +
+  routing/RoutingRepository OSRM), and turn-by-turn navigation. Same
+  StatusOverlayContent as DriveScreen underneath; search/routing is
+  layered on top as its own state machine (idle -> destination selected
+  -> route active -> navigating).
+Search UI: (changed 2026-08-28, user-requested "search destination like
+  Google Maps, redirects to map page when searched") the idle state no
+  longer shows a live, typeable dropdown floating over the map tiles.
+  It now shows a collapsed, tappable bar (search icon + placeholder or
+  the selected destination's name); tapping it sets `showSearchScreen =
+  true`, which renders ui/screens/SearchScreen.kt as a full-page overlay
+  covering this entire screen — same manual boolean-state screen-swap
+  pattern MainActivity already uses for its debug screen / tab
+  switching, one level down. SearchScreen owns the live query/results/
+  debounced-Nominatim-search state itself now (moved out of MapScreen);
+  MapScreen only receives the FINAL picked GeocodeResult via
+  `onResultSelected`, which sets `selectedDestination` and closes the
+  overlay — landing back on the map with the "Start" routing button, the
+  same as before. A `BackHandler(enabled = showSearchScreen)` closes the
+  search page on system Back (added after, so it wins over
+  MainActivity's own tab-level BackHandler while the page is open).
+Connected to: routing/GeocodingRepository, routing/RoutingRepository,
+  routing/OfflineRouteCache, fusion/GeoProjection, ui/screens/SearchScreen
+  (new, opened on demand) -> ui/components/ActiveRouteCard/
+  NavigationInstructionCard/NavigationEtaBar
+```
+
+```
+ui/screens/SearchScreen.kt
+Status: IMPLEMENTED (new file, 2026-08-28)
+Purpose: Full-page destination search, Google Maps' own pattern — opened
+  by MapScreen when its collapsed search bar is tapped, covers the whole
+  screen rather than drawing a dropdown over the live map. Owns the
+  debounced (~500ms, Nominatim's ~1 req/sec usage-policy cap) live
+  query/results/error state that used to live inline in MapScreen.
+Inputs: `initialQuery` (prefills the field, e.g. re-opening on an
+  already-picked destination), `onBack`, `onResultSelected`.
+Outputs: calls `onResultSelected(GeocodeResult)` when a result is
+  tapped — does not navigate itself; the caller (MapScreen) closes the
+  overlay and acts on the result.
+Connected to: routing/GeocodingRepository.search -> SearchScreen ->
+  MapScreen (onResultSelected/onBack callbacks only, no shared state)
+Important concepts: no navigation library added (CLAUDE.md Rule 2) —
+  this is a plain Composable shown/hidden by a boolean in the caller,
+  consistent with every other screen swap in this app.
+```
+
 ### ml/
 
 ```
