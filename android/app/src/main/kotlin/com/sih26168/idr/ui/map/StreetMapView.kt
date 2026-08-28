@@ -14,6 +14,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
@@ -294,6 +295,44 @@ fun StreetMapView(
         onDispose { mapView.onDetach() }
     }
 
+    // Round 2 UI smoothness pass (2026-08-28): the marker position and
+    // map rotation used to be set directly from currentLatDeg/currentLonDeg/
+    // headingDeg inside the `update` block below, which only re-runs on a
+    // real GNSS/DR tick (~5-10Hz) — visibly stepping/teleporting in small
+    // discrete jumps rather than gliding, since the display itself
+    // refreshes at ~60Hz. `targetPosition`/`targetHeadingDeg` below are
+    // updated at that same ~5-10Hz tick rate (from `update`); THIS loop
+    // runs independently at display frame rate, chasing them smoothly via
+    // PositionSmoother. Keyed on `mapView` (stable for this composable's
+    // lifetime) so it starts once and is cancelled automatically when this
+    // screen leaves composition (standard LaunchedEffect behavior) — no
+    // manual cleanup needed. An always-on 60fps loop is an accepted cost
+    // for a foreground live-navigation screen (every real turn-by-turn map
+    // app redraws continuously while active), not a battery concern this
+    // MVP needs to optimize away.
+    val positionSmoother = remember { PositionSmoother() }
+    val targetPosition = remember { mutableStateOf<GeoPoint?>(null) }
+    val targetHeadingDeg = remember { mutableStateOf(0f) }
+    LaunchedEffect(mapView) {
+        while (true) {
+            withFrameNanos { }
+            val target = targetPosition.value
+            if (target != null) {
+                val smoothed = positionSmoother.stepPosition(target.latitude, target.longitude)
+                if (smoothed != null) {
+                    overlay.position = GeoPoint(smoothed.first, smoothed.second)
+                }
+            }
+            val smoothedHeadingDeg = positionSmoother.stepHeading(targetHeadingDeg.value)
+            // osmdroid rotates the MAP clockwise by the given degrees, so to
+            // make the device's own heading point "up" the map must be
+            // rotated by the OPPOSITE (negative) amount — same convention
+            // the old per-tick call used, just now fed a smoothed value.
+            mapView.setMapOrientation(-smoothedHeadingDeg)
+            mapView.invalidate()
+        }
+    }
+
     // BUG FIX (2026-08-26, real on-device test): setTileSource() rebuilds
     // osmdroid's internal tile-provider modules (closes/reopens caches),
     // which interrupts any tile download already in flight — a real problem
@@ -338,14 +377,17 @@ fun StreetMapView(
                     null
                 }
                 // Heading-up rotation while navigating (headingDeg != null),
-                // north-up (0 degrees) otherwise. osmdroid rotates the MAP
-                // clockwise by the given degrees, so to make the device's
-                // own heading point "up" the map must be rotated by the
-                // OPPOSITE (negative) amount.
-                view.setMapOrientation(if (headingDeg != null) -headingDeg else 0f)
+                // north-up (0 degrees) otherwise. Feeds the target the
+                // per-frame smoothing loop above chases toward — does NOT
+                // set the map's rotation directly (Round 2 UI smoothness
+                // pass, 2026-08-28, see that loop's doc).
+                targetHeadingDeg.value = headingDeg ?: 0f
                 if (currentLatDeg != null && currentLonDeg != null) {
                     val point = GeoPoint(currentLatDeg, currentLonDeg)
-                    overlay.position = point
+                    // Feeds the target the per-frame smoothing loop above
+                    // chases toward — does NOT set the marker position
+                    // directly (same Round 2 change as headingDeg above).
+                    targetPosition.value = point
                     val previousCenter = lastCenteredPoint.value
                     val shouldRecenter = isFollowingLocation &&
                         (previousCenter == null || previousCenter.distanceToAsDouble(point) >= MIN_RECENTER_DISTANCE_M)
@@ -376,7 +418,13 @@ fun StreetMapView(
                 contentDescription = "Resume following current location",
                 onClick = {
                     isFollowingLocation = true
-                    val point = overlay.position
+                    // Prefer the TRUE target position over overlay.position
+                    // (Round 2: the latter is now a smoothed, slightly-
+                    // lagged cosmetic value, see the smoothing loop above)
+                    // — recentering should snap to where the phone actually
+                    // is, not to wherever the marker's glide animation
+                    // happens to be mid-frame.
+                    val point = targetPosition.value ?: overlay.position
                     if (point != null) {
                         isProgrammaticMove.value = true
                         mapView.controller.setCenter(point)

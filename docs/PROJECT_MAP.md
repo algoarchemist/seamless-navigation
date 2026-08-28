@@ -1993,7 +1993,86 @@ Important concepts/assumptions: the current-position dot is always
   path shape; the real GNSS-vs-DR comparison at reacquisition is exact
   (see DriftSummaryCard/DriftSummary). `METERS_TO_PIXELS = 8f` is an
   engineering default, unvalidated (Rule 13).
-Connected to: fusion/StateEstimator.kt (FusedPositionUiState) -> DriveScreen.kt -> TrackCanvas
+UPDATE (Round 2 UI smoothness pass, 2026-08-28): the anchor's screen
+  position now comes from a `ui/map/PositionSmoother` instance (see its
+  entry below) instead of `fusedEastM`/`fusedNorthM` directly — those
+  update at the ~5-10Hz GNSS/DR tick rate, which made the dashed anchor
+  line visibly step in small discrete jumps each tick rather than glide,
+  since the canvas itself redraws at ~60Hz. A `LaunchedEffect(Unit)` loop
+  polls a mirrored `MutableState` target every display frame and chases
+  it smoothly; the center dot itself is unaffected (always drawn at
+  canvas center, never animated).
+Connected to: fusion/StateEstimator.kt (FusedPositionUiState) -> DriveScreen.kt -> TrackCanvas;
+  ui/map/PositionSmoother -> TrackCanvas (Round 2, 2026-08-28)
+
+android/app/src/main/kotlin/com/sih26168/idr/ui/map/PositionSmoother.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: Frame-rate marker/heading smoothing shared by `ui/map/TrackCanvas.kt`
+  (Drive tab's abstract grid) and `ui/map/StreetMapView.kt` (Map tab's
+  real OSM tiles) — both had the same symptom: GNSS/DR position updates
+  arrive at ~5-10Hz, but the display refreshes at ~60Hz, so drawing
+  directly from the latest tick made the marker/anchor/map-rotation
+  visibly step in small discrete jumps instead of gliding. Pure Kotlin,
+  no Android/Compose dependency, unit-testable (CLAUDE.md Rule 19 — a
+  filter, even a cosmetic one, gets a test).
+Inputs: stepPosition(targetLatOrEastM, targetLonOrNorthM) — units-
+  agnostic (lat/lon degrees for StreetMapView, local meters for
+  TrackCanvas, same exponential-smoothing math either way);
+  stepHeading(targetHeadingDeg) — degrees, 0-360.
+Outputs: the smoothed position/heading, one step closer to the target
+  each call.
+Important functions/classes: stepPosition() — exponential ("chase")
+  smoothing: `new = prev + (target - prev) * smoothingFactor`
+  (default 0.25/frame, tuned by feel per CLAUDE.md Rule 13, not measured
+  — ~94% of any gap closed within ~10 frames/~166ms at 60fps); the
+  FIRST-EVER target snaps directly (nothing to glide from yet).
+  stepHeading() — same idea, but interpolates CIRCULARLY via sin/cos
+  (duplicates the technique fusion/HeadingFusion.kt already uses for its
+  own, UNRELATED, REACQUISITION-blend concern — accepted small
+  duplication rather than coupling the ui/map package to fusion/'s
+  private internals for two ~10-line functions, CLAUDE.md Rule 2's
+  "smallest practical stack" cuts both ways); reset().
+Important concepts/assumptions: deliberately NOT a Kalman filter or
+  predictive smoothing — a cosmetic display concern, not a position-
+  estimation one (the real fusion math is untouched, lives entirely in
+  fusion/PositionFusion.kt/HeadingFusion.kt). HONEST LIMITATION: after a
+  long gap with no target updates (e.g. the Pause button), the next real
+  target can be far from the last displayed one, producing a brief fast
+  slide rather than an instant snap — not specially handled, an accepted
+  minor cosmetic edge case.
+Connected to: ui/map/TrackCanvas.kt -> PositionSmoother (Round 2, 2026-08-28);
+  ui/map/StreetMapView.kt -> PositionSmoother (Round 2, 2026-08-28)
+Unit tests: tests/.../ui/map/PositionSmootherTest.kt — null target
+  returns null; first-ever target snaps; a second step closes the gap by
+  exactly the configured smoothingFactor (hand-derived); repeated
+  identical-target steps converge; heading interpolates the SHORT way
+  across the 0/360 wrap boundary (same wrap case HeadingFusionTest
+  covers for its own class); reset() clears both position and heading
+  state so the next step snaps again.
+
+ui/map/StreetMapView.kt
+Status: IMPLEMENTED (Slice 8b, 2026-08-26)
+Purpose: The real-map counterpart to TrackCanvas.kt — see that file's
+  entry and this file's own doc comment for the full osmdroid/tile-source
+  history (CARTO paywall fix, tile-interruption fix, follow/pan-gesture
+  fix, etc., all dated 2026-08-26 in `summary.txt`).
+UPDATE (Round 2 UI smoothness pass, 2026-08-28): the marker position and
+  map rotation (`setMapOrientation`) used to be set directly inside the
+  `AndroidView` `update` block, which only re-runs on a real GNSS/DR tick
+  — same stepping/teleporting symptom as TrackCanvas.kt above. `update`
+  now only writes `targetPosition`/`targetHeadingDeg` (MutableState); a
+  separate `LaunchedEffect(mapView) { while(true) { withFrameNanos {} ... } }`
+  loop polls them every display frame and chases them via
+  `ui/map/PositionSmoother`, setting `overlay.position`/
+  `mapView.setMapOrientation()` from the SMOOTHED value. The recenter-
+  button's `onClick` was updated to snap to `targetPosition` (the TRUE
+  position) rather than `overlay.position` (now a lagged cosmetic value)
+  — recentering should snap to where the phone actually is. The
+  follow/pan recenter logic (`isFollowingLocation`, `MIN_RECENTER_DISTANCE_M`,
+  `lastCenteredPoint`) is UNCHANGED and still keys off the raw
+  currentLatDeg/currentLonDeg, not the smoothed display value — camera
+  recentering decisions stay based on real movement.
+Connected to: ui/map/PositionSmoother -> StreetMapView.kt (Round 2, 2026-08-28)
 
 ui/screens/DriveScreen.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
