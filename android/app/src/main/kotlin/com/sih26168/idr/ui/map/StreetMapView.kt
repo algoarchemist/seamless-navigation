@@ -2,8 +2,10 @@ package com.sih26168.idr.ui.map
 
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
+import android.graphics.Path
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -136,6 +138,8 @@ private class CurrentPositionOverlay : Overlay() {
     var position: GeoPoint? = null
     var anchor: GeoPoint? = null
     var mode: GnssMode = GnssMode.GNSS_AIDED
+    /** (Round 2 addition, 2026-08-28, user report: "line terminating vaguely") The active route's destination — null clears the pin. */
+    var destination: GeoPoint? = null
 
     private val haloPaint = Paint().apply { color = AccentBlue.copy(alpha = 0.18f).toArgb(); isAntiAlias = true }
     private val ringPaint = Paint().apply {
@@ -153,6 +157,18 @@ private class CurrentPositionOverlay : Overlay() {
         strokeWidth = 6f
         pathEffect = DashPathEffect(floatArrayOf(24f, 16f), 0f)
     }
+
+    // Destination pin paints — same CtaRed accent the route polyline and
+    // outage-anchor marker already use (Figma's own route-related color),
+    // so the pin reads as "belongs to the route," not a competing accent.
+    private val pinFillPaint = Paint().apply { color = CtaRed.toArgb(); isAntiAlias = true; style = Paint.Style.FILL }
+    private val pinOutlinePaint = Paint().apply {
+        color = Color.WHITE
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
+    private val pinHolePaint = Paint().apply { color = Color.WHITE; isAntiAlias = true }
 
     override fun draw(canvas: Canvas, projection: Projection) {
         val currentPosition = position ?: return
@@ -172,9 +188,38 @@ private class CurrentPositionOverlay : Overlay() {
             }
         }
 
+        destination?.let { destinationPoint ->
+            val destPixel = projection.toPixels(destinationPoint, null)
+            drawPin(canvas, destPixel.x.toFloat(), destPixel.y.toFloat())
+        }
+
         canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 44f, haloPaint)
         canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 16f, ringPaint)
         canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 11f, dotPaint)
+    }
+
+    /**
+     * Classic map-pin silhouette (circular head + a triangular tail
+     * pointing down) — drawn with Canvas primitives, same approach the
+     * halo/ring/dot marker above already uses, no new drawable asset
+     * needed. The tail's point (NOT the head's center) lands exactly on
+     * [tipX]/[tipY] — the actual destination coordinate — matching how
+     * every real map app anchors a pin at its pointed tip, not its head.
+     */
+    private fun drawPin(canvas: Canvas, tipX: Float, tipY: Float) {
+        val headRadius = 22f
+        val headCenterY = tipY - headRadius * 2.2f
+
+        val tail = Path().apply {
+            moveTo(tipX - headRadius * 0.55f, headCenterY + headRadius * 0.85f)
+            lineTo(tipX + headRadius * 0.55f, headCenterY + headRadius * 0.85f)
+            lineTo(tipX, tipY)
+            close()
+        }
+        canvas.drawPath(tail, pinFillPaint)
+        canvas.drawCircle(tipX, headCenterY, headRadius, pinFillPaint)
+        canvas.drawCircle(tipX, headCenterY, headRadius, pinOutlinePaint)
+        canvas.drawCircle(tipX, headCenterY, headRadius * 0.32f, pinHolePaint)
     }
 }
 
@@ -359,7 +404,30 @@ fun StreetMapView(
         val geometry = routeGeometry
         if (!geometry.isNullOrEmpty()) {
             mapView.post {
-                mapView.zoomToBoundingBox(BoundingBox.fromGeoPoints(geometry), true, 100)
+                // BUG FIX (Round 2, 2026-08-28, user report: "glitchy
+                // buffer... large pixel tiles of some random places" after
+                // pressing Go, needing a manual recenter tap to fix): this
+                // call used to fire WITHOUT the isProgrammaticMove guard
+                // the marker-recenter logic below already uses, so
+                // osmdroid's own onScroll/onZoom callbacks (fired BY
+                // zoomToBoundingBox itself) were misclassified as a REAL
+                // user gesture by the MapListener below, permanently
+                // flipping isFollowingLocation off. Later, when navigation
+                // started and the map zoomed in tight
+                // (MapScreen.kt's isNavigating effect, setZoom(19.0)), it
+                // zoomed in at the STALE route-preview center instead of
+                // recentering on the live position — a real but far-off,
+                // sparsely-tile-cached area, which is exactly what reads
+                // as "random places" made of large placeholder tiles.
+                // animated=false (was true) for the same reason setCenter
+                // (not animateTo) is used for marker-following below: an
+                // ANIMATED call fires its scroll/zoom callbacks
+                // asynchronously over several frames, after this flag
+                // would already be reset — only an instant jump lets the
+                // guard actually cover every callback it causes.
+                isProgrammaticMove.value = true
+                mapView.zoomToBoundingBox(BoundingBox.fromGeoPoints(geometry), false, 100)
+                isProgrammaticMove.value = false
             }
         }
     }
@@ -371,6 +439,12 @@ fun StreetMapView(
             update = { view ->
                 routePolyline.setPoints(routeGeometry ?: emptyList())
                 overlay.mode = mode
+                // Round 2 addition (2026-08-28, user report: "line
+                // terminating vaguely") — the route's own last geometry
+                // point IS the destination; no separate geocode lookup
+                // needed, RoutingRepository's OSRM response already ends
+                // exactly there.
+                overlay.destination = routeGeometry?.lastOrNull()
                 overlay.anchor = if (anchorLatDeg != null && anchorLonDeg != null) {
                     GeoPoint(anchorLatDeg, anchorLonDeg)
                 } else {

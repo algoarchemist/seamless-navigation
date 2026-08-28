@@ -2147,6 +2147,38 @@ UPDATE (Round 2 UI smoothness pass, 2026-08-28): the marker position and
   `lastCenteredPoint`) is UNCHANGED and still keys off the raw
   currentLatDeg/currentLonDeg, not the smoothed display value — camera
   recentering decisions stay based on real movement.
+UPDATE (Round 2, 2026-08-28, user report: "glitchy buffer... large pixel
+  tiles of some random places" after pressing Go, needing a manual
+  recenter tap to fix): REAL BUG — the `LaunchedEffect(routeGeometry)`
+  block's `zoomToBoundingBox()` call (route-preview zoom-to-fit) fired
+  WITHOUT the `isProgrammaticMove` guard the marker-recenter logic
+  already used, so osmdroid's own onScroll/onZoom callbacks (fired BY
+  that call itself) were misclassified by the `MapListener` as a REAL
+  user gesture, permanently flipping `isFollowingLocation` off the
+  moment a route was computed. Later, when navigation started and
+  `MapScreen.kt`'s `isNavigating` effect zoomed the map in tight
+  (`setZoom(19.0)`), the map no longer auto-recentered on the live
+  position (follow was off) — it zoomed in at the STALE route-preview
+  center instead, a real but far-off/sparsely-tile-cached area, which is
+  exactly what read as "random places" made of large placeholder tiles.
+  Fixed by wrapping the call in the SAME `isProgrammaticMove` guard the
+  marker-recenter `setCenter` call already uses, AND switching
+  `zoomToBoundingBox`'s `animated` argument from true to false — same
+  reason `setCenter` (not `animateTo`) was already chosen for
+  marker-following: an ANIMATED call fires its scroll/zoom callbacks
+  asynchronously over several frames, after a synchronously-reset flag
+  would already be back to false, so only an instant jump lets the guard
+  actually cover every callback it causes.
+UPDATE (Round 2, 2026-08-28, user report: "line terminating vaguely" —
+  no destination marker): `CurrentPositionOverlay` gained a `destination:
+  GeoPoint?` field (set from `routeGeometry?.lastOrNull()` in `update` —
+  the route's own last geometry point IS the destination, no separate
+  geocode lookup needed) and a `drawPin()` private method — a classic
+  map-pin silhouette (circular head + triangular tail) drawn with Canvas
+  primitives, same approach the halo/ring/dot position marker already
+  uses, no new drawable asset needed. The tail's POINT (not the head's
+  center) lands exactly on the destination coordinate, matching how
+  every real map app anchors a pin at its tip.
 Connected to: ui/map/PositionSmoother -> StreetMapView.kt (Round 2, 2026-08-28)
 
 ui/screens/DriveScreen.kt
