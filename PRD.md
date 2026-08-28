@@ -1,8 +1,11 @@
 # SIH26168 Intelligent Dead Reckoning MVP — Product Requirements Document
 
-Status: DRAFT v0.1 — architecture phase, no code written yet
+Status: Round 1 complete (Slices 1-8b implemented, evaluation cleared,
+tagged `round1-submission` on `main`). Round 2 in progress on the
+`hackathon-round2` branch.
 Owner: Nithin R
-Timebox: ~36 hours (hackathon MVP)
+Timebox: Round 1 ~36 hours (complete). Round 2 ~6 days (in progress) —
+see Section 33.
 
 ---
 
@@ -61,7 +64,8 @@ what we will actually attempt and measure.
 
 ## 4. MVP Objective
 
-Build and demonstrate, within ~36 hours, an Android application that:
+Build and demonstrate an Android application that (Round 1 shipped this
+within ~36 hours; Round 2 extends it over 6 days per Section 33):
 
 1. Continuously reads accelerometer, gyroscope and GNSS at ~10 Hz.
 2. Detects when GNSS becomes unavailable/degraded and switches to dead
@@ -110,12 +114,20 @@ is unavoidable for the demo:
 
 - Custom deep-learning map matcher / transformer architectures
 - 3D SLAM or computer-vision localization
-- Full offline routing engine or custom vector-map renderer
+- Custom vector-map renderer
 - Lane-level localization
 - Multi-phone support, FOG IMU, custom hardware, OBD-II integration
 - Large backend/cloud infrastructure or large model training
 - Automatic car-vs-motorcycle classification
-- A general-purpose maps competitor
+
+**Amended (Slice 8b, 2026-08-26)**: "Full offline routing engine" and "a
+general-purpose maps competitor" were explicitly removed from this list
+by developer override — real turn-by-turn navigation (search, routing,
+offline tile caching) was requested and shipped against real
+OSM/Nominatim/OSRM services. See `docs/PROJECT_MAP.md`'s 2026-08-26
+"full routing" entry (now in `summary.txt`, moved during the changelog
+split) for the full reasoning. This is a permanent scope amendment, not
+a one-off exception — the remaining items above still stand.
 
 ## 8. Functional Requirements
 
@@ -344,9 +356,9 @@ correction rather than as the primary estimator.
 While `GNSS_AIDED`: position and heading are taken primarily from GNSS;
 the IMU-derived velocity/heading are used to smooth short GNSS gaps/jitter
 and to continuously calibrate the velocity model's bias against GNSS
-speed (a simple online correction, not a full Kalman filter, given the
-36-hour budget — a loosely-coupled complementary approach is preferred
-over a tightly-coupled EKF for feasibility).
+speed (a simple online correction, not a full Kalman filter — a
+loosely-coupled complementary approach is preferred over a
+tightly-coupled EKF for feasibility within this project's scope).
 
 ## 18. GNSS Outage State Machine
 
@@ -572,7 +584,9 @@ SIH requirement.
 - If phone-to-vehicle auto-alignment proves unreliable, ship a manual
   "hold phone flat, tap to calibrate" fallback.
 
-## 33. 36-Hour Development Plan
+## 33. Development Timeline
+
+### Round 1 — 36-Hour Development Plan (DONE, historical)
 
 | Phase | Focus | Est. hours |
 |---|---|---|
@@ -588,9 +602,25 @@ SIH requirement.
 | 9 | Real-world testing + metric capture | 3 |
 | 10 | Demo hardening | 3 |
 
-Total ≈ 33–36 hours. Each phase's detailed acceptance criteria,
-dependencies, and fallback are tracked in `docs/PROJECT_MAP.md` as they
-are implemented (this PRD sets targets; PROJECT_MAP.md tracks reality).
+Total ≈ 33–36 hours, all DONE — evaluation cleared, tagged
+`round1-submission` on `main`.
+
+### Round 2 — 6-Day Development Plan (in progress, `hackathon-round2`)
+
+| Day | Focus | Priority |
+|---|---|---|
+| 1 | Doc/branch setup (this section); outdoor GNSS validation drive #1 | Required |
+| 2 | Fix bugs from drive #1; begin self-captured motion-classifier data collection | Required |
+| 2–3 | Step-detector sensor + pedestrian dead reckoning (Walking mode); UI smoothness pass | Required |
+| 3–4 | `ml/train_motion_classifier.py`: train + measure against the deterministic stand-ins | Required |
+| 4 | Export motion classifier to ONNX, wire into Kotlin (only if it measurably beats the stand-ins — Rule 3) | Required |
+| 5 | Outdoor GNSS validation drive #2 (confirm fixes, capture final demo numbers) | Required |
+| 6 | Docs pass (`docs/PROJECT_MAP.md`, `summary.txt`, `README.md`), demo rehearsal | Required |
+| 6 (if time remains) | Google Maps SDK migration off `osmdroid` (needs a GCP project/API key first) | Optional / stretch |
+
+Each day's detailed acceptance criteria, dependencies, and fallback are
+tracked in `docs/PROJECT_MAP.md` as they are implemented (this PRD sets
+targets; PROJECT_MAP.md tracks reality) — same convention Round 1 used.
 
 ## 34. Future Scope
 

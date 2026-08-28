@@ -8,9 +8,14 @@ smartphone-only navigation continuity through GNSS-denied stretches.
 
 ## Mission
 
-Ship a real, working, on-device Android demo within a ~36-hour hackathon
-window that visibly and honestly shows GNSS→dead-reckoning→GNSS
-transitions with a measured (not assumed) drift result.
+Ship a real, working, on-device Android demo that visibly and honestly
+shows GNSS→dead-reckoning→GNSS transitions with a measured (not assumed)
+drift result. Round 1 did this within a ~36-hour hackathon window
+(tagged `round1-submission` on `main`, evaluation cleared). Round 2
+extends it over a 6-day window on the `hackathon-round2` branch — same
+standard of honest, measured results over assumed ones, now with enough
+runway for things Round 1 couldn't fit: real self-captured training
+data and a real outdoor validation run.
 
 ## Source of Truth
 
@@ -21,19 +26,36 @@ developer explicitly amends it. If code and PROJECT_MAP.md disagree,
 PROJECT_MAP.md is stale and must be updated immediately — never leave it
 describing something that no longer exists.
 
-## Critical 36-Hour Constraint
+## Development Timeline
 
-Time is the primary constraint, ahead of theoretical completeness. A
+**Round 1 (complete)**: ~36 hours, hackathon MVP. Frozen at the
+`round1-submission` git tag on `main` — do not rewrite that history;
+all Round 2 work happens on `hackathon-round2` instead.
+
+**Round 2 (in progress)**: ~6 days, internal hackathon round. Still a
+real constraint, just a longer one — the standard below still applies,
+it's not a license to gold-plate:
+
+Time is a primary constraint, ahead of theoretical completeness. A
 working, demonstrable vertical slice always beats a sophisticated,
 incomplete subsystem. When in doubt, ship the simpler version described
-in PRD.md and record the deferred sophistication as Future Work.
+in PRD.md and record the deferred sophistication as Future Work. The
+extra runway Round 2 has over Round 1 is meant for things that were
+genuinely infeasible in 36 hours — real self-captured training data,
+a real outdoor GNSS test — not for scope creep into PRD.md Section 7's
+excluded items. Any expansion past Section 7 still needs the same
+explicit-discussion-first treatment Rule 2/4 already require, evaluated
+per Round 2's own timebox, not assumed just because more days exist.
 
 ## Architecture Rules
 
 1. Never implement a large feature without first checking `PRD.md`.
 2. Never introduce a new framework, library, or service not already
-   named in `PRD.md` Section 8/21/23 without discussing it first — the
-   smallest practical stack wins.
+   named in `PRD.md` Section 6/19/21/23 without discussing it first — the
+   smallest practical stack wins. (Pre-approved Round 2 exception: the
+   Google Maps SDK, to replace `osmdroid`/OSM tiles once a GCP
+   project/API key exists — already discussed, not yet implemented;
+   `osmdroid` stays in place and fully functional until then.)
 3. Never replace a simple deterministic solution with ML unless ML
    provides measurable value (a real comparison against the physics
    baseline, not an assumption).
