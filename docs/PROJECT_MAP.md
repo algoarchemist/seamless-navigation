@@ -54,6 +54,17 @@ accuracy instead of the pre-existing binary `isGood` gate. See each
 file's own entry below for detail, and PRD.md Section 15/17/18's
 2026-08-28 amendments for the requirements these satisfy.
 
+Later the same day: two more Round 2 Day 2-3 items landed, both
+additive/instrumentation-only (neither touches the GNSS/DR/fusion
+pipeline): (5) `motion/FloorChangeDetector.kt` + `FloorChangeRepository.kt`
+(NEW) — barometer-based floor/level-change detection (PRD.md FR12),
+shown on the debug screen; (6) `sensors/SensorRepository.kt` gained
+optional TYPE_LINEAR_ACCELERATION/TYPE_GRAVITY listeners (PRD.md
+Section 11), also shown on the debug screen as a cross-check against
+`dr/WorldFrameAcceleration`'s manual gravity subtraction — not adopted
+into the DR pipeline yet, per Section 11's "only if it measures out
+better, decided empirically."
+
 ---
 
 ## How to read this file
@@ -213,6 +224,13 @@ Important concepts/assumptions: AccelSample/GyroSample are DEVICE frame
   Uses List<Float> rather than FloatArray specifically so this data
   class's generated equals()/hashCode() stay structurally correct
   (Kotlin data classes compare FloatArray fields by reference).
+UPDATE (Round 2, 2026-08-28 — PRD.md FR12): added PressureSample(timestampNs,
+  pressureHpa) — units hPa, per Android's TYPE_PRESSURE convention. Not
+  all devices have a barometer (see SensorRepository.hasBarometer()
+  below); consumers must treat its absence as a normal, honest case.
+  AccelSample is also now reused verbatim (same x/y/z/timestampNs shape)
+  for Android's own TYPE_LINEAR_ACCELERATION/TYPE_GRAVITY readings — see
+  SensorRepository.kt's entry below.
 
 android/app/src/main/kotlin/com/sih26168/idr/sensors/SampleRate.kt
 Status: IMPLEMENTED
@@ -239,14 +257,33 @@ Purpose: Registers accelerometer + gyroscope + rotation-vector listeners
   CLAUDE.md Rule 5's one-responsibility-per-file).
 Inputs: android.content.Context (for SensorManager).
 Outputs: StateFlow<SensorUiState> — {latestAccel, latestGyro,
-  latestOrientation, accelHz, gyroHz, orientationHz}.
+  latestOrientation, accelHz, gyroHz, orientationHz, latestPressure,
+  pressureHz, latestLinearAcceleration, latestGravity (last four, Round 2,
+  2026-08-28)}.
 Connected to: MainActivity -> SensorRepository -> (StateFlow) -> Compose UI
   ; SensorRepository -> OrientationMath (pure function, orientation
-  conversion only, no reverse dependency)
+  conversion only, no reverse dependency);
+  SensorRepository -> motion/FloorChangeRepository (Round 2, 2026-08-28,
+  reads latestPressure)
 Important functions/classes: start()/stop() (lifecycle-tied — called
   from onResume/onPause, not onCreate/onDestroy, so sensors aren't
   active while backgrounded); hasRequiredSensors() (now also requires
-  TYPE_ROTATION_VECTOR).
+  TYPE_ROTATION_VECTOR); hasBarometer() (Round 2, 2026-08-28 — separate
+  from hasRequiredSensors() since the barometer is OPTIONAL, unlike
+  accel/gyro/rotation-vector — see PressureSample's entry above).
+UPDATE (Round 2, 2026-08-28 — PRD.md FR12 + Section 11): registers three
+  new OPTIONAL listeners (all `?.let { registerListener(...) }`, same
+  nullable-safe pattern as the required three): TYPE_PRESSURE (barometer,
+  publishes latestPressure/pressureHz, same Hz-tracking pattern as
+  accel/gyro/orientation), TYPE_LINEAR_ACCELERATION and TYPE_GRAVITY
+  (Android's own fused, already-gravity-removed accelerometer and
+  smoothed gravity vector — publish latestLinearAcceleration/
+  latestGravity with NO Hz tracking, deliberately: these are a one-off
+  instrumentation cross-check against dr/WorldFrameAcceleration.kt's
+  manual gravity subtraction, shown side-by-side on MainActivity's debug
+  screen, NOT wired into the DR pipeline — PRD.md Section 11 explicitly
+  says "adopted only if it measures out better... decided empirically,"
+  which hasn't happened yet, so nothing was swapped, only instrumented).
 Important concepts/assumptions: listener callbacks run on a dedicated
   background HandlerThread ("SensorRepositoryThread"), never the
   main/UI thread, per CLAUDE.md Android Rule 7. StateFlow is the
@@ -592,6 +629,23 @@ UPDATE (Round 2, 2026-08-28): now also instantiates a single
   `onRecalibrate` callbacks now call `alignmentRepository.reset()`
   directly instead of `mlVelocityRepository?.resetAlignment()` (removed
   — see `alignment/AlignmentRepository.kt`'s entry).
+UPDATE (Round 2, 2026-08-28 — PRD.md FR12 + Section 11): also
+  instantiates `motion/FloorChangeRepository` (independent of everything
+  else — only needs `sensorRepository`) and starts/stops it alongside the
+  other repositories. `IdrSensorScreen` (the debug screen) now takes a
+  `floorState: FloorChangeUiState` param and renders: (1) live relative
+  barometric altitude + total floors changed + a "FLOOR CHANGE detected"
+  flash, or an honest "this device has no barometer" message; (2) a
+  gravity-removal CROSS-CHECK line comparing
+  `dr/WorldFrameAcceleration`'s manual gravity subtraction (recomputed
+  inline from `state.latestAccel`/`latestOrientation`, purely for
+  display — does NOT touch the DR pipeline) against Android's own
+  `TYPE_LINEAR_ACCELERATION` reading (`state.latestLinearAcceleration`)
+  side by side. Neither the Drive/Map polished screens nor any DR/fusion
+  logic reads either of these yet — this is instrumentation on the debug
+  screen only, so a future real drive can decide (per PRD.md Section 11's
+  "adopted only if it measures out better") whether either is worth
+  wiring further.
 Important functions/classes: requestLocationPermission
   (registerForActivityResult(RequestPermission()), registered as a
   property initializer since it must be registered before the activity
@@ -1707,6 +1761,71 @@ Connected to: dr/BaselineDeadReckoningRepository AND
   (that came from BaselinePhysicsIntegrator.update() alone, no
   corrections at all) — it only affects the LIVE corrected display,
   exactly like ZUPT/non-holonomic already do for the physics path.
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/FloorChangeDetector.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: PRD.md FR12 — barometer-based floor/level-change detection,
+  directly supporting the multi-level-parking scenario named in the SIH
+  problem statement (Section 2/3). Pure Kotlin, no Android dependency,
+  unit-testable on the plain JVM (CLAUDE.md Rule 19). Deterministic
+  threshold detector — same "physics-only stand-in" precedent as
+  StationaryDetector/PotholeShockDetector, but satisfies its OWN FR
+  directly (there's no PRD Section 14 motion class for this).
+Inputs: nowMs (boot-time ms, relative durations only), pressureHpa.
+Outputs: Result(relativeAltitudeM, floorChangeDetected, floorDelta).
+Important functions/classes: relativeAltitudeMeters(baselineHpa,
+  currentHpa) (companion, pure) — the international barometric formula
+  `h = 44330*(1-(P/P0)^(1/5.255))`, a standard atmospheric-physics
+  approximation (not an invented/measured figure — CLAUDE.md Rule 13's
+  "no invented numbers" concerns claimed benchmarks, not textbook
+  constants), only accurate for modest altitude changes near the
+  baseline (ICAO standard-atmosphere assumption) — adequate for a few
+  parking-structure floors, not claimed accurate at km scale; evaluate()
+  — tracks a baseline pressure (established on the first-ever reading),
+  computes relative altitude against it, and signals a floor change only
+  once a threshold crossing has been SUSTAINED for minDwellMs (same
+  hysteresis principle as StationaryDetector/GnssOutageDetector,
+  CLAUDE.md Rule 16's spirit — a brief pressure blip, e.g. a car door
+  slamming, must not flip this); on a confirmed change, the baseline
+  RE-ANCHORS to the current pressure so a SUBSEQUENT floor change (e.g.
+  descending multiple levels) can also be detected, not just the first;
+  reset().
+Important concepts/assumptions: engineering defaults
+  (floorHeightThresholdM=2.5m, minDwellMs=2000ms), not yet validated
+  against a real multi-level-parking test drive (CLAUDE.md Rule 13).
+Connected to: motion/FloorChangeRepository -> FloorChangeDetector -> FloorChangeUiState
+Unit tests: tests/.../motion/FloorChangeDetectorTest.kt — the formula
+  itself hand-verified against a known pressure-ratio case (0.5 ratio ~=
+  5478m, derived via the formula's own Taylor expansion, not just
+  round-tripped through the code); sustained crossings up/down signal the
+  correct floorDelta; a crossing that doesn't last the full dwell, or is
+  interrupted mid-streak, does NOT signal a change; staying within the
+  threshold band never signals a change; re-anchoring after a confirmed
+  change allows a second change to also be detected; reset() clears state.
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/FloorChangeRepository.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: Android/coroutine glue driving FloorChangeDetector off
+  SensorRepository's barometer stream. A SEPARATE repository (CLAUDE.md
+  Rule 5) rather than folded into BaselineDeadReckoningRepository/
+  MlVelocityRepository — floor detection is entirely independent of
+  GNSS/DR position estimation; nothing about it gates or is gated by
+  either DR path, so it only depends on SensorRepository.
+Inputs: SensorRepository (read-only, via its StateFlow), a CoroutineScope.
+Outputs: StateFlow<FloorChangeUiState> — {relativeAltitudeM,
+  floorChangeDetected, floorDelta, totalFloorsChanged, hasBarometer}.
+Important functions/classes: start()/stop() (lifecycle-tied, same
+  pattern as every other repository here); totalFloorsChanged — a
+  running signed count this class accumulates across confirmed floor
+  changes (the pure detector only reports ONE change at a time, this
+  repository is what turns that into a running trip total, same
+  "pure math + stateful glue" split as everywhere else in this codebase).
+Important concepts/assumptions: not all devices have a barometer —
+  `hasBarometer` reflects `SensorRepository.hasBarometer()` honestly
+  (CLAUDE.md Rule 13) rather than silently showing "no floor change,
+  ever" on a device that structurally can't detect one.
+Connected to: SensorRepository -> FloorChangeRepository -> MainActivity
+  (debug screen only so far — see MainActivity.kt's entry)
 
 MapConstraint.kt
 Status: PLANNED

@@ -32,6 +32,7 @@ import com.sih26168.idr.alignment.AlignmentRepository
 import com.sih26168.idr.capture.SensorRecorder
 import com.sih26168.idr.dr.BaselineDeadReckoningRepository
 import com.sih26168.idr.dr.DeadReckoningState
+import com.sih26168.idr.dr.WorldFrameAcceleration
 import com.sih26168.idr.fusion.DrSource
 import com.sih26168.idr.fusion.FusedPositionUiState
 import com.sih26168.idr.fusion.StateEstimator
@@ -41,6 +42,8 @@ import com.sih26168.idr.gnss.LocationRepository
 import com.sih26168.idr.ml.MlVelocityRepository
 import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.ml.VelocityModel
+import com.sih26168.idr.motion.FloorChangeRepository
+import com.sih26168.idr.motion.FloorChangeUiState
 import com.sih26168.idr.sensors.SensorRepository
 import com.sih26168.idr.sensors.SensorUiState
 import com.sih26168.idr.ui.components.AppTab
@@ -51,6 +54,7 @@ import com.sih26168.idr.ui.screens.HistoryScreen
 import com.sih26168.idr.ui.screens.MapScreen
 import com.sih26168.idr.ui.theme.IdrTheme
 import java.io.File
+import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -94,6 +98,7 @@ data class RecordingUiState(
 class MainActivity : ComponentActivity() {
 
     private lateinit var sensorRepository: SensorRepository
+    private lateinit var floorChangeRepository: FloorChangeRepository
     private lateinit var alignmentRepository: AlignmentRepository
     private lateinit var deadReckoningRepository: BaselineDeadReckoningRepository
     private lateinit var locationRepository: LocationRepository
@@ -147,6 +152,13 @@ class MainActivity : ComponentActivity() {
         // not a claimed behavior of the shipped navigation logic itself.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         sensorRepository = SensorRepository(applicationContext)
+        // Round 2 (2026-08-28 — PRD.md FR12): independent of GNSS/DR
+        // entirely (see FloorChangeRepository's doc), so it only needs
+        // sensorRepository — constructed here, ahead of everything else
+        // that reads sensorRepository, purely by convention (no ordering
+        // dependency actually exists between this and the other
+        // repositories below).
+        floorChangeRepository = FloorChangeRepository(sensorRepository, lifecycleScope)
         locationRepository = LocationRepository(applicationContext)
         // GnssModeRepository must exist before BaselineDeadReckoningRepository —
         // Slice 5 wires the DR odometer's reset behavior to the GNSS mode.
@@ -197,6 +209,7 @@ class MainActivity : ComponentActivity() {
             val gnssState by gnssModeRepository.state.collectAsState()
             val mlState by (mlVelocityRepository?.state ?: MutableStateFlow(MlVelocityUiState())).collectAsState()
             val fusedState by stateEstimator.state.collectAsState()
+            val floorState by floorChangeRepository.state.collectAsState()
             val mlError by mlModelLoadError.collectAsState()
             val recState by recordingState.collectAsState()
             var showDebugScreen by remember { mutableStateOf(false) }
@@ -233,7 +246,7 @@ class MainActivity : ComponentActivity() {
             IdrTheme(darkTheme = isDarkTheme) {
                 if (showDebugScreen) {
                     IdrSensorScreen(
-                        uiState, drState, gnssState, mlState, fusedState, mlError, recState,
+                        uiState, drState, gnssState, mlState, fusedState, floorState, mlError, recState,
                         sensorRepository.hasRequiredSensors(),
                         onStartRecording = ::startRecording,
                         onStopRecording = ::stopRecordingAndSave,
@@ -300,6 +313,9 @@ class MainActivity : ComponentActivity() {
     // stateEstimator — see the original inline comments this replaced).
     private fun startPipeline() {
         sensorRepository.start()
+        // Independent of GNSS/DR (see FloorChangeRepository's doc) — only
+        // needs sensorRepository, which is already started above.
+        floorChangeRepository.start()
         gnssModeRepository.start()
         if (locationRepository.hasLocationPermission()) {
             locationRepository.start()
@@ -327,6 +343,7 @@ class MainActivity : ComponentActivity() {
         mlVelocityRepository?.stop()
         deadReckoningRepository.stop()
         alignmentRepository.stop()
+        floorChangeRepository.stop()
         gnssModeRepository.stop()
         locationRepository.stop()
         sensorRepository.stop()
@@ -431,6 +448,7 @@ private fun IdrSensorScreen(
     gnssState: GnssModeUiState,
     mlState: MlVelocityUiState,
     fusedState: FusedPositionUiState,
+    floorState: FloorChangeUiState,
     mlModelLoadError: String?,
     recordingState: RecordingUiState,
     hasRequiredSensors: Boolean,
@@ -647,6 +665,67 @@ private fun IdrSensorScreen(
                                 fusedState.secondsSinceLastGnssAided,
                             )
                     },
+                )
+
+                // Round 2 (2026-08-28 — PRD.md FR12): barometer-based
+                // floor/level-change detection.
+                Text(
+                    text = if (!floorState.hasBarometer) {
+                        "Floor detection: this device has no barometer."
+                    } else {
+                        "Floor detection: relative altitude=%.2fm, total floors changed=%d%s".format(
+                            floorState.relativeAltitudeM,
+                            floorState.totalFloorsChanged,
+                            if (floorState.floorChangeDetected) {
+                                " — FLOOR CHANGE just detected (%s)".format(
+                                    if (floorState.floorDelta > 0) "up" else "down",
+                                )
+                            } else {
+                                ""
+                            },
+                        )
+                    },
+                )
+                Text(
+                    text = "^ deterministic threshold on relative barometric altitude " +
+                        "(PRD Section 2/3's multi-level-parking scenario) — NOT validated " +
+                        "against a real multi-level test yet (CLAUDE.md Rule 13).",
+                )
+
+                // Round 2 (2026-08-28 — PRD.md Section 11): gravity-sensor
+                // cross-check. Purely observational — this does NOT feed
+                // the DR pipeline; it lets a real test drive compare our
+                // own manual gravity subtraction against Android's own
+                // fused sensors before deciding whether to switch
+                // (CLAUDE.md Rule 3: a real comparison, not an assumption).
+                val ourLinearAccel = if (state.latestAccel != null && state.latestOrientation != null) {
+                    val world = WorldFrameAcceleration.rotateDeviceToWorld(
+                        deviceX = state.latestAccel.xMps2,
+                        deviceY = state.latestAccel.yMps2,
+                        deviceZ = state.latestAccel.zMps2,
+                        rotationMatrixDeviceToWorld = state.latestOrientation.rotationMatrixDeviceToWorld,
+                    )
+                    WorldFrameAcceleration.removeGravity(world)
+                } else {
+                    null
+                }
+                val ourLinearAccelMagnitude = ourLinearAccel?.let {
+                    sqrt(it[0] * it[0] + it[1] * it[1] + it[2] * it[2])
+                }
+                val androidLinearAccelMagnitude = state.latestLinearAcceleration?.let {
+                    sqrt(it.xMps2 * it.xMps2 + it.yMps2 * it.yMps2 + it.zMps2 * it.zMps2)
+                }
+                Text(
+                    text = "Gravity-removal cross-check (m/s^2 magnitude): ours=%s, Android's own=%s".format(
+                        ourLinearAccelMagnitude?.let { "%.3f".format(it) } ?: "n/a",
+                        androidLinearAccelMagnitude?.let { "%.3f".format(it) } ?: "n/a (no TYPE_LINEAR_ACCELERATION on this device)",
+                    ),
+                )
+                Text(
+                    text = "^ instrumentation only (PRD Section 11) — not wired into the DR " +
+                        "pipeline; compare these two on a real drive before deciding whether " +
+                        "to switch dr/WorldFrameAcceleration's manual subtraction for Android's " +
+                        "own fused sensor (CLAUDE.md Rule 3: adopt only on a measured win).",
                 )
             }
         }
