@@ -140,7 +140,12 @@ latency and transition to DEAD_RECKONING state.
 
 FR3. App shall estimate forward velocity via the trained velocity model
 (ML) during DR, with a physics-integration fallback if the model is
-unavailable or its input is out of expected range.
+unavailable or its input is out of expected range. The live ML velocity
+output shall be damped (exponential smoothing or a min-speed cutoff)
+before being integrated into position — unlike the physics path's
+integrator "memory," the ML path had no such damping, and a single
+anomalous sample produced a visible position jump (Round 2 finding,
+2026-08-28).
 
 FR4. App shall classify motion state per sample/window (stationary,
 moving, accelerating, braking, pothole, turning, cruising, phone-moved)
@@ -158,11 +163,20 @@ FR7. App shall constrain the propagated position to the nearest
 plausible road geometry (map-matching, MVP-level — Section 19).
 
 FR8. App shall re-fuse with GNSS on reacquisition without a visible
-teleport in the UI (blend/interpolate over a short window).
+teleport in the UI (blend/interpolate over a short window) — this covers
+BOTH position and heading/map-orientation. Round 1 only blended position
+(`fusion/PositionFusion.kt`); heading was a hard cutover, which produced a
+visible ~180° map-orientation flip on reacquisition during the Round 2
+Day 1 live outage test (2026-08-28) — see Section 18.
 
 FR9. App shall perform an initial phone-to-vehicle alignment
 (pitch/roll/yaw) automatically while GNSS + motion are available, and
-shall detect gross phone movement thereafter.
+shall detect gross phone movement thereafter. The resulting alignment
+correction shall be applied to BOTH the ML velocity path's feature
+extraction AND the physics DR path's heading integration — Round 1 only
+wired it into the former, which let the physics path's heading drift far
+enough from true heading to contribute to the reacquisition flip above
+(Round 2 finding, 2026-08-28). See Section 15.
 
 FR10. UI shall show, at minimum: GNSS status, current mode
 (GNSS_AIDED/TRANSITION/DEAD_RECKONING/REACQUISITION), estimated speed,
@@ -170,6 +184,16 @@ motion state, and the live position on a map.
 
 FR11. App shall run entirely on-device; no continuous dependency on a
 laptop for inference.
+
+FR12 (Round 2 addition, 2026-08-28). App shall detect floor/level changes
+using the barometer (pressure sensor), directly supporting the
+multi-level-parking scenario named in the SIH problem statement
+(Section 2/3) — no altitude signal is used anywhere in the MVP today.
+
+FR13 (Round 2 addition, 2026-08-28). GNSS + INS fusion shall weight the
+GNSS contribution as a continuous function of fix accuracy, not a binary
+good/bad gate — a 24 m fix should not be trusted identically to a 2 m fix.
+See Section 17.
 
 ## 9. Non-Functional Requirements
 
@@ -230,13 +254,20 @@ was judged necessary for the MVP scope.
   on Android's `SensorEvent.timestamp` (monotonic, boot-time base) —
   reconciled against wall-clock/GNSS time explicitly, per Rule 7/8
   (CLAUDE.md): sensor timestamps are **not** wall-clock and must not be
-  silently treated as such.
+  silently treated as such. **(Round 2 addition, 2026-08-28)**: barometer
+  (pressure, hPa) is also read, for floor/level-change detection — see
+  FR12.
 - **Synchronization**: nearest-timestamp alignment of accel/gyro (same
   sensor thread, so effectively synchronous) against GNSS fixes (much
   lower rate, ~1 Hz), interpolated/held between fixes.
 - **Filtering**: low-pass filtering (or a light complementary/Kalman
   filter for orientation) to remove high-frequency vibration noise before
   feature extraction; a matched approach is used for gravity removal.
+  **(Round 2, 2026-08-28)**: gravity removal may use Android's own
+  `TYPE_GRAVITY`/`TYPE_LINEAR_ACCELERATION` fused sensors in place of, or
+  as a cross-check against, the current manual gravity-subtraction step —
+  adopted only if it measures out better (CLAUDE.md Rule 13: no invented
+  numbers), not assumed superior up front.
 - **Orientation estimation**: device rotation vector (Android sensor
   fusion) as the base orientation source, refined by the phone-to-vehicle
   alignment offset from Section 12.
@@ -288,6 +319,12 @@ during Phase 4, not to assume up front.
   fall back to constant-acceleration physics integration with a
   documented confidence penalty, rather than trusting an out-of-
   distribution ML output.
+- **Damping (Round 2 addition, 2026-08-28)**: the live ML velocity output
+  is damped (exponential smoothing or a min-speed cutoff) before being
+  integrated into position. The physics path's integrator has "memory"
+  that absorbs a single bad reading; the ML path had none, so one jolt
+  (e.g. a desk-bump during bench testing) produced a visible position
+  jump — observed directly, not hypothesized. See FR3.
 
 ## 14. Motion Classification
 
@@ -335,6 +372,15 @@ motorcycle lean beyond flagging it as reduced confidence during large
 roll excursions (Section 15/7 of source brief) rather than building a
 lean-dynamics model.
 
+**(Round 2, 2026-08-28)**: the alignment correction is applied to BOTH the
+ML velocity path's vehicle-frame feature extraction AND the physics DR
+path's heading integration (Section 16). Round 1 only wired it into the
+ML path (`MlVelocityRepository`) — the physics path
+(`BaselineDeadReckoningRepository`) kept using raw, unaligned device
+azimuth. That gap is what let the physics-path heading drift far enough
+from true heading to flip the map ~180° on GNSS reacquisition during the
+Round 2 Day 1 live outage test.
+
 ## 16. Dead Reckoning
 
 Core propagation while in `DEAD_RECKONING`:
@@ -351,6 +397,10 @@ Gated by: ZUPT when Stationary, non-holonomic lateral suppression
 (Section 20), and map-constraint snapping (Section 19) applied as a
 correction rather than as the primary estimator.
 
+**(Round 2, 2026-08-28)**: `heading[t]` integration now starts from the
+aligned azimuth (Section 15's phone-to-vehicle correction applied), not
+raw device azimuth as in Round 1 — see Section 15 for why.
+
 ## 17. GNSS + INS Fusion
 
 While `GNSS_AIDED`: position and heading are taken primarily from GNSS;
@@ -359,6 +409,14 @@ and to continuously calibrate the velocity model's bias against GNSS
 speed (a simple online correction, not a full Kalman filter — a
 loosely-coupled complementary approach is preferred over a
 tightly-coupled EKF for feasibility within this project's scope).
+
+**(Round 2 addition, 2026-08-28 — FR13)**: the blending/correction weight
+given to a GNSS fix is a continuous function of its reported accuracy
+(e.g. inverse-accuracy weighting), not the binary good/bad gate
+`GnssQuality.isGood` currently applies uniformly — a 24 m fix should not
+be trusted identically to a 2 m fix. The binary gate remains as the state
+machine's enter/exit trigger (Section 18); this only changes how much a
+given "good" fix is trusted within the fusion blend itself.
 
 ## 18. GNSS Outage State Machine
 
@@ -383,18 +441,33 @@ each state) is required to prevent mode-flapping on borderline GNSS
 accuracy. Outage-detection and recovery latency are both measured
 metrics (Section 28), not assumed constants.
 
+**(Round 2, 2026-08-28 — FR8)**: REACQUISITION blends BOTH position
+(already implemented, `fusion/PositionFusion.kt`, Slice 7) AND
+heading/map-orientation. Round 1 only blended position, leaving heading as
+a hard cutover — during the Round 2 Day 1 live outage test this produced
+a visible ~180° map-orientation flip at the moment of reacquisition, on
+top of the position snap the position-only blend was supposed to prevent
+(the position blend alone wasn't enough once heading also jumped).
+
 ## 19. Map Matching
 
 MVP approach: **nearest-road snapping**, not a custom map-matching
-engine. Two options, decided in Phase 7 based on time remaining:
+engine.
 
-- Use an existing Android map/navigation SDK's road-snapping capability
-  directly, if one is available and quick to integrate.
-- Otherwise, a lightweight local method: pull OSM road geometry for the
-  demo area ahead of time, and snap the DR position to the nearest
-  compatible road segment whose heading roughly matches the estimated
-  heading (simple nearest-segment + heading-compatibility check, not an
-  HMM).
+**(Round 2, 2026-08-28)**: scheduled for Round 2 Day 4 (Section 33),
+committing to the lightweight local method below — Slice 8b's routing
+work already pulls OSM road geometry and talks to OSRM live, so this adds
+no new service dependency, only the nearest-segment snapping logic
+itself:
+
+- Pull OSM road geometry for the demo area ahead of time, and snap the DR
+  position to the nearest compatible road segment whose heading roughly
+  matches the estimated heading (simple nearest-segment +
+  heading-compatibility check, not an HMM).
+- (Originally-considered alternative, not taken: an existing Android
+  map/navigation SDK's own road-snapping capability — not pursued since
+  the OSM-based approach above reuses infrastructure Slice 8b already
+  built, at no added integration cost.)
 
 Explicitly **not** attempting: a full HMM-based map matcher, a custom
 renderer, or general-area routing. This is the MVP map constraint; full
@@ -501,6 +574,11 @@ desktop benchmarks.
 - **Real-world tests**: stationary, straight driving, acceleration,
   braking, turning, potholes, stop-and-go, phone movement, GNSS loss,
   GNSS recovery — each run logged for later drift analysis.
+- **(Round 2 addition, 2026-08-28)**: every DR session automatically logs
+  accumulated position drift over the outage (not just per-tick velocity
+  MAE) so a real number is captured on every run instead of being
+  eyeballed — this is what Section 28's honesty requirement actually
+  takes to satisfy in practice, not just a nice-to-have.
 
 ## 28. Performance Metrics
 
@@ -508,7 +586,9 @@ All numbers reported to judges must come from an actual measured run
 (CLAUDE.md Rule 13 — never invent numbers). Metrics to capture:
 
 - **Position error**: absolute and relative position error, drift % over
-  a GNSS-denied segment.
+  a GNSS-denied segment. **(Round 2, 2026-08-28)**: captured via an
+  automated per-session drift log (Section 27), not a manual/eyeballed
+  read of the on-screen position.
 - **Velocity**: MAE, RMSE against GNSS speed (when available) or ground
   truth (IO-VNBD).
 - **Motion classifier**: accuracy, precision, recall, F1, confusion
@@ -570,6 +650,27 @@ SIH requirement.
   both a real GNSS-denied location and a controlled/simulated-outage
   fallback path for testing (not for the final measured numbers, per
   Rule 12 — simulation is for testing only).
+- **(Round 2, 2026-08-28) ML feature-importance generalization risk**:
+  `accel_up_std_mps2` currently dominates the velocity model's feature
+  importance (measured 0.672) — plausibly a road-vibration proxy rather
+  than a true kinematic signal. Untested across different vehicles,
+  mounts, and road surfaces; flagged, not yet mitigated.
+- **(Round 2, 2026-08-28) Unexplained held-out-trip result**: the one
+  held-out trip where physics beat the ML model (S-Vtb3) was never
+  root-caused — unknown whether it's a one-off or a pattern (e.g. the
+  model underperforming on short/low-speed trips). Flagged as an open
+  item for Phase 4 follow-up, not yet investigated.
+- **(Round 2, 2026-08-28) Stationary-vs-coasting ambiguity**:
+  `StationaryDetector.kt`'s own documented limitation — accel+gyro alone
+  cannot distinguish "parked" from "coasting at a perfectly steady
+  speed." Known, not yet mitigated; a GNSS-speed or classifier-based gate
+  is Future Work (Section 34) if it proves to matter in practice.
+- **(Round 2, 2026-08-28) Cross-language feature-extraction drift**:
+  `feature_extraction.py` (Python) and `FeatureExtractor.kt` (Kotlin) are
+  still hand-mirrored only, with no automated parity check — any future
+  edit to one and not the other would silently corrupt ML input. Explicitly
+  deferred this round to Future Work (Section 34) rather than built now,
+  kept here as an open risk rather than silently dropped.
 
 ## 32. Fallback Strategies
 
@@ -583,6 +684,14 @@ SIH requirement.
   alone, documenting the trade-off honestly to judges.
 - If phone-to-vehicle auto-alignment proves unreliable, ship a manual
   "hold phone flat, tap to calibrate" fallback.
+- **(Round 2, 2026-08-28)** If the remaining Round 2 timebox gets tight,
+  the newly-scheduled Day 2-4 items (Section 33) drop in this order,
+  newest/most speculative first, per CLAUDE.md's "working slice over
+  sophistication" rule: reacquisition blending/alignment/damping bug
+  fixes (already broken — must ship) > motion classifier (already
+  Required) > snap-to-road (Section 19) > continuous GNSS confidence
+  weighting (Section 17) > barometer floor detection (FR12) >
+  linear-acceleration/gravity sensor swap (Section 11).
 
 ## 33. Development Timeline
 
@@ -607,16 +716,26 @@ Total ≈ 33–36 hours, all DONE — evaluation cleared, tagged
 
 ### Round 2 — 6-Day Development Plan (in progress, `hackathon-round2`)
 
+**Updated 2026-08-28** after Day 1's live outage test (real drive,
+GPS toggled off mid-trip to force an outage — see Section 18/15's dated
+findings): the end-to-end GNSS→DR→GNSS transition worked, but surfaced a
+position-snap + map-orientation-flip bug on reacquisition, plus a set of
+scoped-in additions (below) chosen over deferring everything to Future
+Work (Section 34).
+
 | Day | Focus | Priority |
 |---|---|---|
-| 1 | Doc/branch setup (this section); outdoor GNSS validation drive #1 | Required |
-| 2 | Fix bugs from drive #1; begin self-captured motion-classifier data collection | Required |
-| 2–3 | Step-detector sensor + pedestrian dead reckoning (Walking mode); UI smoothness pass | Required |
+| 1 (today, in progress) | Doc/branch setup (done); live outage test — surfaced reacquisition-blend, alignment, damping/OOD bugs (Sections 15/17/18) | Required |
+| 2 | Fix Day-1 bugs: heading+position blend on reacquisition (Section 18); apply `AlignmentEstimator` correction to the physics DR path (Section 15/16); damping/smoothing + OOD guard on ML velocity (Section 13); continuous GNSS confidence weighting in fusion (Section 17/FR13). Begin self-captured motion-classifier data collection | Required |
+| 2–3 | Step-detector sensor + pedestrian dead reckoning (Walking mode); barometer floor/level detection (FR12); linear-acceleration/gravity sensor read (Section 11); UI smoothness pass | Required |
 | 3–4 | `ml/train_motion_classifier.py`: train + measure against the deterministic stand-ins | Required |
-| 4 | Export motion classifier to ONNX, wire into Kotlin (only if it measurably beats the stand-ins — Rule 3) | Required |
-| 5 | Outdoor GNSS validation drive #2 (confirm fixes, capture final demo numbers) | Required |
+| 4 | Export motion classifier to ONNX, wire into Kotlin (only if it measurably beats the stand-ins — Rule 3); map-constrained snap-to-road (Section 19) | Required |
+| 5 | Outdoor GNSS validation drive #2 (confirm fixes, capture final demo numbers, incl. the automated drift log from Section 27) | Required |
 | 6 | Docs pass (`docs/PROJECT_MAP.md`, `summary.txt`, `README.md`), demo rehearsal | Required |
 | 6 (if time remains) | Google Maps SDK migration off `osmdroid` (needs a GCP project/API key first) | Optional / stretch |
+
+If Days 2-4 run over the timebox, see Section 32's drop-order for what
+gets deferred to Section 34 first.
 
 Each day's detailed acceptance criteria, dependencies, and fallback are
 tracked in `docs/PROJECT_MAP.md` as they are implemented (this PRD sets
@@ -629,6 +748,19 @@ lane-level localization, multi-phone fusion, FOG IMU support, OBD-II
 integration, automatic vehicle-type classification, continuous
 in-motion re-alignment without a GNSS window, and a full cloud backend —
 all explicitly deferred (Section 7).
+
+**(Round 2, 2026-08-28)** Also explicitly deferred this round (chosen
+over scheduling into Section 33, given the remaining timebox):
+
+- Game rotation vector + magnetometer read — a plausible fix for
+  in-vehicle magnetic interference affecting heading accuracy, but not
+  scheduled this round.
+- An automated parity test harness between `feature_extraction.py`
+  (Python) and `FeatureExtractor.kt` (Kotlin) — currently hand-mirrored
+  only (Section 31's cross-language-drift risk).
+- An audit for the `GeocodingRepository`-style silent-failure pattern
+  (collapsing a failure into an empty result instead of surfacing an
+  error) elsewhere in the codebase.
 
 ## 35. Definition of Done (MVP)
 
