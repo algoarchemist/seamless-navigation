@@ -5,6 +5,7 @@ import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
 import org.osmdroid.tileprovider.cachemanager.CacheManager
+import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 
@@ -94,6 +95,38 @@ object OfflineRouteCache {
         )
     }
 
+    // REAL CRASH FOUND + FIXED (2026-08-29, user report: "if i start the
+    // destination the app is closing"): CacheManager.downloadAreaAsync()
+    // runs on an AsyncTask, and when the current tile source's policy
+    // rejects bulk downloads, it throws TileSourcePolicyException from
+    // INSIDE that background task's doInBackground() — a synchronous
+    // try/catch around the CacheManager(mapView) constructor call below
+    // (which is a DIFFERENT, earlier failure mode) can never catch that,
+    // since the exception happens later, asynchronously, on the AsyncTask's
+    // own thread; left uncaught there, it crashes the whole app. Confirmed
+    // via `adb logcat -b crash`: TileSourceFactory.MAPNIK is built with
+    // `new TileSourcePolicy(2, 15)` — flags=15 sets FLAG_NO_BULK, meaning
+    // osmdroid PERMANENTLY refuses bulk/CacheManager downloads against
+    // MAPNIK, honoring OpenStreetMap's own real tile usage policy
+    // (operations.osmfoundation.org/policies/tiles — "no bulk downloading"
+    // against the free tile.openstreetmap.org server). This was silently
+    // broken since `ui/map/StreetMapView.kt`'s 2026-08-26 CARTO->MAPNIK
+    // switch (that file's own doc comment) — [downloadRouteTiles]'s
+    // explicit "Download offline" button has carried this exact same
+    // crash ever since, just apparently never tapped/tested against
+    // MAPNIK until [prefetchLiveZoomTiles] started calling this code
+    // automatically. Fixed by checking [OnlineTileSourceBase.getTileSourcePolicy]
+    // BEFORE calling downloadAreaAsync — the same check CacheManager's own
+    // internal preCheck() does, just performed early enough here to fail
+    // synchronously via [onFailed] instead of asynchronously crashing.
+    // HONEST CONSEQUENCE, not silently glossed over (CLAUDE.md Rule 13):
+    // since this restriction is PERMANENT for MAPNIK (not a transient
+    // network failure), both [downloadRouteTiles] and [prefetchLiveZoomTiles]
+    // will now always/only call onFailed() and never actually cache
+    // anything — bulk tile pre-fetch cannot work at all against the
+    // current tile source. See PROJECT_MAP.md/summary.txt for the
+    // decision this raises (keep as a permanently-no-op safe failure,
+    // remove the feature, or switch tile source).
     private fun downloadTiles(
         context: Context,
         mapView: MapView,
@@ -104,12 +137,19 @@ object OfflineRouteCache {
         onComplete: () -> Unit,
         onFailed: () -> Unit,
     ) {
+        val tileSource = mapView.tileProvider.tileSource
+        if (tileSource is OnlineTileSourceBase && !tileSource.tileSourcePolicy.acceptsBulkDownload()) {
+            onFailed()
+            return
+        }
+
         val cacheManager = try {
             CacheManager(mapView)
         } catch (e: Exception) {
-            // TileSourcePolicyException etc. — the current tile source
-            // doesn't allow bulk caching. Surfaced as a normal failure,
-            // not a crash (same resilience pattern as RoutingRepository).
+            // A different failure mode than the policy check above (e.g.
+            // a malformed/unreadable tile cache) — surfaced as a normal
+            // failure, not a crash (same resilience pattern as
+            // RoutingRepository).
             onFailed()
             return
         }

@@ -424,7 +424,21 @@ fun MapScreen(
                                 routeGeometry = route.geometry,
                                 onProgress = { downloaded, total -> downloadStatus = "Downloading… $downloaded/$total tiles" },
                                 onComplete = { downloadStatus = "Saved for offline use." },
-                                onFailed = { downloadStatus = "Offline download failed — check network." },
+                                // REAL FINDING (2026-08-29, from the crash
+                                // fix in OfflineRouteCache.kt): this will
+                                // currently ALWAYS fail, every time, not
+                                // just on a bad connection — the live tile
+                                // source (osmdroid's MAPNIK) permanently
+                                // refuses bulk downloads by policy (honoring
+                                // OpenStreetMap's own "no bulk downloading"
+                                // tile usage terms), so "check network"
+                                // would be a misleading, retriable-sounding
+                                // message for a non-retriable cause. Says so
+                                // honestly instead (CLAUDE.md Rule 13) —
+                                // whether this button should be reworked or
+                                // removed given it can't currently succeed
+                                // at all is a separate, larger decision.
+                                onFailed = { downloadStatus = "Offline download isn't available for this map source right now." },
                             )
                         },
                         onEnd = {

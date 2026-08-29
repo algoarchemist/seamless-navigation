@@ -1771,3 +1771,64 @@ from 0 (freshly cleared) to 24 real rows, with the explicit "Download
 offline" button never touched -- confirms the automatic prefetch fires
 and writes real tiles into the exact same cache StreetMapView already
 reads from, with no separate code path.
+
+
+REAL CRASH FOUND + FIXED (2026-08-29) -- "if i start the destination the app is closing"
+-------------------------------------------------------------------------------------------
+User reported the app closing the moment they tapped Start after
+picking a destination -- reproduced immediately on-device (confirmed
+via `ps` showing the process gone and `adb logcat -b crash` showing a
+FATAL EXCEPTION on the AsyncTask thread).
+
+Root cause: the automatic tile-prefetch feature added earlier this
+session was calling CacheManager.downloadAreaAsync(), which runs on an
+AsyncTask and throws TileSourcePolicyException from INSIDE that
+background task's doInBackground() when the tile source's policy
+rejects bulk downloads. The only try/catch OfflineRouteCache.downloadTiles
+had wrapped just the CacheManager(mapView) constructor call -- it could
+never catch this, since the real failure happens later, asynchronously,
+on the AsyncTask's own worker thread, left uncaught until Android's
+runtime rethrows it and kills the process.
+
+Decompiled the bundled osmdroid-android-6.1.20 runtime jar with javap
+to find the actual cause rather than guessing: TileSourceFactory.MAPNIK
+is constructed with `new TileSourcePolicy(2, 15)` -- flags=15 sets
+FLAG_NO_BULK, meaning osmdroid PERMANENTLY refuses CacheManager bulk
+downloads against MAPNIK. This isn't a bug in osmdroid; it's osmdroid
+correctly honoring OpenStreetMap's own real tile usage policy ("no bulk
+downloading" against the free tile.openstreetmap.org server -- see
+operations.osmfoundation.org/policies/tiles). That means this exact
+crash has existed since ui/map/StreetMapView.kt's 2026-08-26 CARTO ->
+MAPNIK switch -- the pre-existing explicit "Download offline" button on
+ActiveRouteCard has been carrying the identical latent crash this whole
+time, just apparently never tapped/tested against MAPNIK until this
+session's automatic prefetch started exercising the same code path on
+every single route computed.
+
+Fixed by checking OnlineTileSourceBase.getTileSourcePolicy().
+acceptsBulkDownload() BEFORE ever calling downloadAreaAsync (the same
+check CacheManager's own internal preCheck() does, just performed
+early enough to fail synchronously via onFailed() instead of crashing
+asynchronously). Also corrected the explicit download button's failure
+message from "check network" (implies a retriable, transient cause) to
+"isn't available for this map source right now" (the real, permanent
+cause) -- CLAUDE.md Rule 13 still applies to a bug-fix's own honesty,
+not just to the original feature copy.
+
+HONEST OPEN QUESTION, not resolved in this fix: since FLAG_NO_BULK is
+permanent for MAPNIK, BOTH downloadRouteTiles (explicit button) and
+prefetchLiveZoomTiles (automatic) now always/only fail gracefully --
+neither can ever actually cache a tile against the current tile source.
+Bulk tile pre-fetch is a structural dead end here, not something a
+smarter retry or better error handling can route around. Whether to
+leave this as a permanently-safe no-op, remove the offline-download
+feature outright, or migrate to a tile source whose policy allows bulk
+download is flagged to the user as an open decision, not made
+unilaterally in this fix.
+
+Verified on-device end to end: reproduced the crash pre-fix, applied
+the fix, rebuilt, reinstalled, and repeated the EXACT same search ->
+select -> Start sequence -- route computed successfully (real 11.2km /
+11min route to Chennai Corporation, ActiveRouteCard rendered normally),
+process stayed alive, crash buffer stayed empty. All existing unit
+tests still pass; debug compile clean.
