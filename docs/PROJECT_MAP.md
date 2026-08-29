@@ -238,6 +238,28 @@ Important concepts/assumptions: listener callbacks run on a dedicated
   Rotation-vector's scalar quaternion component (w) is read from
   event.values[3] when present, else derived defensively via
   OrientationMath.scalarFromVectorPart (older devices/edge case).
+REAL BUG FIX (2026-08-29, found via capture/DriveDataLogger.kt's own
+  tick counter during an on-device smoke test): confirmed the requested
+  100ms/10Hz period is a HINT Android does not enforce — the test device
+  (Oppo/ColorOS) delivered accel/gyro/orientation at up to ~200 Hz
+  regardless, 15-20x the PRD.md Section 8/11 target. That reached every
+  downstream consumer unthrottled: BaselineDeadReckoningRepository's
+  integrator+ZUPT and MlVelocityRepository's full ONNX inference both ran
+  15-20x more often than designed, AND features/FeatureExtractor.kt's
+  "~1.0s trailing window" (matched to ml/train_velocity_model.py's own
+  ~10 Hz training rate) was actually only spanning ~50ms of real time per
+  update — a silent train/inference parity break, not just wasted CPU/
+  battery/recomposition. Fixed by independently throttling PUBLISHING
+  each sensor type to real ~10 Hz inside the listener (separate
+  `lastPublished*TimestampNs` trackers, gated on real elapsed time before
+  `_state.value` is updated) — fixed once at this source point (CLAUDE.md
+  Rule 5) rather than patched in every downstream consumer.
+  accelHz/gyroHz/orientationHz are DELIBERATELY left computed from the
+  true RAW arrival rate (unthrottled) so the observed-rate readout stays
+  honest (CLAUDE.md Rule 13) — throttling that too would have hidden this
+  exact bug. Verified on-device: pulled a drive-log CSV before and after
+  the fix — mean inter-tick interval went from ~5-7ms (unthrottled) to a
+  measured 100.2ms (9.98 Hz) after, matching the target almost exactly.
 
 android/app/src/main/kotlin/com/sih26168/idr/sensors/OrientationMath.kt
 Status: IMPLEMENTED

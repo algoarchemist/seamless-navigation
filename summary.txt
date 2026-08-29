@@ -1689,3 +1689,46 @@ test has been run yet; that -- with a deliberate GNSS-denied stretch
 (tunnel/underpass/parking structure) -- is still the needed next step
 before any of the three threshold groups can be called validated rather
 than guessed.
+
+
+REAL BUG FOUND + FIXED (2026-08-29) -- sensor delivery running ~15-20x faster than designed
+---------------------------------------------------------------------------------------------
+User asked "what can be added for smoother working" -- flagged that the
+drive-log tooling from the previous entry had itself already surfaced a
+real number worth investigating: the debug screen's "Accel observed
+rate" consistently read ~199 Hz, not the ~10 Hz PRD.md Section 8/11
+target sensors/SensorRepository.kt requests via registerListener's
+100ms period. Investigated: Android documents that period as a HINT,
+not a guarantee, and this test device (Oppo/ColorOS) was confirmed
+ignoring it, delivering accel/gyro/orientation at up to ~200 Hz
+regardless.
+
+That over-delivery was reaching every downstream consumer completely
+unthrottled: dr/BaselineDeadReckoningRepository's physics integrator +
+ZUPT ran 15-20x more often than designed (wasted CPU/battery, a real
+jank source), Compose recomposed DriveScreen/MapScreen at the same
+rate, and -- the most serious find -- ml/MlVelocityRepository ran full
+ONNX inference on every one of those ticks too, AND fed
+features/FeatureExtractor.kt's rolling window (10 samples, meant to be
+a ~1.0s trailing window matched to ml/train_velocity_model.py's own
+~10 Hz training-data rate) only ~50ms of real elapsed time per update.
+That is a silent train/inference PARITY break, not just a performance
+one -- the on-device feature vectors were being computed over a
+completely different real-world timescale than what the model was
+trained to expect.
+
+Fixed once at the source (sensors/SensorRepository.kt), not patched in
+each consumer separately: the listener now independently throttles
+PUBLISHING each sensor type to real ~10 Hz (separate
+lastPublished*TimestampNs trackers per type, gated on real elapsed
+time), while accelHz/gyroHz/orientationHz are deliberately left
+computed from the true unthrottled raw arrival rate so the "observed
+rate" readout stays honest -- throttling that too would have hidden
+this exact bug from ever surfacing again.
+
+Verified on-device with the same drive-log tooling used to find it:
+pulled a CSV before the fix (1601 ticks in a ~4-8s window) and after
+(261 ticks over a precisely measured 26.05s span) -- mean inter-tick
+interval measured directly from the CSV's own elapsedMs column: 100.2ms
+(9.98 Hz), matching the ~10 Hz target almost exactly. All existing unit
+tests still pass; full debug + release Kotlin compile clean.
