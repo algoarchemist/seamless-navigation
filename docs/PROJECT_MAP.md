@@ -1779,6 +1779,21 @@ Search UI: (changed 2026-08-28, user-requested "search destination like
   same as before. A `BackHandler(enabled = showSearchScreen)` closes the
   search page on system Back (added after, so it wins over
   MainActivity's own tab-level BackHandler while the page is open).
+Automatic tile prefetch (added 2026-08-29, user-requested "smoother
+  working"): the instant `RoutingRepository.computeRoute` succeeds
+  (Start button's onClick), silently calls
+  `routing/OfflineRouteCache.prefetchLiveZoomTiles` on `route.geometry`
+  before the routing UI even updates — separate from, and lighter than,
+  ActiveRouteCard's existing explicit "Download offline" button (see
+  OfflineRouteCache.kt's own doc for the single-zoom-level-vs-full-range
+  tradeoff this was deliberately scoped against, a user decision). Best-
+  effort: a null `mapViewRef` (shouldn't happen — the user is looking at
+  the map to reach this button — but not asserted) just skips the
+  prefetch silently, same "optimization, not a promise" spirit as that
+  function's own silent-failure behavior. Verified on-device by clearing
+  the app's osmdroid tile cache, computing one route, and confirming via
+  a pulled+inspected cache.db that tile rows went from 0 to 24 with the
+  explicit download button never touched.
 Connected to: routing/GeocodingRepository, routing/RoutingRepository,
   routing/OfflineRouteCache, fusion/GeoProjection, ui/screens/SearchScreen
   (new, opened on demand) -> ui/components/ActiveRouteCard/

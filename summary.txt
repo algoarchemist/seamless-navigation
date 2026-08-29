@@ -1732,3 +1732,42 @@ pulled a CSV before the fix (1601 ticks in a ~4-8s window) and after
 interval measured directly from the CSV's own elapsedMs column: 100.2ms
 (9.98 Hz), matching the ~10 Hz target almost exactly. All existing unit
 tests still pass; full debug + release Kotlin compile clean.
+
+
+SLICE 9 (UI/smoothness) — automatic tile pre-fetch for a newly-active route
+-------------------------------------------------------------------------------
+User flagged (from an earlier "how to make the app better" list): map
+browsing along an active route could still stutter on a slow connection,
+since tile pre-fetch only ever happened via the explicit "Download
+offline" button on ActiveRouteCard. Asked to implement automatic
+pre-fetch.
+
+Real tradeoff surfaced before building: an automatic background
+download uses mobile data without the explicit consent an intentional
+button-tap represents, unlike the existing offline-download feature.
+Asked the user to pick a scope rather than assuming one; chose "whole
+route, live-zoom-only" -- silently prefetch the full route corridor the
+instant a route is computed, but at just the ONE zoom level
+StreetMapView actually displays while driving (18), not the wider 14-18
+range the explicit download button uses -- meaningfully less background
+data than a full offline save, while still covering the whole trip.
+
+routing/OfflineRouteCache.kt refactored: both the existing
+downloadRouteTiles (explicit button, full 14-18 range, progress UI) and
+the new prefetchLiveZoomTiles (automatic, single zoom level 18, no
+progress UI, silent on failure) now share one private downloadTiles
+helper wrapping the same CacheManager call -- only the zoom range and
+whether it's user-visible differ. ui/screens/MapScreen.kt's Start button
+now calls prefetchLiveZoomTiles right after a route computes
+successfully, before the routing UI even updates.
+
+Verified end-to-end on-device: cleared the app's entire osmdroid tile
+cache (adb run-as rm -rf), searched + selected a real destination,
+tapped Start, then pulled and inspected the cache's SQLite database
+directly (adb exec-out through Bash, not PowerShell -- PowerShell's `>`
+redirect was found to corrupt binary pulls by prepending a UTF-8 BOM,
+worth remembering for any future binary adb pull). Tile row count went
+from 0 (freshly cleared) to 24 real rows, with the explicit "Download
+offline" button never touched -- confirms the automatic prefetch fires
+and writes real tiles into the exact same cache StreetMapView already
+reads from, with no separate code path.

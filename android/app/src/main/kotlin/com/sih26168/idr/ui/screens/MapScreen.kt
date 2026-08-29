@@ -337,6 +337,29 @@ fun MapScreen(
                                     activeRoute = route
                                     searchQuery = ""
                                     selectedDestination = null
+                                    // User-requested "smoother working"
+                                    // (2026-08-29): silently warms the tile
+                                    // cache for this route's corridor at the
+                                    // live-viewing zoom level, so browsing
+                                    // the map along the route is less likely
+                                    // to stutter waiting on a live tile
+                                    // fetch — separate from, and lighter
+                                    // than, the explicit "Download offline"
+                                    // button on ActiveRouteCard (see
+                                    // OfflineRouteCache.prefetchLiveZoomTiles's
+                                    // own doc for the data-usage tradeoff
+                                    // this was deliberately scoped against).
+                                    // Best-effort: mapViewRef should already
+                                    // be set (the user is looking at the map
+                                    // to have reached this button), but a
+                                    // null skips silently rather than crash —
+                                    // this is an optimization, not a
+                                    // guarantee, same as the function's own
+                                    // silent-failure behavior on a genuine
+                                    // network/cache error.
+                                    mapViewRef?.let { mapView ->
+                                        OfflineRouteCache.prefetchLiveZoomTiles(context, mapView, route.geometry)
+                                    }
                                 }
                             }
                         },

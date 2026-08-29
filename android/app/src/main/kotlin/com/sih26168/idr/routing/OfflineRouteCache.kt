@@ -30,6 +30,21 @@ import org.osmdroid.views.MapView
  *
  * Only one saved route is kept at a time (this trip alone, per the
  * request) — saving a new one overwrites the last.
+ *
+ * [prefetchLiveZoomTiles] (added 2026-08-29, user-requested "smoother
+ * working" — no tile pre-fetch beyond the explicit download button, so
+ * browsing the live map along a route could still stutter on a slow
+ * connection) is a THIRD, separate piece from the two above: an
+ * AUTOMATIC, silent prefetch of the route corridor fired the instant a
+ * route is computed (`MapScreen.kt`, no button tap needed), scoped down
+ * from [downloadRouteTiles]'s full [MIN_ZOOM]..[MAX_ZOOM] range to just
+ * the single zoom level `ui/map/StreetMapView.kt` actually displays while
+ * driving (18) — a deliberately smaller, lighter background download than
+ * the explicit "Download offline" button's guaranteed-offline promise,
+ * since this fires without the user's explicit consent to the data usage
+ * (see that function's own doc for the exact tradeoff this was scoped
+ * against). Both share [downloadTiles], the actual [CacheManager] call —
+ * only the zoom RANGE and whether it's user-visible differ.
  */
 object OfflineRouteCache {
 
@@ -39,10 +54,52 @@ object OfflineRouteCache {
     private const val MIN_ZOOM = 14
     private const val MAX_ZOOM = 18
 
+    /** StreetMapView's own live-viewing zoom (`controller.setZoom(18.0)`) — kept as one named constant so [prefetchLiveZoomTiles] can never silently drift out of sync with what the map actually displays. */
+    private const val LIVE_VIEWING_ZOOM = 18
+
     fun downloadRouteTiles(
         context: Context,
         mapView: MapView,
         routeGeometry: List<GeoPoint>,
+        onProgress: (downloaded: Int, total: Int) -> Unit,
+        onComplete: () -> Unit,
+        onFailed: () -> Unit,
+    ) = downloadTiles(context, mapView, routeGeometry, MIN_ZOOM, MAX_ZOOM, onProgress, onComplete, onFailed)
+
+    /**
+     * Silent, automatic, best-effort — fired once per newly-computed
+     * route (see `MapScreen.kt`'s Start button), no progress UI, and a
+     * failure (no network, tile source rejects bulk caching, etc.) is
+     * swallowed rather than surfaced: this is a "smoother if it works"
+     * optimization layered on top of the map's existing normal on-demand
+     * tile loading, not a promise the way the explicit download button
+     * is — a failure here changes nothing the user would notice (the map
+     * simply falls back to fetching tiles live, exactly like today).
+     * Single zoom level ([LIVE_VIEWING_ZOOM]) rather than
+     * [downloadRouteTiles]'s full range specifically to keep the
+     * automatic/no-consent data usage modest (user-scoped decision,
+     * 2026-08-29 — the wider range was considered and deliberately not
+     * used here).
+     */
+    fun prefetchLiveZoomTiles(context: Context, mapView: MapView, routeGeometry: List<GeoPoint>) {
+        downloadTiles(
+            context = context,
+            mapView = mapView,
+            routeGeometry = routeGeometry,
+            minZoom = LIVE_VIEWING_ZOOM,
+            maxZoom = LIVE_VIEWING_ZOOM,
+            onProgress = { _, _ -> },
+            onComplete = {},
+            onFailed = {},
+        )
+    }
+
+    private fun downloadTiles(
+        context: Context,
+        mapView: MapView,
+        routeGeometry: List<GeoPoint>,
+        minZoom: Int,
+        maxZoom: Int,
         onProgress: (downloaded: Int, total: Int) -> Unit,
         onComplete: () -> Unit,
         onFailed: () -> Unit,
@@ -70,7 +127,7 @@ object OfflineRouteCache {
             }
             override fun onTaskFailed(errors: Int) = onFailed()
         }
-        cacheManager.downloadAreaAsync(context, points, MIN_ZOOM, MAX_ZOOM, callback)
+        cacheManager.downloadAreaAsync(context, points, minZoom, maxZoom, callback)
     }
 
     fun saveRoute(context: Context, route: RouteResult) {
