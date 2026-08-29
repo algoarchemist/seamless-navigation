@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NOT a Figma asset — same honest situation as ic_home.xml: no
+     briefcase/work glyph in the source Figma file, hand-drawn instead of
+     adding material-icons-extended (CLAUDE.md Rule 2). Same 1.6dp
+     round-cap stroke weight as the other hand-drawn icons here. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M4,9L4,19L20,19L20,9Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M9,9L9,6.5A1.5,1.5 0 0,1 10.5,5L13.5,5A1.5,1.5 0 0,1 15,6.5L15,9"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M4,13.5L20,13.5"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

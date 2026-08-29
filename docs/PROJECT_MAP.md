@@ -1618,6 +1618,32 @@ Purpose: PRD.md Section 30 WOW-factor #4 — shows the REAL measured
   internal visibility logic.
 Connected to: fusion/StateEstimator.kt (FusedPositionUiState.driftSummary) -> DriveScreen.kt -> DriftSummaryCard
 
+ui/components/GnssModeChangeBanner.kt
+Status: IMPLEMENTED (new file, 2026-08-29)
+Purpose: User-requested "popup when switching from gnss aided to dead
+  reckoning mode". A transient, non-blocking banner (solid
+  DeadReckoningColor background, white text, auto-dismisses after 4s or
+  on manual X tap) shown inline at the top of ui/screens/
+  StatusOverlayContent.kt — deliberately NOT a blocking AlertDialog,
+  since this app's whole point is honest, UNINTERRUPTED navigation
+  through a GNSS outage (CLAUDE.md Mission); a modal the driver has to
+  dismiss the instant GNSS drops would work against that.
+Important concepts/assumptions: StatusOverlayContent triggers this off
+  gnss/GnssModeRepository's own `lastTransition` (already logged per
+  CLAUDE.md Rule 17), narrowed to `fromMode == TRANSITION && toMode ==
+  DEAD_RECKONING` — the one path into DEAD_RECKONING that genuinely
+  started from GNSS_AIDED (see gnss/GnssOutageDetector.kt's state
+  diagram). A REACQUISITION bail-back also lands in DEAD_RECKONING but
+  is excluded on purpose — it was never GNSS_AIDED to begin with, and
+  showing this on every failed reacquisition attempt during a marginal-
+  GNSS stretch would be noisy, not honest signal. `dismissedTransitionAtMs`
+  (StatusOverlayContent-local state, keyed by the transition's own
+  timestamp) lets the banner re-show on a SECOND real outage later in the
+  same session instead of staying permanently dismissed after the first.
+  Only the GNSS_AIDED -> DEAD_RECKONING direction was requested/built;
+  the symmetric "GNSS reacquired" case is NOT implemented.
+Connected to: gnss/GnssModeRepository.kt (GnssModeUiState.lastTransition) -> StatusOverlayContent.kt -> GnssModeChangeBanner
+
 ui/map/TrackCanvas.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
 Purpose: The map layer — a Compose `Canvas`, NOT a real map SDK
@@ -1703,22 +1729,81 @@ Connected to: routing/GeocodingRepository, routing/RoutingRepository,
 
 ```
 ui/screens/SearchScreen.kt
-Status: IMPLEMENTED (new file, 2026-08-28)
+Status: IMPLEMENTED (new file, 2026-08-28; restyled 2026-08-29)
 Purpose: Full-page destination search, Google Maps' own pattern — opened
   by MapScreen when its collapsed search bar is tapped, covers the whole
   screen rather than drawing a dropdown over the live map. Owns the
   debounced (~500ms, Nominatim's ~1 req/sec usage-policy cap) live
   query/results/error state that used to live inline in MapScreen.
+Restyled 2026-08-29 (user-supplied Google Maps search-screen screenshot,
+  "implement the same in my app"): rounded search pill (back arrow + text
+  field + mic/clear button), a Home/Work quick-access row, and a "Recent"
+  list shown while the query is empty — matching the reference layout.
+  Two pieces needed real data behind them rather than static copies of
+  the screenshot (CLAUDE.md Rule 13):
+   - Home/Work read/write through the new routing/SavedPlacesRepository
+     (SharedPreferences) — a slot is genuinely unset ("Set location") until
+     the user picks a place for it. Tapping an unset slot puts the screen
+     into a `settingSlot` mode: the next result tapped is SAVED to that
+     slot (and also handed back via onResultSelected) instead of just
+     being searched.
+   - "Recent" reads/writes through the new routing/RecentSearchRepository
+     (SharedPreferences + org.json), most-recent-first, capped at 8,
+     recorded whenever a result is picked outside `settingSlot` mode.
+  Two things visible in the reference were deliberately NOT built:
+   - Per-row business-hours status ("Open · Closes 22:00") — Nominatim
+     (this app's only geocoding source) has no opening-hours data to show
+     there, so it's left out rather than invented.
+   - The third "… More" shortcut (opens additional saved lists in real
+     Google Maps) — this app has no additional saved-place concept, so
+     there's nothing for it to open; a non-functional button would be a
+     fake affordance.
+  The mic button uses Android's own `android.speech.RecognizerIntent`
+  (platform API, no new dependency) to launch the system speech-
+  recognition UI and read back its real transcribed text; a device with
+  no speech-recognition app shows a real error (Toast), not a silent
+  no-op. New icons (no material-icons-extended dependency, CLAUDE.md
+  Rule 2 — same reasoning as ic_car.xml/ic_motorcycle.xml/ic_walk.xml):
+  res/drawable/ic_home.xml, ic_work.xml, ic_mic.xml, ic_recent.xml (hand-
+  drawn), ic_place.xml (standard AOSP Material "place" glyph, reused
+  directly rather than pulled in via the extended icon pack).
 Inputs: `initialQuery` (prefills the field, e.g. re-opening on an
   already-picked destination), `onBack`, `onResultSelected`.
 Outputs: calls `onResultSelected(GeocodeResult)` when a result is
   tapped — does not navigate itself; the caller (MapScreen) closes the
   overlay and acts on the result.
-Connected to: routing/GeocodingRepository.search -> SearchScreen ->
+Connected to: routing/GeocodingRepository.search, routing/
+  SavedPlacesRepository, routing/RecentSearchRepository -> SearchScreen ->
   MapScreen (onResultSelected/onBack callbacks only, no shared state)
 Important concepts: no navigation library added (CLAUDE.md Rule 2) —
   this is a plain Composable shown/hidden by a boolean in the caller,
   consistent with every other screen swap in this app.
+```
+
+```
+routing/SavedPlacesRepository.kt
+Status: IMPLEMENTED (new file, 2026-08-29)
+Purpose: Persists the user's own Home/Work locations (SharedPreferences,
+  full-precision lat/lon stored as strings, not Float, to avoid a silent
+  precision loss). A slot (`SavedPlaceSlot.HOME`/`WORK`) reads back null
+  until the user has actually picked a location for it via SearchScreen —
+  never a placeholder or guessed address (CLAUDE.md Rule 13).
+Inputs: `get(context, slot)`, `save(context, slot, GeocodeResult)`.
+Outputs: `GeocodeResult?` per slot.
+Connected to: ui/screens/SearchScreen.kt (only caller)
+```
+
+```
+routing/RecentSearchRepository.kt
+Status: IMPLEMENTED (new file, 2026-08-29)
+Purpose: Persists the user's own past destination picks (SharedPreferences
+  + org.json, most-recent-first, deduped by display name, capped at 8) so
+  SearchScreen's "Recent" section shows real history, not sample data. A
+  corrupt local cache recovers to an empty list (logged) rather than
+  crashing the search screen.
+Inputs: `getRecent(context)`, `add(context, GeocodeResult)`.
+Outputs: `List<GeocodeResult>`, most-recent-first.
+Connected to: ui/screens/SearchScreen.kt (only caller)
 ```
 
 ### ml/

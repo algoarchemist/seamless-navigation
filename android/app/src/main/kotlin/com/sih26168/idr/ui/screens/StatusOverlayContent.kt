@@ -13,6 +13,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -29,6 +30,7 @@ import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.ui.components.DriftSummaryCard
 import com.sih26168.idr.ui.components.FloatingIconButton
+import com.sih26168.idr.ui.components.GnssModeChangeBanner
 import com.sih26168.idr.ui.components.StatusChip
 import com.sih26168.idr.ui.components.VehicleMode
 import com.sih26168.idr.ui.components.VehicleModeSelector
@@ -87,6 +89,28 @@ internal fun StatusOverlayContent(
         GnssMode.REACQUISITION -> ReacquisitionColor
     }
 
+    // User-requested (2026-08-29) "popup when switching from gnss aided to
+    // dead reckoning mode" — keyed off GnssModeRepository's own
+    // `lastTransition` (already logged per CLAUDE.md Rule 17), not a
+    // locally-tracked `gnssState.mode` diff, so this can't drift out of
+    // sync with what actually got logged. Deliberately narrowed to
+    // `fromMode == TRANSITION`: that's the one path into DEAD_RECKONING
+    // that genuinely started from GNSS_AIDED (see GnssOutageDetector's
+    // state diagram doc comment) — REACQUISITION bailing back to
+    // DEAD_RECKONING re-enters the same mode but was never GNSS_AIDED to
+    // begin with, so it's excluded to avoid re-notifying on every failed
+    // reacquisition attempt during a marginal-GNSS stretch.
+    // `dismissedTransitionAtMs` remembers WHICH transition (by timestamp)
+    // was last dismissed/auto-dismissed, so re-entering DEAD_RECKONING a
+    // second time later in the same session re-shows the banner instead
+    // of staying permanently dismissed after the first outage.
+    var dismissedTransitionAtMs by remember { mutableStateOf<Long?>(null) }
+    val transition = gnssState.lastTransition
+    val showModeChangeBanner = transition != null &&
+        transition.toMode == GnssMode.DEAD_RECKONING &&
+        transition.fromMode == GnssMode.TRANSITION &&
+        transition.atMs != dismissedTransitionAtMs
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -132,6 +156,11 @@ internal fun StatusOverlayContent(
                     TextButton(onClick = onShowDebugScreen) {
                         Text(text = "Debug", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
                     }
+                }
+            }
+            if (showModeChangeBanner) {
+                key(transition!!.atMs) {
+                    GnssModeChangeBanner(onDismiss = { dismissedTransitionAtMs = transition.atMs })
                 }
             }
             if (isPipelinePaused) {

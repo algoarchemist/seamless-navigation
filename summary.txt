@@ -1603,3 +1603,41 @@ buttons distinguishable at 96dp). Both fixes confirmed on-device via
 screenshot + a simulated pan gesture: tiles now load fully (real road
 names/buildings visible), a pan gesture stays put instead of snapping
 back, and the new button correctly resumes following and re-centers.
+
+
+SLICE 8 (UI restyle) — Google Maps-style destination search screen
+---------------------------------------------------------------------
+User supplied a screenshot of Google Maps' own destination-search
+screen and asked for the same in this app. Restyled
+ui/screens/SearchScreen.kt to match: a rounded search pill (back arrow +
+text field + mic/clear button), a Home/Work quick-access row, and a
+"Recent" list shown while the query field is empty.
+
+Two pieces of the reference needed real data behind them rather than
+being copied as static decoration: Home/Work now read/write through a
+new routing/SavedPlacesRepository (SharedPreferences) -- a slot reads
+back "Set location" until the user has actually picked one; tapping an
+unset slot switches the screen into a pick-and-save mode instead of
+faking an address. "Recent" now reads/writes through a new
+routing/RecentSearchRepository (SharedPreferences + org.json),
+most-recent-first, capped at 8 real past picks.
+
+Two things visible in the screenshot were deliberately left out rather
+than built as decoration: the per-row business-hours line ("Open .
+Closes 22:00") -- Nominatim, this app's only geocoding source, has no
+opening-hours data to show there -- and the third "... More" shortcut,
+which in real Google Maps opens additional saved lists this app has no
+equivalent of. The mic button is wired to Android's own
+android.speech.RecognizerIntent (a platform API, not a new dependency)
+rather than left as a decorative icon that does nothing when tapped; a
+device with no speech-recognition app shows a real error instead of
+silently failing. New hand-drawn icons (ic_home, ic_work, ic_mic,
+ic_recent) plus the standard AOSP "place" glyph (ic_place) were added
+under res/drawable/ rather than pulling in the material-icons-extended
+dependency for a handful of icons, the same tradeoff ic_car.xml/
+ic_motorcycle.xml/ic_walk.xml already made.
+
+Verified with a Gradle Kotlin compile (no test device available for
+this session) -- functional on-device verification (mic permission
+flow, saved-place persistence across app restarts) is still pending a
+real test pass.
