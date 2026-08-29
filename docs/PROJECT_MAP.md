@@ -639,6 +639,42 @@ Real usage (2026-08-25): used once, live, moving the phone by hand for
   capture is nowhere near enough labeled data to train a classifier on
   — this only proves the tooling works end-to-end.
 
+android/app/src/main/kotlin/com/sih26168/idr/capture/DriveDataLogger.kt
+Status: IMPLEMENTED (new file, 2026-08-29)
+Purpose: A minimal, one-off data-capture tool (CLAUDE.md Rule 18), same
+  spirit as SensorRecorder.kt above but for validating the three
+  "engineering default, not yet validated" threshold groups against a
+  REAL TEST DRIVE instead of gathering ML training data: gnss/
+  GnssQuality.kt's max-accuracy/max-fix-age, gnss/GnssOutageDetector.kt's
+  four dwell constants, and dr/StationaryDetector.kt's ZUPT accel/gyro/
+  dwell thresholds. Logs one CSV row per DR tick (device's real observed
+  sensor rate, e.g. ~135-200 Hz on the test device — faster than the
+  ~10 Hz nominal design target, which only means a richer log, not a
+  problem) combining dr/BaselineDeadReckoningRepository's DeadReckoningState
+  (now also carrying its raw ZUPT inputs/decision, see that class's own
+  doc for why) with gnss/GnssModeRepository's GnssModeUiState at the same
+  instant. NOT part of the shipped demo's state machine (CLAUDE.md
+  Rule 8) — only reads already-real values, same as SensorRecorder.
+  CSV (not JSON) specifically so scripts/analyze_drive_log.py can load it
+  with `pandas.read_csv` directly.
+Inputs: record() takes one tick's GNSS mode/accuracy/fixAge/speed + DR
+  velocity/accel-magnitude/gyro-magnitude/isStationary.
+Outputs: toCsv() — hand-written CSV (no new dependency, CLAUDE.md Rule 2).
+Connected to: MainActivity (Start/Stop drive log button on the debug
+  screen, own deadReckoningRepository.state collector reading
+  gnssModeRepository.state.value synchronously each tick) -> DriveDataLogger
+  -> CSV file (getExternalFilesDir(null), pulled via `adb pull`) ->
+  scripts/analyze_drive_log.py
+Real usage (2026-08-29): smoke-tested indoors (phone handled, not a real
+  drive) for ~35s — 4742 rows, GNSS mode flapped GNSS_AIDED/TRANSITION/
+  DEAD_RECKONING/REACQUISITION repeatedly (expected indoors, same
+  marginal-GNSS behavior already documented elsewhere in this file) and
+  scripts/analyze_drive_log.py parsed the real pulled CSV without error.
+  This only proves the tooling works end-to-end — a real outdoor test
+  drive with an intentional GNSS-denied stretch (tunnel/underpass/
+  parking structure) is still needed before any of the three threshold
+  groups above can be called validated.
+
 android/app/src/test/kotlin/com/sih26168/idr/sensors/SampleRateTest.kt
 Status: IMPLEMENTED
 Purpose: JUnit4 unit test for SampleRate.hzFromDeltaNs and

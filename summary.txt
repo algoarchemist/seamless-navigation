@@ -1641,3 +1641,51 @@ Verified with a Gradle Kotlin compile (no test device available for
 this session) -- functional on-device verification (mic permission
 flow, saved-place persistence across app restarts) is still pending a
 real test pass.
+
+
+SLICE 9 (tooling) — real-drive threshold validation logger + analysis script
+-------------------------------------------------------------------------------
+User asked to validate the three "engineering default, not yet
+validated" threshold groups (gnss/GnssQuality.kt's max-accuracy/max-fix-
+age, gnss/GnssOutageDetector.kt's four hysteresis dwell constants, dr/
+StationaryDetector.kt's ZUPT accel/gyro/dwell thresholds) against a real
+driving test's data, instead of leaving them as guesses. Since no such
+data existed yet, built the tooling needed to capture and analyze it:
+
+Android side: dr/BaselinePhysicsIntegrator.kt's DeadReckoningState now
+also carries the raw ZUPT inputs (linearAccelMagnitudeMps2,
+gyroMagnitudeRadPerSec) and decision (isStationary) that
+BaselineDeadReckoningRepository was already computing every tick but
+previously discarded after using them. A new capture/DriveDataLogger.kt
+(same one-off-tool pattern as the existing capture/SensorRecorder.kt)
+logs one CSV row per DR tick combining that state with GnssModeRepository's
+live GNSS mode/accuracy/fix-age/speed at the same instant. A new
+"Start/Stop drive log" button on the debug screen controls it, saving a
+CSV to the app's external files directory on Stop.
+
+Python side: a new scripts/analyze_drive_log.py (pandas, already a
+dependency via ml/inspect_dataset.py) loads a pulled CSV and reports:
+real GNSS-mode segment durations (comparable against the four dwell
+constants), GNSS accuracy distribution while GNSS_AIDED (comparable
+against GnssQuality's 25m threshold), and a ZUPT confusion-matrix-style
+check -- using GNSS speed while GNSS_AIDED as an INDEPENDENT ground
+truth for "actually moving" (independent of the accel/gyro inputs ZUPT
+itself uses, avoiding a circular validation) -- reporting false-positive
+and false-negative rates for the current 0.25 m/s^2 / 0.05 rad/s / 300ms
+thresholds. The script only reports; it deliberately does not auto-edit
+the Kotlin constants, since trading off ZUPT false-positives against
+false-negatives (or a flappier vs slower GNSS state machine) is a human
+judgment call, not something to silently apply from one script run.
+
+Verified end-to-end on-device: built, installed, ran the drive-log
+button indoors for ~35s (phone handled, not a real drive) -- captured
+4742 rows at the device's real observed sensor rate (~135 Hz for this
+stretch; the device's accel/gyro deliver up to ~200 Hz, faster than the
+~10 Hz nominal design target, which just means a richer log), pulled the
+CSV via adb, and ran scripts/analyze_drive_log.py against the real file
+without error. This proves the tooling works end-to-end -- it does NOT
+constitute the actual validation. HONEST GAP: no real outdoor driving
+test has been run yet; that -- with a deliberate GNSS-denied stretch
+(tunnel/underpass/parking structure) -- is still the needed next step
+before any of the three threshold groups can be called validated rather
+than guessed.

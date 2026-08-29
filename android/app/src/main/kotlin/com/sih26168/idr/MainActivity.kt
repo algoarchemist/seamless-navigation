@@ -28,6 +28,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import com.sih26168.idr.capture.DriveDataLogger
 import com.sih26168.idr.capture.SensorRecorder
 import com.sih26168.idr.dr.BaselineDeadReckoningRepository
 import com.sih26168.idr.dr.DeadReckoningState
@@ -86,6 +87,20 @@ data class RecordingUiState(
     val lastSavedFileName: String? = null,
 )
 
+/**
+ * UI state for capture/DriveDataLogger.kt's Start/Stop button (added
+ * 2026-08-29) — same shape as [RecordingUiState], kept as its own type
+ * rather than reused: this logs GNSS+DR state for threshold validation
+ * during a real test drive, a different real-world scenario from
+ * [RecordingUiState]'s stationary motion-classifier capture, and the two
+ * are started/stopped independently.
+ */
+data class DriveLogUiState(
+    val isLogging: Boolean = false,
+    val recordedCount: Int = 0,
+    val lastSavedFileName: String? = null,
+)
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var sensorRepository: SensorRepository
@@ -121,6 +136,19 @@ class MainActivity : ComponentActivity() {
     private val recordingState: StateFlow<RecordingUiState> = _recordingState.asStateFlow()
     private var recorderCollectJob: Job? = null
     private var lastProcessedRecorderAccelTimestampNs: Long? = null
+
+    // One-off data-capture tool (capture/DriveDataLogger.kt) — gathers a
+    // real test drive's GNSS+DR ticks so the "engineering default, not
+    // yet validated" thresholds in gnss/GnssQuality.kt, gnss/
+    // GnssOutageDetector.kt, and dr/StationaryDetector.kt can be checked
+    // against real data via scripts/analyze_drive_log.py, instead of
+    // staying guesses indefinitely. Same "reads already-real values,
+    // doesn't touch the shipped pipeline" separation as sensorRecorder
+    // above (CLAUDE.md Rule 8).
+    private val driveDataLogger = DriveDataLogger()
+    private val _driveLogState = MutableStateFlow(DriveLogUiState())
+    private val driveLogState: StateFlow<DriveLogUiState> = _driveLogState.asStateFlow()
+    private var driveLogCollectJob: Job? = null
 
     // Must be registered before the activity reaches STARTED — a property
     // initializer (runs during construction, before onCreate) satisfies that.
@@ -175,6 +203,7 @@ class MainActivity : ComponentActivity() {
             val fusedState by stateEstimator.state.collectAsState()
             val mlError by mlModelLoadError.collectAsState()
             val recState by recordingState.collectAsState()
+            val driveLogUiState by driveLogState.collectAsState()
             var showDebugScreen by remember { mutableStateOf(false) }
             var selectedTab by remember { mutableStateOf(AppTab.DRIVE) }
             var isDarkTheme by remember { mutableStateOf(true) }
@@ -213,6 +242,9 @@ class MainActivity : ComponentActivity() {
                         sensorRepository.hasRequiredSensors(),
                         onStartRecording = ::startRecording,
                         onStopRecording = ::stopRecordingAndSave,
+                        driveLogState = driveLogUiState,
+                        onStartDriveLog = ::startDriveLog,
+                        onStopDriveLog = ::stopDriveLogAndSave,
                     )
                 } else {
                     // Slice 8b: three tabs (Drive/Map/History) share the SAME
@@ -356,11 +388,42 @@ class MainActivity : ComponentActivity() {
                 _recordingState.value = _recordingState.value.copy(recordedCount = sensorRecorder.recordedCount)
             }
         }
+
+        // Same always-collecting / gated-by-flag convention as the
+        // recorder loop above — ticks off deadReckoningRepository's own
+        // StateFlow (already ~10 Hz, one emission per real accel sample,
+        // per BaselineDeadReckoningRepository's own dedup guard) rather
+        // than re-deriving a separate tick source. GNSS state is read via
+        // `.value` at the same instant (same synchronous-snapshot pattern
+        // BaselineDeadReckoningRepository itself already uses to read
+        // gnssModeRepository.state.value.mode), so each row is GNSS+DR at
+        // the same moment without needing a `combine()` flow.
+        driveLogCollectJob = lifecycleScope.launch {
+            deadReckoningRepository.state.collect { dr ->
+                if (!_driveLogState.value.isLogging) return@collect
+                val gnss = gnssModeRepository.state.value
+                driveDataLogger.record(
+                    timestampNs = System.nanoTime(),
+                    gnssMode = gnss.mode.name,
+                    gnssFixAccuracyM = gnss.latestFix?.accuracyM,
+                    gnssFixAgeMs = gnss.fixAgeMs,
+                    gnssSpeedMps = gnss.latestFix?.speedMps,
+                    drVelocityEastMps = dr.velocityEastMps,
+                    drVelocityNorthMps = dr.velocityNorthMps,
+                    linearAccelMagnitudeMps2 = dr.linearAccelMagnitudeMps2,
+                    gyroMagnitudeRadPerSec = dr.gyroMagnitudeRadPerSec,
+                    isStationary = dr.isStationary,
+                )
+                _driveLogState.value = _driveLogState.value.copy(recordedCount = driveDataLogger.recordedCount)
+            }
+        }
     }
 
     override fun onPause() {
         recorderCollectJob?.cancel()
         recorderCollectJob = null
+        driveLogCollectJob?.cancel()
+        driveLogCollectJob = null
         stopPipeline()
         super.onPause()
     }
@@ -392,6 +455,27 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    private fun startDriveLog() {
+        driveDataLogger.reset()
+        _driveLogState.value = DriveLogUiState(isLogging = true, recordedCount = 0)
+    }
+
+    // Same off-main-thread write as stopRecordingAndSave() above (CLAUDE.md
+    // Android Rule 7) — CSV, not JSON, specifically so scripts/
+    // analyze_drive_log.py can load it with pandas.read_csv directly.
+    private fun stopDriveLogAndSave() {
+        _driveLogState.value = _driveLogState.value.copy(isLogging = false)
+        val csv = driveDataLogger.toCsv()
+        val fileName = "drive_log_${System.currentTimeMillis()}.csv"
+        lifecycleScope.launch(Dispatchers.IO) {
+            val file = File(getExternalFilesDir(null), fileName)
+            file.writeText(csv)
+            withContext(Dispatchers.Main) {
+                _driveLogState.value = _driveLogState.value.copy(lastSavedFileName = fileName)
+            }
+        }
+    }
 }
 
 @Composable
@@ -406,6 +490,9 @@ private fun IdrSensorScreen(
     hasRequiredSensors: Boolean,
     onStartRecording: () -> Unit,
     onStopRecording: () -> Unit,
+    driveLogState: DriveLogUiState,
+    onStartDriveLog: () -> Unit,
+    onStopDriveLog: () -> Unit,
 ) {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
@@ -433,6 +520,31 @@ private fun IdrSensorScreen(
                     } else {
                         "Not recording. Move the phone after tapping Start — accel/gyro/orientation " +
                             "are logged with millisecond timestamps to a JSON file on Stop."
+                    },
+                )
+
+                // Real test-drive logger (capture/DriveDataLogger.kt,
+                // 2026-08-29) — for validating gnss/GnssQuality.kt,
+                // gnss/GnssOutageDetector.kt, and dr/StationaryDetector.kt's
+                // "engineering default, not yet validated" thresholds
+                // against a real drive: tap Start before setting off, tap
+                // Stop after, then `adb pull` the saved CSV and run
+                // scripts/analyze_drive_log.py against it.
+                Button(onClick = if (driveLogState.isLogging) onStopDriveLog else onStartDriveLog) {
+                    Text(text = if (driveLogState.isLogging) "Stop drive log" else "Start drive log")
+                }
+                Text(
+                    text = if (driveLogState.isLogging) {
+                        "Logging GNSS+DR state for threshold validation... %d ticks captured so far.".format(
+                            driveLogState.recordedCount,
+                        )
+                    } else if (driveLogState.lastSavedFileName != null) {
+                        "Last drive log: %d ticks saved to %s (app-external-files dir)".format(
+                            driveLogState.recordedCount, driveLogState.lastSavedFileName,
+                        )
+                    } else {
+                        "Not logging. Start before a real test drive, Stop after — saves a CSV of " +
+                            "GNSS mode/accuracy/speed + DR velocity/ZUPT state per tick."
                     },
                 )
 

@@ -183,7 +183,14 @@ class BaselineDeadReckoningRepository(
                 // else: Walking mode — leave integrator's own double-integrated
                 // velocity untouched, no vehicle-only lateral suppression.
 
-                _state.value = integrator.currentState()
+                // Publishes the SAME raw ZUPT inputs/decision already computed
+                // above (not recomputed) — see DeadReckoningState's own doc
+                // for why (capture/DriveDataLogger.kt, 2026-08-29).
+                _state.value = integrator.currentState().copy(
+                    linearAccelMagnitudeMps2 = linearAccelMagnitudeMps2.toDouble(),
+                    gyroMagnitudeRadPerSec = gyroMagnitudeRadPerSec.toDouble(),
+                    isStationary = stationary,
+                )
             }
         }
     }
