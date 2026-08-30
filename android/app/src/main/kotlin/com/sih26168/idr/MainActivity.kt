@@ -713,6 +713,32 @@ private fun IdrSensorScreen(
                         text = "^ deterministic vertical-accel threshold, PRD Section 14's Pothole " +
                             "effect — NOT validated against real pothole data (none exists yet).",
                     )
+                    Text(
+                        text = when {
+                            mlState.isAccelerating -> "Longitudinal motion: ACCELERATING this tick"
+                            mlState.isBraking -> "Longitudinal motion: BRAKING this tick"
+                            else -> "Longitudinal motion: neither Accelerating nor Braking this tick"
+                        },
+                    )
+                    Text(
+                        text = "^ deterministic sign/magnitude threshold on the SAME alignment-" +
+                            "corrected forward-acceleration feature the ONNX model consumes — PRD " +
+                            "Section 14's Accelerating/Braking classes (see " +
+                            "LongitudinalMotionClassifier.kt), NOT validated against real labeled data.",
+                    )
+                    Text(
+                        text = if (drState.isTurning) {
+                            "Turning: DETECTED this tick — non-holonomic lateral-velocity " +
+                                "suppression is relaxed while this is true"
+                        } else {
+                            "Turning: not detected this tick"
+                        },
+                    )
+                    Text(
+                        text = "^ deterministic yaw-rate threshold, PRD Section 14's Turning class " +
+                            "(see TurningDetector.kt) — physics-path signal, shown here alongside " +
+                            "the other ML-side motion signals for one combined readout.",
+                    )
                 }
 
                 Text(

@@ -15,6 +15,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+// Engineering default, unvalidated against a real outdoor test drive
+// (CLAUDE.md Rule 13) — see LowPassFilter.kt's own doc for the general
+// filter reasoning; 2.0 Hz is picked to sit comfortably below this
+// project's ~10 Hz sample rate's 5 Hz Nyquist limit while still clearing
+// typical road/engine vibration frequencies, which run well above a few Hz.
+private const val DEFAULT_VIBRATION_FILTER_CUTOFF_HZ = 2.0
+
 /**
  * Slice 3+5 (sensor -> baseline physics velocity/position; dead
  * reckoning state machine + ZUPT + non-holonomic constraint; per
@@ -62,6 +69,20 @@ import kotlinx.coroutines.launch
  * unaffected by a constant offset (it cancels out between two consecutive
  * readings of the same frame), so correcting it here would add complexity
  * with no behavioral effect.
+ *
+ * UPDATE (2026-08-30, PRD.md Section 11's vibration filter — capability
+ * "AI Speed & Vibration Filter"): [accelEastFilter]/[accelNorthFilter]/
+ * [accelUpFilter]/[gyroXFilter]/[gyroYFilter]/[gyroZFilter] low-pass
+ * (`LowPassFilter.kt`) the WORLD-frame linear acceleration and raw gyro
+ * components before they reach [integrator] and the ZUPT magnitude
+ * calculation below — see `LowPassFilter.kt`'s own doc for why this is
+ * scoped to this physics path only, not `ml/MlVelocityRepository.kt`'s
+ * feature-extraction input (ONNX model train/inference parity, CLAUDE.md
+ * Rule 20). Deliberately applied AFTER the pothole discount, not before —
+ * [potholeShockDetector] needs to see the RAW, unfiltered vertical
+ * acceleration spike to detect it at all; low-pass filtering that signal
+ * FIRST would itself partially smooth away the very transient event this
+ * detector exists to catch.
  */
 class BaselineDeadReckoningRepository(
     private val sensorRepository: SensorRepository,
@@ -71,8 +92,15 @@ class BaselineDeadReckoningRepository(
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
     private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
     private val turningDetector: TurningDetector = TurningDetector(),
+    private val vibrationFilterCutoffHz: Double = DEFAULT_VIBRATION_FILTER_CUTOFF_HZ,
 ) {
     private val integrator = BaselinePhysicsIntegrator()
+    private val accelEastFilter = LowPassFilter(vibrationFilterCutoffHz)
+    private val accelNorthFilter = LowPassFilter(vibrationFilterCutoffHz)
+    private val accelUpFilter = LowPassFilter(vibrationFilterCutoffHz)
+    private val gyroXFilter = LowPassFilter(vibrationFilterCutoffHz)
+    private val gyroYFilter = LowPassFilter(vibrationFilterCutoffHz)
+    private val gyroZFilter = LowPassFilter(vibrationFilterCutoffHz)
 
     // 2026-08-26, user-requested Walking mode (explicit override of PRD.md
     // Section 6's Car/Motorcycle-only scope): NonHolonomicConstraint's
@@ -106,6 +134,12 @@ class BaselineDeadReckoningRepository(
     fun start() {
         integrator.reset()
         turningDetector.reset()
+        accelEastFilter.reset()
+        accelNorthFilter.reset()
+        accelUpFilter.reset()
+        gyroXFilter.reset()
+        gyroYFilter.reset()
+        gyroZFilter.reset()
         lastProcessedAccelTimestampNs = null
         _state.value = DeadReckoningState()
 
@@ -153,29 +187,47 @@ class BaselineDeadReckoningRepository(
                 // (forward-ish) accel on a detected vertical shock so it
                 // doesn't get misread as forward acceleration — the Up
                 // component that triggered detection is left untouched.
+                // Checked on the RAW (pre-filter) Up component — see this
+                // class's own doc for why shock detection must see the
+                // signal before the low-pass filter below smooths it.
                 val potholeShockDetectedThisTick = potholeShockDetector.isShock(linearAccel[2])
                 val linearAccelEastMps2 = if (potholeShockDetectedThisTick) 0.0 else linearAccel[0].toDouble()
                 val linearAccelNorthMps2 = if (potholeShockDetectedThisTick) 0.0 else linearAccel[1].toDouble()
 
+                // PRD.md Section 11's low-pass vibration filter — smooths
+                // everyday road/engine-vibration noise out of the signal
+                // BEFORE it reaches the double-integrator and the ZUPT
+                // magnitude check below. See this class's own doc and
+                // LowPassFilter.kt for the full reasoning (physics-path-
+                // only, applied after the pothole discount above).
+                val filteredAccelEastMps2 = accelEastFilter.filter(linearAccelEastMps2, dtSeconds)
+                val filteredAccelNorthMps2 = accelNorthFilter.filter(linearAccelNorthMps2, dtSeconds)
+                val filteredAccelUpMps2 = accelUpFilter.filter(linearAccel[2].toDouble(), dtSeconds)
+                val filteredGyroXRadPerSec = gyroXFilter.filter(gyro.xRadPerSec.toDouble(), dtSeconds)
+                val filteredGyroYRadPerSec = gyroYFilter.filter(gyro.yRadPerSec.toDouble(), dtSeconds)
+                val filteredGyroZRadPerSec = gyroZFilter.filter(gyro.zRadPerSec.toDouble(), dtSeconds)
+
                 integrator.update(
                     dtSeconds = dtSeconds,
-                    linearAccelEastMps2 = linearAccelEastMps2,
-                    linearAccelNorthMps2 = linearAccelNorthMps2,
+                    linearAccelEastMps2 = filteredAccelEastMps2,
+                    linearAccelNorthMps2 = filteredAccelNorthMps2,
                 )
 
                 // ZUPT / non-holonomic correction — see StationaryDetector
                 // and NonHolonomicConstraint docs for the honest limits of
-                // each (constant-velocity motion can look "stationary";
-                // there's no Turning exemption yet).
+                // each (constant-velocity motion can look "stationary").
+                // Computed from the FILTERED components above, not raw —
+                // see DeadReckoningState's own doc for why that's now a
+                // disclosed, real change to what these two fields mean.
                 val linearAccelMagnitudeMps2 = sqrt(
-                    linearAccel[0] * linearAccel[0] +
-                        linearAccel[1] * linearAccel[1] +
-                        linearAccel[2] * linearAccel[2],
+                    filteredAccelEastMps2 * filteredAccelEastMps2 +
+                        filteredAccelNorthMps2 * filteredAccelNorthMps2 +
+                        filteredAccelUpMps2 * filteredAccelUpMps2,
                 )
                 val gyroMagnitudeRadPerSec = sqrt(
-                    gyro.xRadPerSec * gyro.xRadPerSec +
-                        gyro.yRadPerSec * gyro.yRadPerSec +
-                        gyro.zRadPerSec * gyro.zRadPerSec,
+                    filteredGyroXRadPerSec * filteredGyroXRadPerSec +
+                        filteredGyroYRadPerSec * filteredGyroYRadPerSec +
+                        filteredGyroZRadPerSec * filteredGyroZRadPerSec,
                 )
                 // Boot-time ms (not wall-clock) — this only needs a
                 // relative dwell duration, same clock family as the
@@ -183,8 +235,8 @@ class BaselineDeadReckoningRepository(
                 val nowBootTimeMs = accel.timestampNs / 1_000_000L
                 val stationary = stationaryDetector.evaluate(
                     nowBootTimeMs,
-                    linearAccelMagnitudeMps2,
-                    gyroMagnitudeRadPerSec,
+                    linearAccelMagnitudeMps2.toFloat(),
+                    gyroMagnitudeRadPerSec.toFloat(),
                 )
 
                 // PRD.md Section 20's `Turning` exemption: computed every
@@ -221,13 +273,14 @@ class BaselineDeadReckoningRepository(
                 // isn't either (PRD.md Section 20) — only straight-line
                 // vehicle motion gets the non-holonomic correction.
 
-                // Publishes the SAME raw ZUPT inputs/decision already computed
-                // above (not recomputed) — see DeadReckoningState's own doc
-                // for why (capture/DriveDataLogger.kt, 2026-08-29).
+                // Publishes the SAME ZUPT/Turning inputs/decisions already
+                // computed above (not recomputed) — see DeadReckoningState's
+                // own doc for why (capture/DriveDataLogger.kt, 2026-08-29).
                 _state.value = integrator.currentState().copy(
-                    linearAccelMagnitudeMps2 = linearAccelMagnitudeMps2.toDouble(),
-                    gyroMagnitudeRadPerSec = gyroMagnitudeRadPerSec.toDouble(),
+                    linearAccelMagnitudeMps2 = linearAccelMagnitudeMps2,
+                    gyroMagnitudeRadPerSec = gyroMagnitudeRadPerSec,
                     isStationary = stationary,
+                    isTurning = turning,
                 )
             }
         }

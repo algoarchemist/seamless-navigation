@@ -1390,6 +1390,12 @@ Purpose: The Android/coroutine glue wiring SensorRepository +
   AlignmentRepository.reset() directly). See AlignmentRepository's own
   entry for why (ML-load-failure coupling, physics path having no access
   at all).
+  UPDATE (2026-08-30): motion/LongitudinalMotionClassifier.kt added,
+  classifying PRD Section 14's Accelerating/Braking from the SAME
+  accelForwardMps2 already computed for the ONNX feature vector —
+  published as MlVelocityUiState.isAccelerating/isBraking. See that
+  class's own entry.
+  at all).
   Deliberately a SEPARATE, PARALLEL repository to
   BaselineDeadReckoningRepository (CLAUDE.md Rule 5) — does NOT modify
   or replace the physics position integrator; Slice 5's tested physics
@@ -1702,6 +1708,89 @@ Connected to: dr/BaselineDeadReckoningRepository AND
   (that came from BaselinePhysicsIntegrator.update() alone, no
   corrections at all) — it only affects the LIVE corrected display,
   exactly like ZUPT/non-holonomic already do for the physics path.
+
+android/app/src/main/kotlin/com/sih26168/idr/dr/LowPassFilter.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: PRD.md Section 11's "low-pass filtering... to remove high-
+  frequency vibration noise before feature extraction" — capability "AI
+  Speed & Vibration Filter"'s previously entirely-missing filter half. A
+  single-pole (exponential moving average) low-pass filter, standard RC
+  discretization (`alpha = dt / (rc + dt)`, `rc = 1/(2*pi*cutoffHz)`),
+  computed per-sample so it stays correct at this project's real,
+  non-constant ~10Hz sample rate.
+  SCOPE DECISION (narrows PRD.md Section 11's literal "before feature
+  extraction" wording, CLAUDE.md Rule 4/20): wired into
+  dr/BaselineDeadReckoningRepository.kt (physics baseline) ONLY, NOT into
+  ml/FeatureExtractor.kt's input. The already-trained, exported, and
+  MEASURED ONNX velocity model (MAE 1.244 m/s) was trained on
+  ml/feature_extraction.py's windowed statistics over RAW, unfiltered
+  accel/gyro. Filtering that signal now, on-device only, without
+  retraining + re-validating against a matched Python-side filter, would
+  silently shift the live feature distribution away from the training
+  distribution and could quietly regress the already-measured accuracy
+  with no new measurement to catch it. Retraining on filtered features is
+  legitimate future work, not done here. The physics baseline has no such
+  constraint (no trained parameters to keep in sync with), so it's safe
+  and self-contained there. The already-published physics+ZUPT baseline
+  MAE/RMSE in ml/train_velocity_model.py comes from an independent PYTHON
+  re-implementation over IO-VNBD, not this Kotlin class, so this addition
+  doesn't retroactively change that number — it does mean this on-device
+  path no longer matches that Python mirror exactly, which is now the
+  honest, disclosed state.
+Inputs: value (Double), dtSeconds (elapsed time since the previous sample).
+Outputs: Double (the filtered value) — `<= 0.0` dtSeconds returns the raw
+  value unfiltered and resets internal state (first sample / clock reset,
+  same guard convention as BaselinePhysicsIntegrator.update()).
+Important functions/classes: filter(), reset(). Pure Kotlin, no Android
+  dependency, unit-testable (CLAUDE.md Rule 19) — see LowPassFilterTest.kt
+  (7 cases: passthrough on first sample, dt<=0 reset behavior, DC/constant
+  input stays constant, step response moves gradually not instantly,
+  higher cutoff tracks a step faster, oscillating noise is attenuated,
+  reset() clears state).
+Connected to: dr/BaselineDeadReckoningRepository.kt instantiates SIX
+  instances (accelEast/accelNorth/accelUp/gyroX/gyroY/gyroZ, one shared
+  DEFAULT_VIBRATION_FILTER_CUTOFF_HZ=2.0Hz, engineering default
+  unvalidated per CLAUDE.md Rule 13) -> filters WORLD-frame linear accel
+  + raw gyro components AFTER the pothole discount (PotholeShockDetector
+  needs the RAW vertical-accel spike to detect it at all — filtering
+  first would blunt it) and BEFORE BaselinePhysicsIntegrator.update() /
+  the ZUPT magnitude calculation. DeadReckoningState's published
+  linearAccelMagnitudeMps2/gyroMagnitudeRadPerSec are now the FILTERED
+  magnitude, not raw — a real, disclosed change (see that class's own
+  doc and capture/DriveDataLogger.kt's updated field docs, since these
+  feed scripts/analyze_drive_log.py's offline threshold validation).
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/LongitudinalMotionClassifier.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: A DETERMINISTIC stand-in for PRD.md Section 14's `Accelerating`/
+  `Braking` classes — same "no labeled classifier data yet" precedent as
+  MotionStateClassifier.kt/PotholeShockDetector.kt/TurningDetector.kt/
+  PhoneMovedDetector.kt. A simple sign/magnitude threshold on vehicle-
+  frame FORWARD acceleration.
+  ML-path only, same precedent MotionStateClassifier already establishes
+  (CLAUDE.md Rule 3: physics-only baseline stays untouched by any
+  ML-derived signal) — reads ml/MlVelocityRepository.kt's already-
+  computed, alignment-corrected accelForwardMps2 (the SAME vehicle-frame
+  forward-acceleration feature that also feeds the ONNX model), rather
+  than reimplementing a separate vehicle-frame projection for the
+  physics path (which has no alignment-corrected forward/lateral split
+  at all).
+Inputs: accelForwardMps2 (Float).
+Outputs: LongitudinalMotionClassification(isAccelerating, isBraking) —
+  mutually exclusive (opposite-sign thresholds), both false in between.
+Important functions/classes: classify() — minLongitudinalAccelMps2
+  defaults to 1.0 m/s^2 (~0.1g), engineering default, unvalidated against
+  real labeled data (CLAUDE.md Rule 13). Stateless — no dwell/hysteresis,
+  unlike TurningDetector/PhoneMovedDetector, since this only drives a
+  display label (PRD.md Section 14: "context for the state machine...
+  and non-holonomic constraint"), not a correction that would misfire
+  badly on one noisy sample.
+Pure Kotlin, no Android dependency, unit-testable (CLAUDE.md Rule 19) —
+  see LongitudinalMotionClassifierTest.kt (6 cases).
+Connected to: ml/MlVelocityRepository -> LongitudinalMotionClassifier ->
+  MlVelocityUiState.isAccelerating/isBraking ->
+  ui/screens/StatusOverlayContent.kt's motion label AND MainActivity's
+  debug screen.
 
 android/app/src/main/kotlin/com/sih26168/idr/map/MapConstraint.kt
 Status: IMPLEMENTED (2026-08-30)

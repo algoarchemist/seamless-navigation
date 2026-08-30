@@ -7,6 +7,7 @@ import com.sih26168.idr.features.FeatureExtractor
 import com.sih26168.idr.fusion.VelocityBiasCalibrator
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
+import com.sih26168.idr.motion.LongitudinalMotionClassifier
 import com.sih26168.idr.motion.MotionStateClassifier
 import com.sih26168.idr.motion.PotholeShockDetector
 import com.sih26168.idr.sensors.SampleRate
@@ -37,6 +38,10 @@ data class MlVelocityUiState(
     val isCruising: Boolean = false,
     /** PotholeShockDetector fired this tick — forward/lateral accel was discounted before feature extraction. */
     val potholeShockDetectedThisTick: Boolean = false,
+    /** LongitudinalMotionClassifier: vehicle-frame forward acceleration is above the Accelerating threshold this tick. */
+    val isAccelerating: Boolean = false,
+    /** LongitudinalMotionClassifier: vehicle-frame forward acceleration is below the (negative) Braking threshold this tick. */
+    val isBraking: Boolean = false,
 )
 
 // If no GNSS fix has ever been received, fixAgeMs is Long.MAX_VALUE —
@@ -99,9 +104,11 @@ private const val MAX_ELAPSED_SINCE_FIX_S = 999f
  * [com.sih26168.idr.dr.BaselineDeadReckoningRepository] baseline stays
  * untouched by any ML signal, per CLAUDE.md Rule 3); [potholeShockDetector]
  * discounts forward/lateral accel on a detected vertical shock before it
- * reaches [featureExtractor], per PRD.md Section 14's `Pothole` effect.
- * Both are deterministic stand-ins, not the trained PRD Section 14
- * classifier — see their own class docs for why.
+ * reaches [featureExtractor], per PRD.md Section 14's `Pothole` effect;
+ * [longitudinalMotionClassifier] (2026-08-30) flags Accelerating/Braking
+ * from the SAME alignment-corrected `accelForwardMps2` the model
+ * consumes. All three are deterministic stand-ins, not the trained PRD
+ * Section 14 classifier — see their own class docs for why.
  */
 class MlVelocityRepository(
     private val sensorRepository: SensorRepository,
@@ -115,6 +122,7 @@ class MlVelocityRepository(
     private val biasCalibrator: VelocityBiasCalibrator = VelocityBiasCalibrator(),
     private val motionStateClassifier: MotionStateClassifier = MotionStateClassifier(),
     private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
+    private val longitudinalMotionClassifier: LongitudinalMotionClassifier = LongitudinalMotionClassifier(),
 ) {
     private val _state = MutableStateFlow(MlVelocityUiState())
     val state: StateFlow<MlVelocityUiState> = _state.asStateFlow()
@@ -205,6 +213,13 @@ class MlVelocityRepository(
                     (discountedLinearAccelEast * lateralEast + discountedLinearAccelNorth * lateralNorth).toFloat()
                 val accelUpMps2 = linearAccel[2]
 
+                // PRD.md Section 14's Accelerating/Braking classes — a
+                // deterministic sign/magnitude stand-in over the SAME
+                // vehicle-frame forward-acceleration feature the ONNX
+                // model itself consumes (see LongitudinalMotionClassifier's
+                // own doc for why this is ML-path-only).
+                val longitudinalClassification = longitudinalMotionClassifier.classify(accelForwardMps2)
+
                 // Yaw rate: rotate the RAW gyro vector into world frame the
                 // same way as accel (angular velocity transforms as a
                 // vector under a pure rotation) and take its Up component —
@@ -293,6 +308,8 @@ class MlVelocityRepository(
                     positionNorthM = positionState.positionNorthM,
                     isCruising = motionClassification.isCruising,
                     potholeShockDetectedThisTick = potholeShockDetectedThisTick,
+                    isAccelerating = longitudinalClassification.isAccelerating,
+                    isBraking = longitudinalClassification.isBraking,
                 )
             }
         }

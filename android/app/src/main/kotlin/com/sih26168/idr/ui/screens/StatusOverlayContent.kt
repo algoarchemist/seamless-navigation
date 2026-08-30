@@ -81,7 +81,7 @@ internal fun StatusOverlayContent(
     var dismissedDrift by remember(fusedState.driftSummary) { mutableStateOf(false) }
 
     val speedMps = estimateSpeedMps(drState, mlState, gnssState, fusedState)
-    val motionLabel = estimateMotionLabel(mlState, speedMps)
+    val motionLabel = estimateMotionLabel(drState, mlState, speedMps)
     val gnssColor = when (gnssState.mode) {
         GnssMode.GNSS_AIDED -> GnssAidedColor
         GnssMode.TRANSITION -> TransitionColor
@@ -295,13 +295,18 @@ internal fun estimateSpeedMps(
 }
 
 // PRD.md FR10's "current motion class" (see also Section 14) — this
-// project only implements a REAL subset of the full 8-class taxonomy
-// (docs/PROJECT_MAP.md: the trained classifier is still blocked on
-// labeled data). Priority order below shows ONLY what's real: Pothole
-// (motion/PotholeShockDetector) -> Cruising (motion/MotionStateClassifier)
-// -> Stationary -> a generic "Moving" fallback. No Turning/Accelerating/
-// Braking/Phone-Moved label is ever shown, since those detectors don't
-// exist (CLAUDE.md Rule 13).
+// project only implements a REAL subset of the full 8-class taxonomy via
+// deterministic stand-ins (docs/PROJECT_MAP.md: the actual TRAINED
+// classifier is still blocked on labeled data, CLAUDE.md Rule 13).
+// UPDATE (2026-08-30): Turning (dr/TurningDetector.kt, via
+// DeadReckoningState.isTurning) and Accelerating/Braking
+// (motion/LongitudinalMotionClassifier.kt) are now real signals and shown
+// here too — priority order below is a DISPLAY choice (only one label
+// fits), not a claim these are mutually exclusive underlying states (a
+// car can genuinely be turning AND accelerating at once). Phone Moved is
+// deliberately still NOT shown here — it is a one-shot reset EVENT
+// (motion/PhoneMovedDetector.kt, logged via alignment/AlignmentRepository.kt),
+// not an ongoing motion state a per-tick label fits well.
 private const val STATIONARY_SPEED_EPSILON_MPS = 0.3
 
 // BUG FIX (2026-08-26, real outdoor walking test): this used to recompute
@@ -316,8 +321,11 @@ private const val STATIONARY_SPEED_EPSILON_MPS = 0.3
 // other. Threshold also raised from 0.05 to 0.3 m/s — 0.05 was tight
 // enough that ordinary GNSS speed noise near walking pace could still
 // read as "Stationary" even while genuinely moving.
-internal fun estimateMotionLabel(mlState: MlVelocityUiState, speedMps: Float): String = when {
+internal fun estimateMotionLabel(drState: DeadReckoningState, mlState: MlVelocityUiState, speedMps: Float): String = when {
     mlState.potholeShockDetectedThisTick -> "Pothole"
+    drState.isTurning -> "Turning"
+    mlState.isAccelerating -> "Accelerating"
+    mlState.isBraking -> "Braking"
     mlState.isCruising -> "Cruising"
     speedMps < STATIONARY_SPEED_EPSILON_MPS -> "Stationary"
     else -> "Moving"

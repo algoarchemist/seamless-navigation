@@ -14,7 +14,7 @@ no benchmark number here is invented (per `CLAUDE.md` Rule 13).
 | # | Capability | Status | Where |
 |---|---|---|---|
 | 1 | In-Vehicle Alignment & Calibration Engine | 🟡 Yaw shared across both DR paths + auto re-calibration implemented (2026-08-30), see below | `alignment/AlignmentRepository.kt`, `alignment/AlignmentEstimator.kt`, `motion/PhoneMovedDetector.kt` |
-| 2 | AI Speed & Vibration Filter | 🟡 Split — velocity ✅, filter/classifier ❌ | `ml/VelocityModel.kt`, `models/velocity_v1.onnx` / `motion/MotionStateClassifier.kt` |
+| 2 | AI Speed & Vibration Filter | 🟡 Velocity ✅, vibration filter + Accelerating/Braking implemented (2026-08-30), trained classifier still ❌ (blocked on real data), see below | `ml/VelocityModel.kt`, `dr/LowPassFilter.kt`, `motion/LongitudinalMotionClassifier.kt` |
 | 3 | Advanced Map-Matching & Kinematic Constraints | 🟡 MVP-level map snap + Turning exemption implemented (2026-08-30), see below | `map/MapConstraint.kt`, `motion/TurningDetector.kt`, `dr/NonHolonomicConstraint.kt` |
 | 4 | GNSS+INS Fusion Engine | 🟡 Implemented, but classical not AI-based | `fusion/PositionFusion.kt`, `fusion/VelocityBiasCalibrator.kt` |
 | 5 | Seamless GNSS Deficit Handler | 🟡 Implemented, timing unvalidated | `gnss/GnssOutageDetector.kt` |
@@ -70,23 +70,46 @@ the IO-VNBD dataset (`ml/train_velocity_model.py`), exported to ONNX
 13 of 14 held-out trips. Sklearn↔ONNX output parity is verified to
 1e-6 m/s.
 
-**What's missing:**
-- **No actual vibration/noise filter.** There is no low-pass,
-  complementary, or Kalman filtering of raw accelerometer/gyroscope
-  signal anywhere in the codebase. Gravity removal is a fixed constant
-  subtraction. What exists instead is rolling-window statistical
-  features (mean/std) feeding the regressor — useful, but not a signal
-  filter.
-- **The 8-class motion/event classifier is not built.**
-  `train_motion_classifier.py` is explicitly PLANNED, blocked on
-  self-captured labeled data (the public IO-VNBD dataset has no
-  Pothole/Phone-Moved ground truth). Two small deterministic
-  (non-ML) stand-ins exist and are labeled as such in code:
-  `MotionStateClassifier.kt` (Stationary vs. Cruising only) and
-  `PotholeShockDetector.kt` (a single vertical-accel threshold,
-  unvalidated against real pothole data). Together they cover 3 of the
-  8 required classes — Turning, Accelerating, Braking, Phone-Moved
-  detection, and general Moving are not classified at all.
+**What was missing, now closed (2026-08-30):**
+- **Vibration filter.** `dr/LowPassFilter.kt` — a real single-pole
+  (RC-discretized) low-pass filter, wired into
+  `dr/BaselineDeadReckoningRepository.kt` ONLY: filters the WORLD-frame
+  linear-acceleration East/North/Up components and raw gyro X/Y/Z before
+  they reach the double-integrator and the ZUPT magnitude check, applied
+  AFTER the pothole discount (so `PotholeShockDetector` still sees the
+  raw, unsmoothed spike it needs to detect). **Deliberately NOT wired
+  into `ml/FeatureExtractor.kt`'s input** — the already-trained, exported
+  ONNX model (MAE 1.244 m/s, a real measured number) was trained on
+  `ml/feature_extraction.py`'s unfiltered windowed statistics; filtering
+  the live signal now without retraining + re-validating against a
+  matched Python-side filter would silently shift the inference-time
+  feature distribution away from the training distribution (CLAUDE.md
+  Rule 20) and could quietly regress that measured accuracy with nothing
+  to catch it (Rule 13). Retraining on filtered features is legitimate
+  future work, not folded into this change. `DeadReckoningState`'s
+  published `linearAccelMagnitudeMps2`/`gyroMagnitudeRadPerSec` are now
+  the FILTERED magnitude, not raw — a real, disclosed change since these
+  feed `scripts/analyze_drive_log.py`'s offline threshold validation.
+- **Two more classifier classes covered.** `motion/LongitudinalMotionClassifier.kt`
+  (Accelerating/Braking, from the same alignment-corrected
+  `accelForwardMps2` the ONNX model consumes, ML-path only per the same
+  precedent `MotionStateClassifier` already sets) — plus `TurningDetector`
+  and `PhoneMovedDetector` built in earlier Round 2 work — bring
+  deterministic-stand-in coverage from 3/8 to **7 of the 8** PRD §14
+  classes (only general "Moving" has no dedicated detector, but it
+  already renders correctly as the UI's own fallback label). Wired into
+  `ui/screens/StatusOverlayContent.kt`'s motion label and MainActivity's
+  debug screen.
+
+**Still missing relative to the literal ask:** the actual TRAINED 8-class
+Random Forest/GBT classifier (`train_motion_classifier.py`) remains
+correctly blocked on self-captured labeled data (the public IO-VNBD
+dataset has no Pothole/Phone-Moved/Turning/Accelerating/Braking ground
+truth) — no confusion matrix or per-class precision/recall can be
+reported yet (CLAUDE.md Rule 13). Every "classifier" class above is a
+deterministic threshold stand-in, explicitly not the PRD §14 classifier,
+and every threshold used is an engineering default unvalidated against
+real labeled data.
 
 ## 3. Advanced Map-Matching & Kinematic Constraints — 🟡 MVP-level, implemented 2026-08-30
 
@@ -220,15 +243,24 @@ Strategies) first.
    `MotionStateClassifier` (which only covers Stationary/Cruising, not
    Phone Moved) — still needs real "phone picked up mid-drive" data to
    validate its thresholds.
-6. **Add a real low-pass/complementary pre-filter** on raw accel/gyro
+6. ~~**Add a real low-pass/complementary pre-filter** on raw accel/gyro
    ahead of feature extraction (PRD §11), independent of the ML velocity
    model — this is the literal "vibration filter" half of capability #2
-   that's currently missing entirely.
+   that's currently missing entirely.~~ **DONE (2026-08-30)** — see
+   capability #2 above (`dr/LowPassFilter.kt`). Scoped to the physics
+   path only, per that entry's own reasoning (ONNX train/inference parity)
+   — still needs a real outdoor test drive to see whether it measurably
+   reduces the physics baseline's own drift.
 7. **Collect a small self-captured labeled dataset** (Pothole,
-   Phone-Moved, Turning) and train `train_motion_classifier.py`,
-   replacing the two deterministic stand-ins. Report a real confusion
-   matrix and per-class precision/recall as PRD §14 requires — not an
-   assumed one.
+   Phone-Moved, Turning, Accelerating, Braking) and train
+   `train_motion_classifier.py`, replacing ALL FIVE deterministic
+   stand-ins (`MotionStateClassifier`, `PotholeShockDetector`,
+   `TurningDetector`, `PhoneMovedDetector`, `LongitudinalMotionClassifier`
+   — the last two added 2026-08-30). Report a real confusion matrix and
+   per-class precision/recall as PRD §14 requires — not an assumed one.
+   Still blocked exactly as before; deterministic-stand-in COVERAGE grew
+   (7/8 classes now have some real signal), but none of them is the
+   actual trained classifier this item asks for.
 
 ### Decision point — capability #4's "AI-based" wording
 The shipped GNSS+INS fusion is classical/rule-based by deliberate PRD

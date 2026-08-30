@@ -88,6 +88,56 @@ class StatusOverlayContentTest {
             gnssState = GnssModeUiState(mode = GnssMode.GNSS_AIDED, latestFix = fix(speedMps = 15.1f)),
             fusedState = FusedPositionUiState(),
         )
-        assertEquals("Stationary", estimateMotionLabel(MlVelocityUiState(), speed))
+        assertEquals("Stationary", estimateMotionLabel(DeadReckoningState(), MlVelocityUiState(), speed))
+    }
+
+    @Test
+    fun `estimateMotionLabel reads Turning when DeadReckoningState flags it, even while moving`() {
+        val label = estimateMotionLabel(
+            drState = DeadReckoningState(isTurning = true),
+            mlState = MlVelocityUiState(),
+            speedMps = 5f,
+        )
+        assertEquals("Turning", label)
+    }
+
+    @Test
+    fun `estimateMotionLabel reads Accelerating from the ML longitudinal classifier`() {
+        val label = estimateMotionLabel(
+            drState = DeadReckoningState(),
+            mlState = MlVelocityUiState(isAccelerating = true),
+            speedMps = 5f,
+        )
+        assertEquals("Accelerating", label)
+    }
+
+    @Test
+    fun `estimateMotionLabel reads Braking from the ML longitudinal classifier`() {
+        val label = estimateMotionLabel(
+            drState = DeadReckoningState(),
+            mlState = MlVelocityUiState(isBraking = true),
+            speedMps = 5f,
+        )
+        assertEquals("Braking", label)
+    }
+
+    @Test
+    fun `Pothole still takes priority over Turning`() {
+        val label = estimateMotionLabel(
+            drState = DeadReckoningState(isTurning = true),
+            mlState = MlVelocityUiState(potholeShockDetectedThisTick = true),
+            speedMps = 5f,
+        )
+        assertEquals("Pothole", label)
+    }
+
+    @Test
+    fun `Turning still takes priority over Accelerating for the single displayed label`() {
+        val label = estimateMotionLabel(
+            drState = DeadReckoningState(isTurning = true),
+            mlState = MlVelocityUiState(isAccelerating = true),
+            speedMps = 5f,
+        )
+        assertEquals("Turning", label)
     }
 }

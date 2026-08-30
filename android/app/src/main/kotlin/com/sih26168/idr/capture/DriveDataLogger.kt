@@ -21,7 +21,9 @@ data class DriveLogEntry(
     val gnssSpeedMps: Float?,
     val drVelocityEastMps: Double,
     val drVelocityNorthMps: Double,
+    /** UPDATE (2026-08-30): low-pass FILTERED, not raw — see DeadReckoningState's own doc. */
     val linearAccelMagnitudeMps2: Double,
+    /** UPDATE (2026-08-30): low-pass FILTERED, not raw — see DeadReckoningState's own doc. */
     val gyroMagnitudeRadPerSec: Double,
     val isStationary: Boolean,
 )
