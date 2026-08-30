@@ -23,8 +23,8 @@ import com.sih26168.idr.ui.theme.TextSecondary
 import androidx.compose.ui.graphics.Brush
 
 /**
- * The "other window" companion to [DriveScreen]/[MapScreen] (Slice 8b) —
- * inspired by the Figma template's "Timeline" screen (a scrollable list of
+ * The "other window" companion to [MapScreen] (Slice 8b) — inspired by
+ * the Figma template's "Timeline" screen (a scrollable list of
  * past trip events on the same dark/glass visual language). HONEST
  * DEPARTURE from that screen (CLAUDE.md Rule 13): Figma's Timeline shows a
  * fabricated per-day mileage bar chart with no data source behind it. This

@@ -44,11 +44,11 @@ import kotlin.math.hypot
 
 /**
  * The status overlay (GNSS mode/speed/motion/alignment header, vehicle-mode
- * selector + recalibrate + drift-summary footer) shared by BOTH
- * [DriveScreen] (over [com.sih26168.idr.ui.map.TrackCanvas]'s abstract
- * local-meter grid) and [MapScreen] (over
- * [com.sih26168.idr.ui.map.StreetMapView]'s real street tiles, Slice 8b) —
- * extracted here so the two base layers can share one FR10 status
+ * selector + recalibrate + drift-summary footer) used by [MapScreen] (over
+ * [com.sih26168.idr.ui.map.StreetMapView]'s real street tiles, Slice 8b).
+ * Originally shared with the abstract-grid DriveScreen too (removed once
+ * MapScreen's real map made it redundant) — extracted as its own
+ * composable so a future second base layer could share one FR10 status
  * implementation instead of two copies drifting apart. Every value
  * displayed traces back to the same real repositories both screens were
  * already reading (CLAUDE.md Rule 8), unchanged by this extraction.
@@ -74,8 +74,8 @@ internal fun StatusOverlayContent(
     // with ActiveRouteCard/NavigationEtaBar — both occupy the same
     // bottom-of-screen area once a route is active, producing an illegible
     // overlapping mess (confirmed on a real S24 FE). MapScreen now passes
-    // false while a route is active/navigating; DriveScreen (which has no
-    // competing bottom content) keeps the default true.
+    // false while a route is active/navigating; the default true is for
+    // when there is no competing bottom content (no active route).
     showBottomBar: Boolean = true,
 ) {
     var dismissedDrift by remember(fusedState.driftSummary) { mutableStateOf(false) }

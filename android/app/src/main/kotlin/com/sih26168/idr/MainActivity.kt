@@ -46,7 +46,6 @@ import com.sih26168.idr.sensors.SensorUiState
 import com.sih26168.idr.ui.components.AppTab
 import com.sih26168.idr.ui.components.BottomNavBar
 import com.sih26168.idr.ui.components.VehicleMode
-import com.sih26168.idr.ui.screens.DriveScreen
 import com.sih26168.idr.ui.screens.HistoryScreen
 import com.sih26168.idr.ui.screens.MapScreen
 import com.sih26168.idr.ui.theme.IdrTheme
@@ -205,24 +204,24 @@ class MainActivity : ComponentActivity() {
             val recState by recordingState.collectAsState()
             val driveLogUiState by driveLogState.collectAsState()
             var showDebugScreen by remember { mutableStateOf(false) }
-            var selectedTab by remember { mutableStateOf(AppTab.DRIVE) }
+            var selectedTab by remember { mutableStateOf(AppTab.MAP) }
             var isDarkTheme by remember { mutableStateOf(true) }
             var vehicleMode by remember { mutableStateOf<VehicleMode?>(null) }
             BackHandler(enabled = showDebugScreen) { showDebugScreen = false }
             // User-reported bug (2026-08-26): with no BackHandler at all on
-            // the normal Drive/Map/History tabs, the system back button fell
+            // the normal Map/History tabs, the system back button fell
             // straight through to ComponentActivity's default behavior
             // (finish the Activity) from ANY tab, closing the whole app
-            // instead of navigating within it — surprising from Map/History,
-            // where a user expects Back to return to the main Drive screen
+            // instead of navigating within it — surprising from History,
+            // where a user expects Back to return to the main Map screen
             // first, same as any standard bottom-nav app. Only enabled when
-            // NOT already on Drive (and not on the debug screen, which the
-            // handler above already owns) so Back from Drive itself still
+            // NOT already on Map (and not on the debug screen, which the
+            // handler above already owns) so Back from Map itself still
             // falls through to the normal "exit app" behavior — the
             // conventional bottom-nav-app convention (only the true home tab
             // exits on Back).
-            BackHandler(enabled = !showDebugScreen && selectedTab != AppTab.DRIVE) {
-                selectedTab = AppTab.DRIVE
+            BackHandler(enabled = !showDebugScreen && selectedTab != AppTab.MAP) {
+                selectedTab = AppTab.MAP
             }
 
             // Walking mode actually changes DR behavior (see
@@ -247,32 +246,23 @@ class MainActivity : ComponentActivity() {
                         onStopDriveLog = ::stopDriveLogAndSave,
                     )
                 } else {
-                    // Slice 8b: three tabs (Drive/Map/History) share the SAME
-                    // live state above — switching tabs never re-reads a
+                    // Slice 8b: two tabs (Map/History) share the SAME live
+                    // state above — switching tabs never re-reads a
                     // different data source, only changes which screen
-                    // presents it (DriveScreen's abstract grid, MapScreen's
-                    // real street tiles, or HistoryScreen's measured-drift
-                    // log). The tab bar lives outside all three screens so
-                    // each screen's own bottom-aligned content (vehicle
-                    // selector, drift card) never overlaps it.
+                    // presents it (MapScreen's real street tiles, or
+                    // HistoryScreen's measured-drift log). The DRIVE tab's
+                    // abstract local-meter grid (ui/screens/DriveScreen.kt,
+                    // ui/map/TrackCanvas.kt) was removed once MapScreen's
+                    // real map + routing made it redundant — it showed the
+                    // same StatusOverlayContent as MapScreen but over a
+                    // fake grid instead of a real street map, so it added
+                    // no capability MapScreen didn't already have. The tab
+                    // bar lives outside both screens so each screen's own
+                    // bottom-aligned content (vehicle selector, drift card)
+                    // never overlaps it.
                     Column(modifier = Modifier.fillMaxSize()) {
                         Column(modifier = Modifier.weight(1f).fillMaxWidth()) {
                             when (selectedTab) {
-                                AppTab.DRIVE -> DriveScreen(
-                                    drState = drState,
-                                    gnssState = gnssState,
-                                    mlState = mlState,
-                                    fusedState = fusedState,
-                                    mlModelLoadError = mlError,
-                                    isDarkTheme = isDarkTheme,
-                                    isPipelinePaused = isPipelinePaused,
-                                    vehicleMode = vehicleMode,
-                                    onToggleTheme = { isDarkTheme = !isDarkTheme },
-                                    onRecalibrate = { mlVelocityRepository?.resetAlignment() },
-                                    onShowDebugScreen = { showDebugScreen = true },
-                                    onTogglePipelinePause = ::togglePipelinePause,
-                                    onVehicleModeChange = { vehicleMode = it },
-                                )
                                 AppTab.MAP -> MapScreen(
                                     drState = drState,
                                     gnssState = gnssState,
@@ -287,6 +277,7 @@ class MainActivity : ComponentActivity() {
                                     onShowDebugScreen = { showDebugScreen = true },
                                     onTogglePipelinePause = ::togglePipelinePause,
                                     onVehicleModeChange = { vehicleMode = it },
+                                    onActiveRouteGeometryChanged = stateEstimator::setActiveRouteGeometry,
                                 )
                                 AppTab.HISTORY -> HistoryScreen(driftHistory = fusedState.driftHistory)
                             }
@@ -718,6 +709,26 @@ private fun IdrSensorScreen(
                                 fusedState.secondsSinceLastGnssAided,
                             )
                     },
+                )
+                Text(
+                    text = if (fusedState.roadSnapped) {
+                        // distanceToRoadM is always non-null alongside
+                        // roadSnapped=true (StateEstimator sets both
+                        // together) — the ?: 0.0 is just to keep
+                        // String.format's numeric conversion happy with a
+                        // non-null Double type, not a real fallback path.
+                        "Map constraint: SNAPPED this tick, %.1fm from the active route's road " +
+                            "geometry".format(fusedState.distanceToRoadM ?: 0.0)
+                    } else {
+                        "Map constraint: not snapped this tick (no active route, no GNSS anchor " +
+                            "yet, GNSS_AIDED already trusted, moving too slowly for a reliable " +
+                            "heading, or nothing within snap range/heading tolerance)"
+                    },
+                )
+                Text(
+                    text = "^ PRD Section 19 MVP map constraint (map/MapConstraint.kt) — nearest-" +
+                        "road-snap + heading-compatibility check against the active route's real " +
+                        "OSRM geometry, NOT a general road dataset or an HMM map matcher.",
                 )
             }
         }

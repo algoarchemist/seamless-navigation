@@ -65,9 +65,9 @@ import org.osmdroid.views.MapView
  * (`routing/GeocodingRepository.kt`, OpenStreetMap Nominatim), real
  * routing (`routing/RoutingRepository.kt`, OSRM), and real offline
  * caching of that one trip's tiles + route data
- * (`routing/OfflineRouteCache.kt`). Same [StatusOverlayContent] as
- * [DriveScreen] underneath — the GNSS/DR status readout is unaffected by
- * any of this; search/routing is layered on top as its own state machine
+ * (`routing/OfflineRouteCache.kt`). Uses [StatusOverlayContent] for the
+ * GNSS/DR status readout, unaffected by any of this; search/routing is
+ * layered on top as its own state machine
  * (idle -> destination selected -> route active).
  *
  * HONEST LIMITATION (CLAUDE.md Rule 13): no live "next turn in X m"
@@ -91,6 +91,15 @@ fun MapScreen(
     onShowDebugScreen: () -> Unit,
     onTogglePipelinePause: () -> Unit,
     onVehicleModeChange: (VehicleMode) -> Unit,
+    /**
+     * PRD.md Section 19's MVP map constraint: hands the active route's
+     * geometry (or null, once it ends) to `fusion/StateEstimator.kt` so it
+     * can road-snap the fused DR position against it during an outage —
+     * see [com.sih26168.idr.fusion.StateEstimator.setActiveRouteGeometry]'s
+     * own doc for why this crosses from UI state into that lower layer via
+     * a plain callback instead of StateEstimator reading UI state directly.
+     */
+    onActiveRouteGeometryChanged: (List<Pair<Double, Double>>?) -> Unit = {},
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -170,6 +179,15 @@ fun MapScreen(
     // mode, Google Maps-like)": a third state past route-active, entered
     // via ActiveRouteCard's new "Go" button.
     var isNavigating by remember { mutableStateOf(false) }
+
+    // Pushes the active route's geometry (or null, once it ends) down to
+    // fusion/StateEstimator.kt for road-snapping — see
+    // onActiveRouteGeometryChanged's own doc. Converted from osmdroid's
+    // GeoPoint to plain lat/lon pairs here, at the UI boundary, so that
+    // lower layer stays free of a map-library dependency.
+    LaunchedEffect(activeRoute) {
+        onActiveRouteGeometryChanged(activeRoute?.geometry?.map { it.latitude to it.longitude })
+    }
 
     // Live route progress — projects the route geometry into the SAME
     // local East/North frame fusion/StateEstimator.kt's anchor already

@@ -41,19 +41,20 @@ import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.views.overlay.TilesOverlay
 
 /**
- * The REAL street-map counterpart to [TrackCanvas]'s abstract local-meter
- * grid (Slice 8b — added when the user explicitly asked to bring in a real
- * map dependency, CLAUDE.md Rule 2 discussed and overridden for this
- * decision). osmdroid, not Google Maps Compose/Mapbox, specifically
- * because it needs no API key or billing account to show real tiles —
- * nothing here blocks on a credential this project doesn't have.
+ * The real street-map base layer (Slice 8b — added when the user
+ * explicitly asked to bring in a real map dependency, CLAUDE.md Rule 2
+ * discussed and overridden for this decision). osmdroid, not Google Maps
+ * Compose/Mapbox, specifically because it needs no API key or billing
+ * account to show real tiles — nothing here blocks on a credential this
+ * project doesn't have.
  *
- * This file draws real OpenStreetMap street geometry underneath the SAME
+ * This file draws real OpenStreetMap street geometry underneath the
  * current-position marker language (halo/ring/dot,
  * [com.sih26168.idr.ui.theme.AccentBlue]) and outage-anchor dashed line
- * [TrackCanvas] already established from the Figma extraction — it is a
- * different BASE LAYER over identical marker styling, not a competing
- * visual language.
+ * established from the Figma extraction — an abstract local-East/North-
+ * meter grid base layer (ui/map/TrackCanvas.kt) originally established
+ * this same marker styling before it was removed as redundant once this
+ * real map existed.
  *
  * HONEST GAP (CLAUDE.md Rule 13): the standard OSM tile server is
  * rate-limited and meant for light/demo traffic, not production load —
@@ -119,11 +120,8 @@ private fun configureOsmdroid(context: Context) {
 // temporarily if a future tile issue needs re-diagnosing.
 
 /**
- * Draws the exact same halo/ring/dot current-position marker
- * [TrackCanvas] uses, at a real [GeoPoint] on osmdroid's tile canvas
- * instead of at a fixed local-meter screen offset — the one visual
- * language, two different position sources (local meters vs real
- * lat/lon), per this file's own doc comment.
+ * Draws the halo/ring/dot current-position marker at a real [GeoPoint]
+ * on osmdroid's tile canvas, per this file's own doc comment.
  *
  * Plain mutable fields rather than `View.setTag(int, Any)` — osmdroid's
  * `MapView` (like any Android `View`) requires int tag keys to be real
@@ -183,8 +181,7 @@ private class CurrentPositionOverlay : Overlay() {
  *   run and no anchor to project DR meters against), in which case the map
  *   still renders (last-known/default world view) but with no marker.
  * @param anchorLatDeg/[anchorLonDeg] the outage-anchor point the dashed
- *   drift line is drawn back to during DEAD_RECKONING/REACQUISITION —
- *   mirrors [TrackCanvas]'s own anchor-line behavior.
+ *   drift line is drawn back to during DEAD_RECKONING/REACQUISITION.
  * @param isDarkTheme toggles [TilesOverlay.INVERT_COLORS] over the one real
  *   [STREET_TILE_SOURCE] (user-requested light mode, 2026-08-26) — switched
  *   live via a [LaunchedEffect] below if the app's theme toggle changes

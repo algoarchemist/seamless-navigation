@@ -371,15 +371,48 @@ Inputs: velocityEastMps, velocityNorthMps, headingRad (device azimuth).
 Outputs: Pair<Double, Double> (forward-only East/North velocity).
 Important concepts/assumptions: PRD.md Section 20 specifies this in
   VEHICLE frame with a Turning exemption from the ML motion classifier.
-  Neither exists yet, so this is a deliberately simplified WORLD-frame
-  stand-in: it uses the device's own WORLD-frame heading as a proxy for
-  vehicle heading, under the explicit assumption the phone's yaw tracks
-  the vehicle's yaw (true if rigidly mounted; false if loose, e.g. a
-  cup holder). No Turning exemption either, so a genuine turn's real
-  lateral velocity gets suppressed too — an accepted, documented
-  over-constraint for this slice, to be relaxed once Slice 6's motion
-  classifier can flag Turning windows.
-Connected to: BaselineDeadReckoningRepository -> NonHolonomicConstraint -> BaselinePhysicsIntegrator.overrideVelocity
+  The VEHICLE-frame half still doesn't exist (phone-to-vehicle yaw
+  alignment, alignment/AlignmentEstimator.kt, is wired into the ML
+  feature path only, not this physics path — Capability #1's own tracked
+  gap), so this remains a deliberately simplified WORLD-frame stand-in:
+  it uses the device's own WORLD-frame heading as a proxy for vehicle
+  heading, under the explicit assumption the phone's yaw tracks the
+  vehicle's yaw (true if rigidly mounted; false if loose, e.g. a cup
+  holder).
+  UPDATE (2026-08-30): the Turning exemption now exists — see
+  motion/TurningDetector.kt below — applied by this function's one
+  caller (BaselineDeadReckoningRepository), which now skips calling
+  suppressLateralVelocity() on any tick TurningDetector flags as turning,
+  the same way it already skips it for walkingModeEnabled. This
+  function's own signature/tests are unchanged; the exemption is pure
+  caller-side gating.
+Connected to: BaselineDeadReckoningRepository -> NonHolonomicConstraint -> BaselinePhysicsIntegrator.overrideVelocity;
+  BaselineDeadReckoningRepository -> TurningDetector -> (gates whether NonHolonomicConstraint is called at all)
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/TurningDetector.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: A DETERMINISTIC stand-in for PRD.md Section 14's `Turning` class
+  — same "no labeled classifier data yet" precedent as
+  MotionStateClassifier.kt/PotholeShockDetector.kt — built specifically to
+  close NonHolonomicConstraint.kt's PRD.md Section 20 gap ("except during
+  classifier-flagged Turning windows, where the constraint is relaxed").
+  Reuses alignment/YawRate.kt — the SAME WORLD-frame-azimuth-derived
+  yaw-rate signal AlignmentEstimator already computes to detect "moving
+  straight" — inverted to flag Turning ABOVE a threshold instead of
+  straight-line motion below one, so "is this vehicle turning" is
+  answered consistently by one signal everywhere in the pipeline instead
+  of a second, differently-tuned yaw-rate computation.
+Inputs: nowNs, azimuthRad (device WORLD-frame azimuth, per orientation tick).
+Outputs: Boolean (isTurning) — false on the first call (no previous
+  sample to diff against) and on any sample below the threshold.
+Important functions/classes: evaluate() — stateful (tracks previous
+  azimuth/timestamp); reset() clears that history for a new DR session.
+  minYawRateForTurningRadPerSec defaults to 0.15 rad/s (~8.6 deg/s),
+  deliberately above AlignmentEstimator's own 0.1 rad/s "straight"
+  ceiling so there's a small dead zone between the two rather than them
+  touching exactly — engineering default, unvalidated against a real
+  outdoor test drive (CLAUDE.md Rule 13).
+Connected to: BaselineDeadReckoningRepository -> TurningDetector -> gates NonHolonomicConstraint's call site
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/BaselineDeadReckoningRepository.kt
 Status: IMPLEMENTED
@@ -564,7 +597,8 @@ Connected to: SensorRepository -> MainActivity -> IdrSensorScreen (Compose);
   GnssModeRepository -> BaselineDeadReckoningRepository (Slice 5);
   SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity -> IdrSensorScreen (Slice 6);
   GnssModeRepository, BaselineDeadReckoningRepository, MlVelocityRepository -> fusion/StateEstimator -> MainActivity -> IdrSensorScreen (Slice 7);
-  MainActivity -> ui/theme/IdrTheme -> ui/screens/DriveScreen (DEFAULT screen, Slice 8) / IdrSensorScreen (debug toggle)
+  MainActivity -> ui/theme/IdrTheme -> ui/screens/MapScreen (DEFAULT/home tab, since the 2026-08-30 DriveScreen removal) or
+  ui/screens/HistoryScreen (via BottomNavBar) / IdrSensorScreen (debug toggle)
 Important functions/classes: requestLocationPermission
   (registerForActivityResult(RequestPermission()), registered as a
   property initializer since it must be registered before the activity
@@ -614,6 +648,17 @@ Important concepts/assumptions: orientation is displayed in degrees but
   `{ mlVelocityRepository?.resetAlignment() }` straight through to
   DriveScreen, the same nullable-safe-call pattern already used for
   `mlVelocityRepository?.start()`/`stop()`.
+  UPDATE (2026-08-30, user-reported "the drive page ... is doing
+  nothing"): `ui/screens/DriveScreen.kt` and its `ui/map/TrackCanvas.kt`
+  base layer were DELETED — see those files' entries above for the
+  reasoning (MapScreen already provided everything DriveScreen did, over
+  a real map instead of an abstract grid). `AppTab.DRIVE` was removed
+  from `ui/components/BottomNavBar.kt`; `selectedTab` now defaults to
+  `AppTab.MAP`, and the "back button returns to the home tab" BackHandler
+  (originally keyed on `AppTab.DRIVE`) now targets `AppTab.MAP`. The
+  `when (selectedTab)` block in `setContent` lost its `AppTab.DRIVE ->
+  DriveScreen(...)` branch entirely; `onRecalibrate`'s nullable-safe-call
+  pattern is now only wired through to `MapScreen`.
 BUG FOUND + FIXED on real-device verification (2026-08-25): the Column
   had no scroll modifier — as the screen accumulated more readout lines
   across Slices 4/5/6, it silently overflowed past the bottom of the
@@ -1335,14 +1380,16 @@ REAL FINDING from on-device testing (2026-08-25) — position drift
   UPDATE (Slice 8, 2026-08-25): added a public `resetAlignment()`
   wrapping the already-private `alignmentEstimator.reset()` call — PRD.md
   Section 15's "Phone Moved... flag for recalibration" / Section 31/32's
-  manual "hold phone flat, tap to calibrate" fallback. `DriveScreen`'s
-  recalibrate `FloatingIconButton` calls this through `MainActivity`, a
-  second (manual) caller of the same reset the automatic Phone-Moved
-  re-trigger was already built for.
+  manual "hold phone flat, tap to calibrate" fallback. The recalibrate
+  `FloatingIconButton` (StatusOverlayContent.kt, used by MapScreen.kt
+  since 2026-08-30's DriveScreen removal) calls this through
+  `MainActivity`, a second (manual) caller of the same reset the
+  automatic Phone-Moved re-trigger was already built for.
 Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity (Compose UI);
   MlVelocityRepository -> fusion/StateEstimator (Slice 7, reads its position + isAligned);
   motion/MotionStateClassifier, motion/PotholeShockDetector -> MlVelocityRepository (2026-08-25);
-  DriveScreen's recalibrate button -> MainActivity -> MlVelocityRepository.resetAlignment() (Slice 8)
+  StatusOverlayContent's recalibrate button (via MapScreen) -> MainActivity ->
+  MlVelocityRepository.resetAlignment() (Slice 8)
 
 fusion/GeoProjection.kt
 Status: IMPLEMENTED (Slice 7, 2026-08-25)
@@ -1452,9 +1499,36 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   computed that tick for PositionFusion's own blend — no new sensor
   data or geodesy needed, this is a small reduction over data already
   flowing through this class.
+  UPDATE (2026-08-30): PRD.md Section 19's MVP map constraint
+  (map/MapConstraint.kt) is now applied to `fused` here, AFTER
+  PositionFusion.update() but before publishing — a per-tick correction
+  to this class's OUTPUT position only, same architectural boundary
+  PositionFusion's own freeze/interpolate corrections already use; it
+  never writes back into BaselineDeadReckoningRepository/
+  MlVelocityRepository's own accumulated state. `setActiveRouteGeometry`
+  is a plain mutable field (lat/lon pairs, not osmdroid's GeoPoint, to
+  keep this fusion-layer class free of a map-library dependency) set
+  once from ui/screens/MapScreen.kt whenever its active route changes,
+  and read every tick on this same collecting coroutine — the SAME
+  "settable field read on the collecting coroutine" pattern
+  BaselineDeadReckoningRepository.walkingModeEnabled already establishes.
+  The road-geometry-to-local-meters projection is cached against the
+  anchor it was computed with, and only re-projected when the route or
+  the anchor changes, not every ~10Hz tick. Only attempted while
+  gnssState.mode != GNSS_AIDED (a real GPS fix needs no road-snap
+  "correction"), an anchor + active route exist, and DR speed is above
+  0.5 m/s (below that, the physics-velocity-vector heading used for the
+  compatibility check is noise, not signal — same floor
+  ui/screens/MapScreen.kt's own heading-up map rotation fallback
+  already uses). `FusedPositionUiState.roadSnapped`/`distanceToRoadM`
+  expose whether/how far this tick's snap moved the estimate, surfaced
+  in MainActivity's debug screen for demo honesty (CLAUDE.md Rule 13) —
+  not shown as a separate map overlay, to avoid growing MapScreen's UI
+  surface for what is fundamentally a debug/verification signal.
 Connected to: GnssModeRepository, BaselineDeadReckoningRepository,
   MlVelocityRepository -> StateEstimator -> MainActivity (Compose UI);
-  fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8)
+  fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8);
+  ui/screens/MapScreen.kt -> StateEstimator.setActiveRouteGeometry() -> map/MapConstraint.snapToRoad() -> FusedPositionUiState.fusedEastM/fusedNorthM
 
 fusion/DriftSummary.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -1534,10 +1608,42 @@ Connected to: dr/BaselineDeadReckoningRepository AND
   corrections at all) — it only affects the LIVE corrected display,
   exactly like ZUPT/non-holonomic already do for the physics path.
 
-MapConstraint.kt
-Status: PLANNED
-Purpose: Snap the estimated position to the nearest plausible road
-  segment (PRD.md Section 19 — MVP-level, not a full map matcher).
+android/app/src/main/kotlin/com/sih26168/idr/map/MapConstraint.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: PRD.md Section 19's MVP-level map constraint — nearest-road-snap
+  plus a heading-compatibility check, explicitly NOT a Hidden Markov
+  Model or general map-matching engine (PRD.md Section 19/CLAUDE.md's
+  "What Not To Build"). Scope reduction from PRD.md Section 19's two
+  listed options: reuses the real OSM/OSRM route geometry this project
+  already fetches for the active route's turn-by-turn directions
+  (routing/RouteModels.kt's RouteResult.geometry) instead of separately
+  fetching a general OSM road dataset for the whole demo area — no new
+  network call, library, or offline dataset (CLAUDE.md Rule 2). Honest
+  tradeoff: only does anything while a route is active.
+Inputs: eastM/northM (WORLD-frame local meters, the pre-snap estimate),
+  headingRad, a List<Segment> (road-geometry edges in the SAME local
+  frame), maxSnapDistanceM (default 30.0 m) and maxHeadingDeltaRad
+  (default 45 deg) — both engineering defaults, unvalidated against a
+  real outdoor test drive (CLAUDE.md Rule 13).
+Outputs: SnapResult(eastM, northM, snapped, distanceToRoadM) — returns
+  the ORIGINAL point unsnapped if no segment is both close enough and
+  heading-compatible.
+Important functions/classes: snapToRoad() — for each segment, projects
+  the point onto it (clamped to the segment, not its infinite line),
+  keeps the nearest segment that also passes the heading check (checked
+  MODULO PI/180 degrees, since a route polyline's point order says
+  nothing about which way traffic flows — a vehicle heading along OR
+  exactly against a segment's stored direction both count as
+  compatible).
+Pure Kotlin, no Android dependency, unit-testable (CLAUDE.md Rule 19) —
+  see MapConstraintTest.kt (8 cases: basic snap, too-far rejection,
+  perpendicular-heading rejection, opposite-heading acceptance,
+  endpoint-clamping, nearest-of-multiple-segments regardless of list
+  order, degenerate-segment skip, no-segments no-op).
+Connected to: fusion/StateEstimator.kt -> MapConstraint.snapToRoad() ->
+  FusedPositionUiState.fusedEastM/fusedNorthM (only while GNSS isn't
+  already trusted, an active route + GNSS anchor exist, and DR speed is
+  above a reliable-heading floor) — see StateEstimator.kt's own entry.
 
 UI (Compose screens)
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -1592,7 +1698,7 @@ Purpose: `LargeGlassCardRadius` = 40dp is a real, directly-inspected
 ui/theme/IdrTheme.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
 Purpose: Wraps Color.kt/Type.kt into a `MaterialTheme` (`darkColorScheme`).
-Connected to: MainActivity.kt -> IdrTheme -> DriveScreen (IdrSensorScreen,
+Connected to: MainActivity.kt -> IdrTheme -> MapScreen/HistoryScreen (IdrSensorScreen,
   the pre-Slice-8 debug screen, deliberately keeps its OWN internal
   `MaterialTheme` call untouched — nesting is harmless, the inner one wins).
 
@@ -1604,7 +1710,8 @@ Purpose: A REAL exported Figma asset — the "Current Location" icon
   crosshair glyph paths are kept; the Figma export's own background
   circle/blur was dropped since FloatingIconButton.kt supplies its own
   button chrome.
-Connected to: Figma node 16-1601 (exported 2026-08-25) -> ic_recenter.xml -> DriveScreen's recalibrate FloatingIconButton
+Connected to: Figma node 16-1601 (exported 2026-08-25) -> ic_recenter.xml ->
+  StatusOverlayContent's recalibrate FloatingIconButton (via MapScreen)
 
 res/drawable/ic_car.xml
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -1639,13 +1746,15 @@ Important concepts/assumptions: no real backdrop blur is applied —
   floor, so the translucent fill alone approximates Figma's frosted
   look; documented as a simplification, not silently dropped.
 Connected to: ui/theme/Color.kt (GlassSurface/GlassBorder), Shape.kt (GlassCardRadius) -> GlassCard -> DriftSummaryCard, StatusChip (background)
+  (used via StatusOverlayContent.kt -> MapScreen.kt, since 2026-08-30's DriveScreen removal)
 
 ui/components/StatusChip.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
 Purpose: Pill/chip primitive (Figma's pill-button convention,
   generalized into a colored-dot + label status indicator). Used for
   GNSS mode and the motion-state readout (FR10).
-Connected to: DriveScreen.kt -> StatusChip (GNSS mode, speed, motion state)
+Connected to: StatusOverlayContent.kt (used by MapScreen.kt, since 2026-08-30's
+  DriveScreen removal) -> StatusChip (GNSS mode, speed, motion state)
 
 ui/components/FloatingIconButton.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -1653,7 +1762,9 @@ Purpose: Circular floating icon button — Figma's "Navigation Button"
   component (Simple Components frame's search/recenter/settings cluster
   on the map screen), inspected directly: solid `#383E42` circle, 44dp.
   Used once, for the manual recalibrate action (PRD Section 15/31/32).
-Connected to: DriveScreen.kt -> FloatingIconButton(ic_recenter) -> MainActivity's onRecalibrate -> MlVelocityRepository.resetAlignment()
+Connected to: StatusOverlayContent.kt (used by MapScreen.kt, since 2026-08-30's
+  DriveScreen removal) -> FloatingIconButton(ic_recenter) -> MainActivity's
+  onRecalibrate -> MlVelocityRepository.resetAlignment()
 
 ui/components/VehicleModeSelector.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -1665,16 +1776,19 @@ Important concepts/assumptions: LOCAL UI STATE ONLY (CLAUDE.md Rule 8)
   — nothing in the pipeline currently branches on vehicle type; this is
   a real, working control that stores a selection without yet changing
   any physics/ML behavior, and is not pretending to.
-Connected to: DriveScreen.kt -> VehicleModeSelector -> (local state only, no downstream consumer yet)
+Connected to: StatusOverlayContent.kt (used by MapScreen.kt, since 2026-08-30's
+  DriveScreen removal) -> VehicleModeSelector -> (local state only, no downstream consumer yet)
 
 ui/components/DriftSummaryCard.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
 Purpose: PRD.md Section 30 WOW-factor #4 — shows the REAL measured
   drift number fusion/DriftSummary.kt computed, on a GlassCard at the
   large (40dp, directly-inspected) radius. Dismissible — the caller
-  (DriveScreen) owns the dismissed/shown state, this component has no
-  internal visibility logic.
-Connected to: fusion/StateEstimator.kt (FusedPositionUiState.driftSummary) -> DriveScreen.kt -> DriftSummaryCard
+  (StatusOverlayContent) owns the dismissed/shown state, this component
+  has no internal visibility logic.
+Connected to: fusion/StateEstimator.kt (FusedPositionUiState.driftSummary) ->
+  StatusOverlayContent.kt (used by MapScreen.kt, since 2026-08-30's
+  DriveScreen removal) -> DriftSummaryCard
 
 ui/components/GnssModeChangeBanner.kt
 Status: IMPLEMENTED (new file, 2026-08-29)
@@ -1703,66 +1817,46 @@ Important concepts/assumptions: StatusOverlayContent triggers this off
 Connected to: gnss/GnssModeRepository.kt (GnssModeUiState.lastTransition) -> StatusOverlayContent.kt -> GnssModeChangeBanner
 
 ui/map/TrackCanvas.kt
-Status: IMPLEMENTED (Slice 8, 2026-08-25)
-Purpose: The map layer — a Compose `Canvas`, NOT a real map SDK
-  (decision made with the user during planning: zero new dependencies,
-  works fully offline for a demo about GNSS-DENIED navigation, plots
-  directly in the local East/North meters fusion/StateEstimator already
-  produces — no new geodesy needed). Styling borrows Google Maps'
-  LAYOUT pattern (dot-with-ring current position, accuracy halo,
-  polyline route) but renders entirely in the Figma-extracted dark
-  palette — NOT a separate light "Google palette" (an earlier planning
-  draft proposed one; the user explicitly corrected this before
-  implementation — see this file's own doc comment for the full note).
-Important concepts/assumptions: the current-position dot is always
-  drawn at canvas CENTER (a "follow-me" navigation view) — the outage
-  anchor is what moves in screen space as the fused position grows.
-  HONEST SIMPLIFICATION (CLAUDE.md Rule 13): draws a single STRAIGHT
-  line from the outage anchor to the current fused position during
-  DEAD_RECKONING/REACQUISITION, NOT a true curved path — nothing in
-  this codebase accumulates a full position-history polyline
-  (StateEstimator only ever publishes the CURRENT position per tick).
-  This shows the NET divergence since the outage began, not the literal
-  path shape; the real GNSS-vs-DR comparison at reacquisition is exact
-  (see DriftSummaryCard/DriftSummary). `METERS_TO_PIXELS = 8f` is an
-  engineering default, unvalidated (Rule 13).
-Connected to: fusion/StateEstimator.kt (FusedPositionUiState) -> DriveScreen.kt -> TrackCanvas
+Status: REMOVED (2026-08-30) — was IMPLEMENTED (Slice 8, 2026-08-25)
+Purpose (historical): The map layer for the DRIVE tab — a Compose
+  `Canvas`, NOT a real map SDK (decision made with the user during
+  planning: zero new dependencies, works fully offline for a demo about
+  GNSS-DENIED navigation, plots directly in the local East/North meters
+  fusion/StateEstimator already produces — no new geodesy needed).
+  Styling borrowed Google Maps' LAYOUT pattern (dot-with-ring current
+  position, accuracy halo, polyline route) but rendered entirely in the
+  Figma-extracted dark palette. Deleted along with ui/screens/
+  DriveScreen.kt (its only caller) once ui/screens/MapScreen.kt's real
+  street map + routing made the abstract grid redundant — MapScreen
+  already showed the same StatusOverlayContent, so the DRIVE tab added
+  no capability MapScreen didn't already have (user-reported: "the drive
+  page ... is doing nothing").
 
 ui/screens/DriveScreen.kt
-Status: IMPLEMENTED (Slice 8, 2026-08-25)
-Purpose: Slice 8's primary screen (PRD.md Section 22's "single main
-  screen") — composes TrackCanvas as the base layer, a status overlay
-  (StatusChip for GNSS mode/speed/motion state, an alignment readout —
-  FR10), VehicleModeSelector (pre-drive, PRD Section 6), the recalibrate
-  FloatingIconButton, and DriftSummaryCard (shown once real drift data
-  exists). A pure function of already-real state (CLAUDE.md Rule 8) —
-  every value traces back to the same repositories IdrSensorScreen
-  already reads.
-Important functions: `estimateSpeedMps()` — real GNSS speed while
-  GNSS_AIDED, else the ML velocity if that's fusion/StateEstimator's
-  active DR source, else the physics velocity's magnitude (already
-  ZUPT-corrected). `estimateMotionLabel()` — PRD.md FR10's "current
-  motion class," but ONLY the real, implemented subset: Pothole ->
-  Cruising -> Stationary (near-zero ZUPT-corrected physics velocity) ->
-  a generic "Moving" fallback. No Turning/Accelerating/Braking/
-  Phone-Moved label is ever shown, since those detectors don't exist
-  (CLAUDE.md Rule 13) — this project only implements a partial subset
-  of PRD.md Section 14's 8-class taxonomy (see motion/ entries above).
-Connected to: BaselineDeadReckoningRepository, GnssModeRepository,
-  MlVelocityRepository, StateEstimator (all read-only, via MainActivity) ->
-  DriveScreen -> TrackCanvas/StatusChip/VehicleModeSelector/
-  FloatingIconButton/DriftSummaryCard
+Status: REMOVED (2026-08-30) — was IMPLEMENTED (Slice 8, 2026-08-25)
+Purpose (historical): Slice 8's primary screen (PRD.md Section 22's
+  "single main screen") — composed TrackCanvas as the base layer, plus
+  StatusOverlayContent (StatusChip for GNSS mode/speed/motion state, an
+  alignment readout — FR10), VehicleModeSelector, the recalibrate
+  FloatingIconButton, and DriftSummaryCard. Superseded by ui/screens/
+  MapScreen.kt (Slice 8b, real street tiles + routing) which reuses the
+  same StatusOverlayContent — see TrackCanvas.kt's entry above for the
+  removal reason. AppTab.DRIVE was removed from ui/components/
+  BottomNavBar.kt at the same time; MainActivity now defaults to
+  AppTab.MAP and treats MAP as the back-button "home" tab.
 ```
 
 ```
 ui/screens/MapScreen.kt
 Status: IMPLEMENTED
-Purpose: The MAP tab — real OpenStreetMap tiles (ui/map/StreetMapView),
-  destination search + routing (routing/GeocodingRepository Nominatim +
-  routing/RoutingRepository OSRM), and turn-by-turn navigation. Same
-  StatusOverlayContent as DriveScreen underneath; search/routing is
-  layered on top as its own state machine (idle -> destination selected
-  -> route active -> navigating).
+Purpose: The MAP tab (now the app's default/home tab — see
+  MainActivity.kt entry) — real OpenStreetMap tiles
+  (ui/map/StreetMapView), destination search + routing
+  (routing/GeocodingRepository Nominatim + routing/RoutingRepository
+  OSRM), and turn-by-turn navigation, using StatusOverlayContent for the
+  GNSS/DR status readout; search/routing is layered on top as its own
+  state machine (idle -> destination selected -> route active ->
+  navigating).
 Search UI: (changed 2026-08-28, user-requested "search destination like
   Google Maps, redirects to map page when searched") the idle state no
   longer shows a live, typeable dropdown floating over the map tiles.

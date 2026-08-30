@@ -9,19 +9,27 @@ import kotlin.math.sin
  * velocity perpendicular to heading is suppressed toward zero.
  *
  * PRD.md Section 20 specifies this in VEHICLE frame with a `Turning`
- * exemption from the ML motion classifier. Neither exists yet — phone-
- * to-vehicle alignment (PRD.md Section 15) needs a GNSS-aided
- * initialization window (not built), and the motion classifier is
- * Slice 6. This is a deliberately simplified WORLD-frame stand-in for
- * Slice 5: it uses the device's own WORLD-frame heading (azimuth, from
- * OrientationMath/OrientationSample) as a proxy for vehicle heading,
- * under the explicit assumption that the phone's yaw tracks the
- * vehicle's yaw (true for a phone mounted rigidly to the vehicle body;
- * false if it's loose, e.g. free-sliding in a cup holder). It also has
- * no `Turning` exemption, so a genuine turn's real lateral velocity gets
- * suppressed too — an accepted, honestly-documented over-constraint for
- * this slice, to be relaxed once Slice 6's motion classifier can flag
- * `Turning` windows.
+ * exemption from the ML motion classifier. The VEHICLE-frame half still
+ * doesn't exist — phone-to-vehicle yaw alignment
+ * (`alignment/AlignmentEstimator.kt`, PRD.md Section 15) is wired into
+ * the ML feature path only, not this physics path, so this remains a
+ * deliberately simplified WORLD-frame stand-in: it uses the device's own
+ * WORLD-frame heading (azimuth, from OrientationMath/OrientationSample)
+ * as a proxy for vehicle heading, under the explicit assumption that the
+ * phone's yaw tracks the vehicle's yaw (true for a phone mounted rigidly
+ * to the vehicle body; false if it's loose, e.g. free-sliding in a cup
+ * holder).
+ *
+ * The `Turning` exemption DOES now exist —
+ * `motion/TurningDetector.kt`'s deterministic yaw-rate stand-in (same
+ * "no labeled classifier data yet" precedent as
+ * `motion/MotionStateClassifier.kt`) — but is applied by this class's one
+ * caller (`dr/BaselineDeadReckoningRepository.kt`), which simply skips
+ * calling [suppressLateralVelocity] on a tick flagged as turning, rather
+ * than being threaded through this function's own signature. Keeps this
+ * object a pure "always project onto heading" function, matching the
+ * gating style already used for ZUPT/`walkingModeEnabled`-style
+ * exemptions at that same call site.
  *
  * Pure Kotlin, no Android dependency, unit-testable on the plain JVM
  * (CLAUDE.md Rule 19).

@@ -3,6 +3,7 @@ package com.sih26168.idr.dr
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
 import com.sih26168.idr.motion.PotholeShockDetector
+import com.sih26168.idr.motion.TurningDetector
 import com.sih26168.idr.sensors.SampleRate
 import com.sih26168.idr.sensors.SensorRepository
 import kotlin.math.sqrt
@@ -54,6 +55,7 @@ class BaselineDeadReckoningRepository(
     private val scope: CoroutineScope,
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
     private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
+    private val turningDetector: TurningDetector = TurningDetector(),
 ) {
     private val integrator = BaselinePhysicsIntegrator()
 
@@ -88,6 +90,7 @@ class BaselineDeadReckoningRepository(
 
     fun start() {
         integrator.reset()
+        turningDetector.reset()
         lastProcessedAccelTimestampNs = null
         _state.value = DeadReckoningState()
 
@@ -169,9 +172,17 @@ class BaselineDeadReckoningRepository(
                     gyroMagnitudeRadPerSec,
                 )
 
+                // PRD.md Section 20's `Turning` exemption: computed every
+                // tick (not just when about to gate on it) so TurningDetector's
+                // internal previous-azimuth/timestamp tracking never misses a
+                // sample and reports a falsely huge yaw rate on the next tick
+                // it IS consulted — same reasoning YawRate/AlignmentEstimator
+                // already document for their own every-tick evaluate() calls.
+                val turning = turningDetector.evaluate(orientation.timestampNs, orientation.azimuthRad)
+
                 if (stationary) {
                     integrator.overrideVelocity(0.0, 0.0)
-                } else if (!walkingModeEnabled) {
+                } else if (!walkingModeEnabled && !turning) {
                     val preConstraint = integrator.currentState()
                     val (forwardEastMps, forwardNorthMps) = NonHolonomicConstraint.suppressLateralVelocity(
                         velocityEastMps = preConstraint.velocityEastMps,
@@ -180,8 +191,12 @@ class BaselineDeadReckoningRepository(
                     )
                     integrator.overrideVelocity(forwardEastMps, forwardNorthMps)
                 }
-                // else: Walking mode — leave integrator's own double-integrated
-                // velocity untouched, no vehicle-only lateral suppression.
+                // else: Walking mode, or a genuine turn in progress — leave
+                // the integrator's own double-integrated velocity untouched.
+                // Walking mode's lateral motion isn't sensor noise (a
+                // pedestrian can strafe); a turn's real lateral velocity
+                // isn't either (PRD.md Section 20) — only straight-line
+                // vehicle motion gets the non-holonomic correction.
 
                 // Publishes the SAME raw ZUPT inputs/decision already computed
                 // above (not recomputed) — see DeadReckoningState's own doc
