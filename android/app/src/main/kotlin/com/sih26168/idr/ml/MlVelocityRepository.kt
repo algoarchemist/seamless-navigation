@@ -1,6 +1,6 @@
 package com.sih26168.idr.ml
 
-import com.sih26168.idr.alignment.AlignmentEstimator
+import com.sih26168.idr.alignment.AlignmentRepository
 import com.sih26168.idr.dr.StationaryDetector
 import com.sih26168.idr.dr.WorldFrameAcceleration
 import com.sih26168.idr.features.FeatureExtractor
@@ -51,9 +51,17 @@ private const val MAX_ELAPSED_SINCE_FIX_S = 999f
 /**
  * Slice 6 (ML inference wired in, per CLAUDE.md's slice order): the
  * Android/coroutine glue connecting SensorRepository + GnssModeRepository's
- * streams to AlignmentEstimator, FeatureExtractor, and VelocityModel,
- * republishing the live ML-predicted velocity AND (as of this change)
- * an ML-driven WORLD-frame position estimate as its own StateFlow.
+ * streams to FeatureExtractor and VelocityModel, republishing the live
+ * ML-predicted velocity AND (as of this change) an ML-driven WORLD-frame
+ * position estimate as its own StateFlow.
+ *
+ * UPDATE: phone-to-vehicle yaw alignment is no longer owned here — it now
+ * lives in [com.sih26168.idr.alignment.AlignmentRepository], a SHARED
+ * estimate also read by dr/BaselineDeadReckoningRepository.kt (see that
+ * repository's own doc and AlignmentRepository's for why: this class used
+ * to be alignment tracking's only home, which meant it silently stopped
+ * existing whenever the ONNX model failed to load, and the physics path
+ * had no access to it at all).
  *
  * Deliberately a SEPARATE, PARALLEL repository to
  * BaselineDeadReckoningRepository (CLAUDE.md Rule 5) — it does NOT
@@ -100,7 +108,7 @@ class MlVelocityRepository(
     private val gnssModeRepository: GnssModeRepository,
     private val velocityModel: VelocityModel,
     private val scope: CoroutineScope,
-    private val alignmentEstimator: AlignmentEstimator = AlignmentEstimator(),
+    private val alignmentRepository: AlignmentRepository,
     private val featureExtractor: FeatureExtractor = FeatureExtractor(),
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
     private val positionIntegrator: MlPositionIntegrator = MlPositionIntegrator(),
@@ -144,12 +152,12 @@ class MlVelocityRepository(
                     positionIntegrator.reset()
                 }
 
-                val alignment = alignmentEstimator.evaluate(
-                    nowNs = accel.timestampNs,
-                    azimuthRad = orientation.azimuthRad,
-                    gnssBearingDeg = fix?.bearingDeg,
-                    gnssSpeedMps = fix?.speedMps,
-                )
+                // Shared alignment estimate (alignment/AlignmentRepository.kt) —
+                // the SAME AlignmentEstimator instance
+                // dr/BaselineDeadReckoningRepository.kt also reads, so both
+                // DR paths agree on one real yaw offset instead of each
+                // maintaining its own independent estimate.
+                val alignment = alignmentRepository.state.value
 
                 // WORLD-frame linear acceleration — reuses Slice 3's
                 // already-tested rotation + gravity-removal.
@@ -293,20 +301,5 @@ class MlVelocityRepository(
     fun stop() {
         collectJob?.cancel()
         collectJob = null
-    }
-
-    /**
-     * PRD.md Section 15's "Ongoing validation... Phone Moved... flag for
-     * recalibration" / Section 31/32's manual "hold phone flat, tap to
-     * calibrate" fallback — Slice 8's recalibrate button calls this
-     * through MainActivity. Discards the accumulated yaw-alignment
-     * estimate so [alignmentEstimator] re-converges from scratch on the
-     * next sustained straight-line GNSS-aided segment, exactly like the
-     * automatic "Phone Moved" re-trigger AlignmentEstimator.reset() was
-     * already built for (see that class's doc) — this is just a second,
-     * manual caller of the same reset.
-     */
-    fun resetAlignment() {
-        alignmentEstimator.reset()
     }
 }

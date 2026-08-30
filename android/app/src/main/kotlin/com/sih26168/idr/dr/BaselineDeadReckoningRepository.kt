@@ -1,5 +1,6 @@
 package com.sih26168.idr.dr
 
+import com.sih26168.idr.alignment.AlignmentRepository
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
 import com.sih26168.idr.motion.PotholeShockDetector
@@ -48,11 +49,25 @@ import kotlinx.coroutines.launch
  * the UI here (see MainActivity's ML section instead) — applying the same
  * discount twice on screen for what is fundamentally one event would be
  * redundant.
+ *
+ * UPDATE (PRD.md Section 15's phone-to-vehicle YAW alignment, previously
+ * ML-feature-path-only): [alignmentRepository] is the SAME shared
+ * [com.sih26168.idr.alignment.AlignmentRepository]
+ * [com.sih26168.idr.ml.MlVelocityRepository] also reads. Its yaw offset
+ * now corrects the heading passed to [NonHolonomicConstraint] below —
+ * closing the documented gap where that constraint used raw device
+ * azimuth as its vehicle-heading proxy unconditionally, even after real
+ * alignment had converged for the ML path. [TurningDetector] deliberately
+ * still uses RAW device azimuth (not alignment-corrected) — yaw RATE is
+ * unaffected by a constant offset (it cancels out between two consecutive
+ * readings of the same frame), so correcting it here would add complexity
+ * with no behavioral effect.
  */
 class BaselineDeadReckoningRepository(
     private val sensorRepository: SensorRepository,
     private val gnssModeRepository: GnssModeRepository,
     private val scope: CoroutineScope,
+    private val alignmentRepository: AlignmentRepository,
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
     private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
     private val turningDetector: TurningDetector = TurningDetector(),
@@ -183,11 +198,19 @@ class BaselineDeadReckoningRepository(
                 if (stationary) {
                     integrator.overrideVelocity(0.0, 0.0)
                 } else if (!walkingModeEnabled && !turning) {
+                    // PRD.md Section 15's yaw alignment, corrected here for
+                    // the first time in this path — falls back to raw
+                    // device azimuth (yaw offset 0) before alignment
+                    // converges, the SAME accepted approximation
+                    // ml/MlVelocityRepository.kt already uses for its own
+                    // feature path.
+                    val vehicleHeadingRad = orientation.azimuthRad -
+                        (alignmentRepository.state.value.yawOffsetRad ?: 0f)
                     val preConstraint = integrator.currentState()
                     val (forwardEastMps, forwardNorthMps) = NonHolonomicConstraint.suppressLateralVelocity(
                         velocityEastMps = preConstraint.velocityEastMps,
                         velocityNorthMps = preConstraint.velocityNorthMps,
-                        headingRad = orientation.azimuthRad,
+                        headingRad = vehicleHeadingRad,
                     )
                     integrator.overrideVelocity(forwardEastMps, forwardNorthMps)
                 }

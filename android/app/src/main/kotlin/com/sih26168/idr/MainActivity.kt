@@ -28,6 +28,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import com.sih26168.idr.alignment.AlignmentRepository
 import com.sih26168.idr.capture.DriveDataLogger
 import com.sih26168.idr.capture.SensorRecorder
 import com.sih26168.idr.dr.BaselineDeadReckoningRepository
@@ -106,6 +107,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var deadReckoningRepository: BaselineDeadReckoningRepository
     private lateinit var locationRepository: LocationRepository
     private lateinit var gnssModeRepository: GnssModeRepository
+    private lateinit var alignmentRepository: AlignmentRepository
     private lateinit var stateEstimator: StateEstimator
     private var mlVelocityRepository: MlVelocityRepository? = null
     private var velocityModel: VelocityModel? = null
@@ -172,12 +174,30 @@ class MainActivity : ComponentActivity() {
         // GnssModeRepository must exist before BaselineDeadReckoningRepository —
         // Slice 5 wires the DR odometer's reset behavior to the GNSS mode.
         gnssModeRepository = GnssModeRepository(locationRepository, lifecycleScope)
-        deadReckoningRepository = BaselineDeadReckoningRepository(sensorRepository, gnssModeRepository, lifecycleScope)
+        // PRD.md Section 15's phone-to-vehicle yaw alignment — ONE shared
+        // instance, constructed before AND passed into both DR paths below,
+        // so physics and ML agree on a single real alignment estimate
+        // instead of each tracking (or, previously, only the ML path
+        // tracking) its own. See AlignmentRepository's own doc for why this
+        // used to live privately inside MlVelocityRepository.
+        alignmentRepository = AlignmentRepository(sensorRepository, gnssModeRepository, lifecycleScope)
+        deadReckoningRepository = BaselineDeadReckoningRepository(
+            sensorRepository,
+            gnssModeRepository,
+            lifecycleScope,
+            alignmentRepository,
+        )
 
         try {
             val model = VelocityModel.loadFromAssets(applicationContext)
             velocityModel = model
-            mlVelocityRepository = MlVelocityRepository(sensorRepository, gnssModeRepository, model, lifecycleScope)
+            mlVelocityRepository = MlVelocityRepository(
+                sensorRepository,
+                gnssModeRepository,
+                model,
+                lifecycleScope,
+                alignmentRepository,
+            )
         } catch (e: Exception) {
             // Loading a bundled asset / building an ONNX session can fail
             // in ways specific to the model file (missing, truncated,
@@ -229,7 +249,7 @@ class MainActivity : ComponentActivity() {
             // this is the one place that live selection reaches the
             // repository, same "Compose state -> plain mutable field on a
             // non-Composable repository" pattern onRecalibrate already uses
-            // for mlVelocityRepository.resetAlignment().
+            // for alignmentRepository.reset().
             LaunchedEffect(vehicleMode) {
                 deadReckoningRepository.walkingModeEnabled = vehicleMode == VehicleMode.WALKING
             }
@@ -273,7 +293,7 @@ class MainActivity : ComponentActivity() {
                                     isPipelinePaused = isPipelinePaused,
                                     vehicleMode = vehicleMode,
                                     onToggleTheme = { isDarkTheme = !isDarkTheme },
-                                    onRecalibrate = { mlVelocityRepository?.resetAlignment() },
+                                    onRecalibrate = alignmentRepository::reset,
                                     onShowDebugScreen = { showDebugScreen = true },
                                     onTogglePipelinePause = ::togglePipelinePause,
                                     onVehicleModeChange = { vehicleMode = it },
@@ -305,6 +325,7 @@ class MainActivity : ComponentActivity() {
         } else {
             requestLocationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
         }
+        alignmentRepository.start()
         deadReckoningRepository.start()
         mlVelocityRepository?.start()
         stateEstimator.start()
@@ -319,9 +340,10 @@ class MainActivity : ComponentActivity() {
     private fun stopPipeline() {
         stateEstimator.stop()
         mlVelocityRepository?.stop()
+        deadReckoningRepository.stop()
+        alignmentRepository.stop()
         gnssModeRepository.stop()
         locationRepository.stop()
-        deadReckoningRepository.stop()
         sensorRepository.stop()
     }
 

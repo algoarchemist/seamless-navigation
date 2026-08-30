@@ -296,10 +296,14 @@ Purpose: Pure-Kotlin (no android.* import) math to rotate a raw DEVICE-
   motion-caused linear acceleration. Explicitly WORLD frame, NOT vehicle
   frame (CLAUDE.md Rule 9/14) — works regardless of phone mounting,
   which is exactly why it's in-scope before phone-to-vehicle alignment
-  existed. UPDATE (Slice 6): AlignmentEstimator.kt is now IMPLEMENTED,
-  but only feeds MlVelocityRepository's ML feature path — this file
-  (and BaselineDeadReckoningRepository's physics position estimate) are
-  still deliberately alignment-free, per Slice 5's original design.
+  existed. UPDATE (Slice 6): AlignmentEstimator.kt is now IMPLEMENTED —
+  this file itself remains deliberately alignment-free (it only produces
+  WORLD-frame acceleration; the alignment-corrected heading is applied
+  downstream, by whichever caller projects onto a heading — see
+  dr/NonHolonomicConstraint.kt and ml/MlVelocityRepository.kt's own
+  forward/lateral projection). UPDATE (2026-08-30): that downstream
+  correction now reaches BOTH callers, not just the ML feature path — see
+  alignment/AlignmentRepository.kt.
 Inputs: device-frame accel (x, y, z, m/s^2) + rotationMatrixDeviceToWorld
   (List<Float>, 9 elements, from OrientationSample).
 Outputs: WORLD-frame linear acceleration (East, North, Up components,
@@ -386,8 +390,15 @@ Important concepts/assumptions: PRD.md Section 20 specifies this in
   the same way it already skips it for walkingModeEnabled. This
   function's own signature/tests are unchanged; the exemption is pure
   caller-side gating.
+  UPDATE (2026-08-30): the heading passed to suppressLateralVelocity() is
+  now alignment-corrected (device azimuth minus AlignmentRepository's
+  shared yaw offset), not raw device azimuth unconditionally — see
+  alignment/AlignmentRepository.kt and this file's own doc for the full
+  reasoning. This function's signature is still unchanged; only what its
+  one caller passes in changed.
 Connected to: BaselineDeadReckoningRepository -> NonHolonomicConstraint -> BaselinePhysicsIntegrator.overrideVelocity;
-  BaselineDeadReckoningRepository -> TurningDetector -> (gates whether NonHolonomicConstraint is called at all)
+  BaselineDeadReckoningRepository -> TurningDetector -> (gates whether NonHolonomicConstraint is called at all);
+  AlignmentRepository -> BaselineDeadReckoningRepository -> (corrects the heading NonHolonomicConstraint projects onto)
 
 android/app/src/main/kotlin/com/sih26168/idr/motion/TurningDetector.kt
 Status: IMPLEMENTED (2026-08-30)
@@ -1170,9 +1181,82 @@ Important concepts/assumptions: engineering-default thresholds
   validated against a real test drive (CLAUDE.md Rule 13). Explicit
   limitations matching PRD.md Section 15's own: assumes at least one
   clean straight-line moving segment with GNSS near trip start; does
-  not re-estimate while GNSS is unavailable; no "Phone Moved"
-  re-trigger yet.
-Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> AlignmentEstimator
+  not re-estimate while GNSS is unavailable.
+  UPDATE (2026-08-30): reset() IS now invoked automatically — see
+  alignment/AlignmentRepository.kt below, which also moved this class's
+  one caller from being MlVelocityRepository-only to a shared repository
+  both DR paths read.
+Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository -> AlignmentEstimator
+
+android/app/src/main/kotlin/com/sih26168/idr/alignment/AlignmentRepository.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: The Android/coroutine glue that turns the pure AlignmentEstimator
+  into a live, SHARED estimate — PRD.md Section 15. PREVIOUSLY this
+  estimation ran privately inside ml/MlVelocityRepository.kt alone, which
+  meant (a) it silently stopped existing whenever the ONNX model failed
+  to load (MainActivity only constructs MlVelocityRepository on a
+  successful model load) even though alignment has nothing to do with ML
+  inference, and (b) dr/BaselineDeadReckoningRepository.kt's physics path
+  had no access to it at all, so dr/NonHolonomicConstraint.kt used raw
+  device azimuth as its vehicle-heading proxy unconditionally. Extracted
+  as its own repository, driven only by SensorRepository (orientation)
+  and GnssModeRepository (GNSS bearing/speed) — no ML dependency — so
+  BOTH BaselineDeadReckoningRepository and MlVelocityRepository now read
+  the SAME AlignmentEstimator instance's estimate.
+  Also wires PRD.md Section 15's "Ongoing validation... Phone Moved...
+  triggers re-initialization": motion/PhoneMovedDetector.kt's
+  deterministic pitch/roll-change stand-in resets AlignmentEstimator
+  automatically on a detected remount, logged (CLAUDE.md Rule 17-style
+  traceability) via Log.i, in addition to the existing manual
+  "recalibrate" button (now calling this class's reset() directly instead
+  of reaching through MlVelocityRepository.resetAlignment(), which no
+  longer exists).
+Inputs: SensorRepository.state (orientation), GnssModeRepository.state
+  (GNSS bearing/speed/latestFix).
+Outputs: AlignmentUiState(yawOffsetRad, sampleCount, isAligned) — same
+  three fields AlignmentEstimate already had, republished as this
+  repository's own StateFlow.
+Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository ->
+  dr/BaselineDeadReckoningRepository (vehicle-heading correction for
+  NonHolonomicConstraint) AND ml/MlVelocityRepository (unchanged feature-
+  path correction); MainActivity's "recalibrate" button ->
+  AlignmentRepository.reset(); motion/PhoneMovedDetector ->
+  AlignmentRepository (automatic reset trigger)
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/PhoneMovedDetector.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: A DETERMINISTIC stand-in for PRD.md Section 14's `Phone Moved`
+  class — same "no labeled classifier data yet" precedent as
+  MotionStateClassifier.kt/PotholeShockDetector.kt/TurningDetector.kt.
+  PRD.md Section 15's own basis for alignment is the phone's fixed
+  mounting orientation — this detects a SUSTAINED change in the device's
+  own WORLD-frame pitch/roll (from OrientationSample, already gravity-
+  referenced) relative to a remembered reference orientation, i.e. "the
+  mount itself changed," not just road vibration.
+Inputs: nowMs, pitchRad, rollRad (per orientation tick).
+Outputs: Boolean (moved) — a one-shot edge on the tick a sustained
+  deviation first crosses the dwell threshold; false on the first-ever
+  call (establishes the initial reference) and on any tick below
+  threshold or not yet sustained long enough.
+Important functions/classes: evaluate() — pitch compared with a plain
+  difference (bounded to [-pi/2, pi/2], never wraps); roll compared via a
+  circular difference (atan2(sin(delta), cos(delta))), same wrap-safety
+  technique alignment/YawRate.kt already uses for azimuth deltas.
+  Thresholds: pitchRollChangeThresholdRad defaults to 0.26 rad (~15
+  degrees), minSustainedDeviationMs defaults to 1000ms — both engineering
+  defaults, unvalidated against real "phone picked up mid-drive" data
+  (CLAUDE.md Rule 13). reset() clears the remembered reference.
+Connected to: AlignmentRepository -> PhoneMovedDetector -> (gates AlignmentEstimator.reset())
+
+android/app/src/test/kotlin/com/sih26168/idr/motion/PhoneMovedDetectorTest.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: JUnit4 unit tests for PhoneMovedDetector.evaluate() — first
+  sample only establishes reference; small deviation within threshold;
+  large deviation not yet sustained; large deviation sustained past
+  dwell fires; reference updates after firing so it doesn't immediately
+  refire; a deviation that clears before the dwell elapses resets the
+  streak; roll deviation near the +-pi wrap boundary isn't a false
+  positive; reset() discards the reference.
 
 android/app/src/main/kotlin/com/sih26168/idr/features/{RollingWindow,FeatureExtractor}.kt
 Status: IMPLEMENTED (Slice 6, 2026-08-25)
@@ -1294,11 +1378,19 @@ android/app/src/main/kotlin/com/sih26168/idr/ml/MlVelocityRepository.kt
 Status: IMPLEMENTED (Slice 6, 2026-08-25; position integration added
   2026-08-25 in a follow-up change)
 Purpose: The Android/coroutine glue wiring SensorRepository +
-  GnssModeRepository's streams through AlignmentEstimator,
-  WorldFrameAcceleration (reused from Slice 3/5), FeatureExtractor,
-  VelocityModel, and (follow-up) MlPositionIntegrator, republishing the
-  live ML-predicted velocity AND an ML-driven WORLD-frame position as
-  its own StateFlow. Deliberately a SEPARATE, PARALLEL repository to
+  GnssModeRepository's streams through WorldFrameAcceleration (reused
+  from Slice 3/5), FeatureExtractor, VelocityModel, and (follow-up)
+  MlPositionIntegrator, republishing the live ML-predicted velocity AND
+  an ML-driven WORLD-frame position as its own StateFlow.
+  UPDATE (2026-08-30): alignment estimation moved OUT of this class into
+  alignment/AlignmentRepository.kt (a required constructor param now,
+  not an owned AlignmentEstimator) — this class reads
+  alignmentRepository.state.value each tick instead of driving its own
+  estimator; resetAlignment() was removed (callers now use
+  AlignmentRepository.reset() directly). See AlignmentRepository's own
+  entry for why (ML-load-failure coupling, physics path having no access
+  at all).
+  Deliberately a SEPARATE, PARALLEL repository to
   BaselineDeadReckoningRepository (CLAUDE.md Rule 5) — does NOT modify
   or replace the physics position integrator; Slice 5's tested physics
   pipeline is completely untouched. Both run and display side by side,
@@ -1380,16 +1472,19 @@ REAL FINDING from on-device testing (2026-08-25) — position drift
   UPDATE (Slice 8, 2026-08-25): added a public `resetAlignment()`
   wrapping the already-private `alignmentEstimator.reset()` call — PRD.md
   Section 15's "Phone Moved... flag for recalibration" / Section 31/32's
-  manual "hold phone flat, tap to calibrate" fallback. The recalibrate
-  `FloatingIconButton` (StatusOverlayContent.kt, used by MapScreen.kt
-  since 2026-08-30's DriveScreen removal) calls this through
-  `MainActivity`, a second (manual) caller of the same reset the
-  automatic Phone-Moved re-trigger was already built for.
+  manual "hold phone flat, tap to calibrate" fallback.
+  UPDATE (2026-08-30): `resetAlignment()` REMOVED — alignment now lives
+  in `alignment/AlignmentRepository.kt` (see its own entry), and the
+  recalibrate `FloatingIconButton` (StatusOverlayContent.kt, used by
+  MapScreen.kt since 2026-08-30's DriveScreen removal) calls
+  `AlignmentRepository.reset()` directly through `MainActivity` instead
+  of reaching through this class.
 Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity (Compose UI);
   MlVelocityRepository -> fusion/StateEstimator (Slice 7, reads its position + isAligned);
   motion/MotionStateClassifier, motion/PotholeShockDetector -> MlVelocityRepository (2026-08-25);
+  alignment/AlignmentRepository -> MlVelocityRepository (shared alignment estimate, 2026-08-30);
   StatusOverlayContent's recalibrate button (via MapScreen) -> MainActivity ->
-  MlVelocityRepository.resetAlignment() (Slice 8)
+  alignment/AlignmentRepository.reset() (2026-08-30)
 
 fusion/GeoProjection.kt
 Status: IMPLEMENTED (Slice 7, 2026-08-25)
@@ -1764,7 +1859,8 @@ Purpose: Circular floating icon button — Figma's "Navigation Button"
   Used once, for the manual recalibrate action (PRD Section 15/31/32).
 Connected to: StatusOverlayContent.kt (used by MapScreen.kt, since 2026-08-30's
   DriveScreen removal) -> FloatingIconButton(ic_recenter) -> MainActivity's
-  onRecalibrate -> MlVelocityRepository.resetAlignment()
+  onRecalibrate -> alignment/AlignmentRepository.reset() (2026-08-30; previously
+  MlVelocityRepository.resetAlignment(), removed)
 
 ui/components/VehicleModeSelector.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)

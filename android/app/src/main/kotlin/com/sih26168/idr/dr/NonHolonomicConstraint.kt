@@ -9,16 +9,21 @@ import kotlin.math.sin
  * velocity perpendicular to heading is suppressed toward zero.
  *
  * PRD.md Section 20 specifies this in VEHICLE frame with a `Turning`
- * exemption from the ML motion classifier. The VEHICLE-frame half still
- * doesn't exist — phone-to-vehicle yaw alignment
- * (`alignment/AlignmentEstimator.kt`, PRD.md Section 15) is wired into
- * the ML feature path only, not this physics path, so this remains a
- * deliberately simplified WORLD-frame stand-in: it uses the device's own
- * WORLD-frame heading (azimuth, from OrientationMath/OrientationSample)
- * as a proxy for vehicle heading, under the explicit assumption that the
- * phone's yaw tracks the vehicle's yaw (true for a phone mounted rigidly
- * to the vehicle body; false if it's loose, e.g. free-sliding in a cup
- * holder).
+ * exemption from the ML motion classifier. This function itself still
+ * only ever projects onto whatever `headingRad` its caller hands it — it
+ * has no opinion on WHICH heading that is. Its one caller
+ * (`dr/BaselineDeadReckoningRepository.kt`) now passes the
+ * `alignment/AlignmentRepository.kt`-corrected vehicle heading (device
+ * azimuth minus the shared PRD.md Section 15 yaw offset) once alignment
+ * has converged, falling back to raw device azimuth (yaw offset 0) before
+ * that — the SAME accepted approximation `ml/MlVelocityRepository.kt`
+ * already uses for its own feature path. Even once corrected, this
+ * remains a WORLD-frame stand-in, not a true 3-axis device-to-vehicle
+ * rotation: it assumes the phone's yaw tracks the vehicle's yaw (true for
+ * a phone mounted rigidly to the vehicle body; false if it's loose, e.g.
+ * free-sliding in a cup holder) — alignment only ever corrects a
+ * constant YAW offset, not that underlying "rigid mount" assumption
+ * itself.
  *
  * The `Turning` exemption DOES now exist —
  * `motion/TurningDetector.kt`'s deterministic yaw-rate stand-in (same

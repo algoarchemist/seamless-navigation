@@ -13,33 +13,51 @@ no benchmark number here is invented (per `CLAUDE.md` Rule 13).
 
 | # | Capability | Status | Where |
 |---|---|---|---|
-| 1 | In-Vehicle Alignment & Calibration Engine | 🟡 Partial — yaw only | `alignment/AlignmentEstimator.kt`, `alignment/YawRate.kt` |
+| 1 | In-Vehicle Alignment & Calibration Engine | 🟡 Yaw shared across both DR paths + auto re-calibration implemented (2026-08-30), see below | `alignment/AlignmentRepository.kt`, `alignment/AlignmentEstimator.kt`, `motion/PhoneMovedDetector.kt` |
 | 2 | AI Speed & Vibration Filter | 🟡 Split — velocity ✅, filter/classifier ❌ | `ml/VelocityModel.kt`, `models/velocity_v1.onnx` / `motion/MotionStateClassifier.kt` |
 | 3 | Advanced Map-Matching & Kinematic Constraints | 🟡 MVP-level map snap + Turning exemption implemented (2026-08-30), see below | `map/MapConstraint.kt`, `motion/TurningDetector.kt`, `dr/NonHolonomicConstraint.kt` |
 | 4 | GNSS+INS Fusion Engine | 🟡 Implemented, but classical not AI-based | `fusion/PositionFusion.kt`, `fusion/VelocityBiasCalibrator.kt` |
 | 5 | Seamless GNSS Deficit Handler | 🟡 Implemented, timing unvalidated | `gnss/GnssOutageDetector.kt` |
 | 6 | Real-time Navigation Interface | 🟡 Mostly implemented, icon doesn't animate | `ui/map/StreetMapView.kt`, `ui/screens/MapScreen.kt` |
 
-## 1. In-Vehicle Alignment & Calibration Engine — 🟡 Partial
+## 1. In-Vehicle Alignment & Calibration Engine — 🟡 yaw shared + auto-recalibration, implemented 2026-08-30
 
-**What exists:** `AlignmentEstimator.kt` computes a **yaw offset only** —
-a circular mean of `(device azimuth − GNSS course-over-ground)`, gated to
-moments the vehicle is moving >5 m/s in a straight line (yaw rate
-≤0.1 rad/s), requiring ≥20 samples before `isAligned` is true.
+**What exists:** `AlignmentEstimator.kt` still computes a **yaw offset
+only** — a circular mean of `(device azimuth − GNSS course-over-ground)`,
+gated to moments the vehicle is moving >5 m/s in a straight line (yaw rate
+≤0.1 rad/s), requiring ≥20 samples before `isAligned` is true. That math
+is unchanged; what changed is who runs and consumes it:
 
-**What's missing relative to the ask:**
-- Pitch/roll are not separately estimated. This is a documented design
-  choice (Android's rotation-vector sensor already gravity-references
-  pitch/roll), not simply unbuilt — but it means there is no true
-  device→vehicle 3-axis rotation matrix, only a scalar yaw correction.
-- That yaw offset is wired into the **ML feature path only**
-  (`MlVelocityRepository.kt` subtracts it from azimuth before feature
-  extraction). The physics/dead-reckoning position integrator does not
-  use it at all.
-- No automatic re-calibration when the phone is repositioned — this was
-  meant to be triggered by a "Phone Moved" motion-classifier output,
-  which doesn't exist yet (see #2). Only a manual "recalibrate" button
-  ships today.
+- **Extracted into `alignment/AlignmentRepository.kt`**, its own
+  Android/coroutine repository driven only by orientation + GNSS
+  bearing/speed — no ML dependency. Previously this estimation ran
+  privately inside `MlVelocityRepository.kt`, which meant it silently
+  stopped existing whenever the ONNX model failed to load.
+- **Now feeds BOTH DR paths.** `dr/BaselineDeadReckoningRepository.kt`
+  reads the shared estimate and corrects the heading passed to
+  `NonHolonomicConstraint.suppressLateralVelocity` (device azimuth minus
+  yaw offset) — previously it used raw device azimuth unconditionally,
+  even once real alignment had converged for the ML path.
+  `ml/MlVelocityRepository.kt`'s own feature-path correction is
+  unchanged, just now reading the shared repository instead of owning a
+  private `AlignmentEstimator`.
+- **Automatic re-calibration** on a detected "Phone Moved" event now
+  exists: `motion/PhoneMovedDetector.kt`, a deterministic stand-in
+  (sustained WORLD-frame pitch/roll change vs. a remembered reference,
+  same "no labeled classifier data" precedent as `MotionStateClassifier`/
+  `PotholeShockDetector`/`TurningDetector`) resets the shared estimator
+  automatically, logged for traceability. The manual "recalibrate"
+  button now calls `AlignmentRepository.reset()` directly, decoupled
+  from ML load success.
+
+**Still missing relative to the literal ask:** pitch/roll are still not
+separately estimated — an unchanged, documented design choice (Android's
+rotation-vector sensor already gravity-references pitch/roll), so there
+is still no true device→vehicle 3-axis rotation matrix, only a scalar
+yaw correction. `PhoneMovedDetector`'s 15°/1s thresholds are engineering
+defaults, unvalidated against real "phone picked up mid-drive" data
+(CLAUDE.md Rule 13) — no real-world false-positive/false-negative rate
+can be quoted yet.
 
 ## 2. AI Speed & Vibration Filter — 🟡 velocity done, filter/classifier missing
 
@@ -193,9 +211,15 @@ Strategies) first.
    geometry — not an HMM.~~ **DONE (2026-08-30)** — see capability #3
    above. Still needs a real outdoor test drive to validate the
    30m/45° defaults against actual DR drift magnitudes.
-5. **Feed the yaw-alignment output into the physics/DR position path**,
+5. ~~**Feed the yaw-alignment output into the physics/DR position path**,
    not just the ML feature path, and wire automatic re-calibration off
-   `MotionStateClassifier` once "Phone Moved" detection exists.
+   `MotionStateClassifier` once "Phone Moved" detection exists.~~
+   **DONE (2026-08-30)** — see capability #1 above
+   (`alignment/AlignmentRepository.kt`, `motion/PhoneMovedDetector.kt`).
+   Re-calibration is off a NEW deterministic `PhoneMovedDetector`, not
+   `MotionStateClassifier` (which only covers Stationary/Cruising, not
+   Phone Moved) — still needs real "phone picked up mid-drive" data to
+   validate its thresholds.
 6. **Add a real low-pass/complementary pre-filter** on raw accel/gyro
    ahead of feature extraction (PRD §11), independent of the ML velocity
    model — this is the literal "vibration filter" half of capability #2
