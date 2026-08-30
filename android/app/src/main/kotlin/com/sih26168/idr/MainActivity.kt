@@ -2,6 +2,7 @@ package com.sih26168.idr
 
 import android.Manifest
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -41,6 +42,7 @@ import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.gnss.LocationRepository
 import com.sih26168.idr.ml.MlVelocityRepository
 import com.sih26168.idr.ml.MlVelocityUiState
+import com.sih26168.idr.ml.ReacquisitionDriftModel
 import com.sih26168.idr.ml.VelocityModel
 import com.sih26168.idr.sensors.SensorRepository
 import com.sih26168.idr.sensors.SensorUiState
@@ -111,6 +113,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var stateEstimator: StateEstimator
     private var mlVelocityRepository: MlVelocityRepository? = null
     private var velocityModel: VelocityModel? = null
+    private var reacquisitionDriftModel: ReacquisitionDriftModel? = null
 
     // 2026-08-26, user-requested Pause button: a `by mutableStateOf`
     // property (not a plain `var`) so Compose recomposes the Pause/Resume
@@ -207,12 +210,32 @@ class MainActivity : ComponentActivity() {
             _mlModelLoadError.value = e.message ?: e::class.simpleName ?: "unknown error"
         }
 
-        // Constructed after the try/catch above so it sees the FINAL
-        // mlVelocityRepository value (null if the ONNX model failed to
-        // load) — StateEstimator falls back to physics-only fusion in
-        // that case rather than crashing (CLAUDE.md Rule 13's resilience
-        // pattern, same as everywhere else the ML half is optional).
-        stateEstimator = StateEstimator(gnssModeRepository, deadReckoningRepository, mlVelocityRepository, lifecycleScope)
+        // PRD.md Section 17's "AI-based" fusion half — a SEPARATE try/catch
+        // from the velocity model above: this model's own load failure
+        // (missing/corrupt asset) must not be conflated with, or block,
+        // the velocity model's independent success/failure. StateEstimator
+        // treats a null value here the exact same resilience way it
+        // already treats a null mlVelocityRepository — falls back to the
+        // previous fixed-1-second classical blend, not a crash.
+        try {
+            reacquisitionDriftModel = ReacquisitionDriftModel.loadFromAssets(applicationContext)
+        } catch (e: Exception) {
+            Log.w("MainActivity", "reacquisition_drift_v1.onnx failed to load — classical fixed-blend fusion only", e)
+        }
+
+        // Constructed after the try/catch blocks above so it sees the FINAL
+        // mlVelocityRepository/reacquisitionDriftModel values (null if
+        // either ONNX model failed to load) — StateEstimator falls back to
+        // physics-only fusion / a fixed classical blend in that case rather
+        // than crashing (CLAUDE.md Rule 13's resilience pattern, same as
+        // everywhere else the ML half is optional).
+        stateEstimator = StateEstimator(
+            gnssModeRepository,
+            deadReckoningRepository,
+            mlVelocityRepository,
+            lifecycleScope,
+            reacquisitionDriftModel = reacquisitionDriftModel,
+        )
 
         setContent {
             val uiState by sensorRepository.state.collectAsState()
@@ -443,6 +466,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         velocityModel?.close()
+        reacquisitionDriftModel?.close()
         super.onDestroy()
     }
 

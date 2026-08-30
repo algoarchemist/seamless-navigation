@@ -16,7 +16,7 @@ no benchmark number here is invented (per `CLAUDE.md` Rule 13).
 | 1 | In-Vehicle Alignment & Calibration Engine | 🟡 Yaw shared across both DR paths + auto re-calibration implemented (2026-08-30), see below | `alignment/AlignmentRepository.kt`, `alignment/AlignmentEstimator.kt`, `motion/PhoneMovedDetector.kt` |
 | 2 | AI Speed & Vibration Filter | 🟡 Velocity ✅, vibration filter + Accelerating/Braking implemented (2026-08-30), trained classifier still ❌ (blocked on real data), see below | `ml/VelocityModel.kt`, `dr/LowPassFilter.kt`, `motion/LongitudinalMotionClassifier.kt` |
 | 3 | Advanced Map-Matching & Kinematic Constraints | 🟡 MVP-level map snap + Turning exemption implemented (2026-08-30), see below | `map/MapConstraint.kt`, `motion/TurningDetector.kt`, `dr/NonHolonomicConstraint.kt` |
-| 4 | GNSS+INS Fusion Engine | 🟡 Implemented, but classical not AI-based | `fusion/PositionFusion.kt`, `fusion/VelocityBiasCalibrator.kt` |
+| 4 | GNSS+INS Fusion Engine | 🟡 AI-based adaptive REACQUISITION blend implemented (2026-08-30), see below | `ml/ReacquisitionDriftModel.kt`, `fusion/PositionFusion.kt`, `fusion/RunningStats.kt` |
 | 5 | Seamless GNSS Deficit Handler | 🟡 Implemented, timing unvalidated | `gnss/GnssOutageDetector.kt` |
 | 6 | Real-time Navigation Interface | 🟡 Mostly implemented, icon doesn't animate | `ui/map/StreetMapView.kt`, `ui/screens/MapScreen.kt` |
 
@@ -143,23 +143,45 @@ real labeled data.
   physics path, which stays a separate, larger change (Roadmap item #5
   below) rather than folded into this one.
 
-## 4. GNSS+INS Fusion Engine — 🟡 implemented, but classical, not AI-based
+## 4. GNSS+INS Fusion Engine — 🟡 AI-based adaptive blend, implemented 2026-08-30
 
-`fusion/PositionFusion.kt` is a rule-based state machine: position is
-**frozen** during `TRANSITION`, then **linearly interpolated** from the
-last DR position to the newly reacquired GNSS fix over a 1-second window
-during `REACQUISITION`. `fusion/VelocityBiasCalibrator.kt` runs an EWMA
-correction of the ML velocity model's bias against GNSS speed while GNSS
-is trusted — its own code comment states this is explicitly **"NOT a
-Kalman filter."**
+`fusion/PositionFusion.kt` is still a rule-based state machine at its
+core — position is **frozen** during `TRANSITION`, then **linearly
+interpolated** from the last DR position to the newly reacquired GNSS fix
+during `REACQUISITION`. What changed: that interpolation's DURATION is no
+longer a fixed 1-second constant. `ml/ReacquisitionDriftModel.kt` — a
+trained LinearRegression, exported to ONNX and run on-device — predicts
+the EXPECTED along-track DR drift (meters) the instant REACQUISITION
+begins, from the outage's real elapsed duration plus
+`fusion/RunningStats.kt`'s running mean/std of DR speed accumulated
+during it. `PositionFusion.blendDurationForDriftMs()` maps that
+prediction to an adaptive blend duration (500ms–3000ms, larger predicted
+drift → longer, less-jarring blend).
 
-This matches what the PRD itself promises (§17: a deliberately simplified
-"loosely-coupled complementary approach," explicitly not EKF/Kalman,
-chosen for feasibility) — so relative to this project's own spec, it's
-faithfully delivered. But it does **not** satisfy the literal
-capability-list wording of an *"innovative AI based Sensor Fusion
-Algorithm."* This is a scope decision, not an oversight — see the
-decision point at the end of this document.
+**Real, measured result (CLAUDE.md Rule 3), not assumed:** trained and
+evaluated on IO-VNBD (outages simulated, since this dataset has no real
+ones — see `ml/train_reacquisition_model.py`'s own doc for why along-
+track drift, not full 2D position, is the target). On 4 held-out trips,
+LinearRegression measurably beat both a RandomForestRegressor (MAE
+14.224m vs 15.060m) and the best 1-parameter physics-formula baseline
+(vs 14.887m) — a real but modest improvement, reported honestly, not
+oversold. Per CLAUDE.md Rule 11 ("lightest model that meets the bar"),
+LinearRegression is what's shipped, not the forest.
+
+`fusion/VelocityBiasCalibrator.kt` is unchanged — still an EWMA
+correction, explicitly documented as **"NOT a Kalman filter."** The
+REACQUISITION blend above is also deliberately **not** a Kalman/EKF state
+update (CLAUDE.md's "What Not To Build" / PRD §7 both explicitly exclude
+that) — this stays a simple, transparent formula fed by a small learned
+prediction, matching the "Learned adaptive REACQUISITION blend" option
+chosen at this decision point (see below) over a full EKF/UKF filter.
+
+**Still missing relative to the literal ask:** the underlying blend
+mechanism is still linear interpolation, not a state-space estimator;
+only its duration is now learned. No real outdoor test drive has yet
+exercised this adaptive path — the 500–3000ms bounds and the
+30ms-per-meter scale factor are engineering defaults, unvalidated against
+real reacquisition events (CLAUDE.md Rule 13).
 
 ## 5. Seamless GNSS Deficit Handler — 🟡 implemented, timing unvalidated
 
@@ -262,13 +284,16 @@ Strategies) first.
    (7/8 classes now have some real signal), but none of them is the
    actual trained classifier this item asks for.
 
-### Decision point — capability #4's "AI-based" wording
-The shipped GNSS+INS fusion is classical/rule-based by deliberate PRD
-decision (§17), not AI-based. Upgrading it to a real learned or
-Kalman-family filter would be the single largest change needed to
-literally match the "innovative AI based Sensor Fusion Algorithm"
-wording in the capability list — but it's also the change most likely to
-blow the Round 2 timebox and drift into the excluded EKF/UKF territory
-above. This is flagged here as a decision for you to make explicitly
-(per CLAUDE.md Rule 3/4), not something to silently build or silently
-leave as-is.
+### Decision point — capability #4's "AI-based" wording — RESOLVED 2026-08-30
+The shipped GNSS+INS fusion was classical/rule-based by deliberate PRD
+decision (§17). Presented with three options (a learned adaptive
+REACQUISITION blend; a full EKF/UKF filter overriding CLAUDE.md's
+explicit exclusion; or closing this out in docs only with no new code),
+the developer chose the first — see capability #4 above for what was
+built (`ml/ReacquisitionDriftModel.kt` + `fusion/PositionFusion.kt`'s
+`blendDurationForDriftMs`) and the real measured comparison that decided
+LinearRegression over a RandomForestRegressor. This satisfies the
+capability list's "AI-based" wording via a small, bounded, measured
+regression feeding a transparent formula — deliberately still not a
+Kalman/EKF filter, which remains excluded per CLAUDE.md's "What Not To
+Build" / PRD §7.

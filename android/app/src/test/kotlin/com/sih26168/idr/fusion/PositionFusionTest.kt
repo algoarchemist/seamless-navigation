@@ -118,4 +118,48 @@ class PositionFusionTest {
         assertEquals(5.0, afterReset.eastM, 0.0001)
         assertEquals(5.0, afterReset.northM, 0.0001)
     }
+
+    @Test
+    fun `setReacquisitionBlendMs changes how fast REACQUISITION converges`() {
+        val fusion = PositionFusion()
+        fusion.setReacquisitionBlendMs(2000L)
+        fusion.update(0L, GnssMode.REACQUISITION, drEastM = 0.0, drNorthM = 0.0, newFixEastM = 10.0, newFixNorthM = 0.0)
+        // At the OLD 1000ms default this would already be fully converged;
+        // at the new 2000ms blend, t=1000ms is only the midpoint.
+        val midpoint = fusion.update(1000L, GnssMode.REACQUISITION, drEastM = 0.0, drNorthM = 0.0, newFixEastM = 10.0, newFixNorthM = 0.0)
+        assertEquals(5.0, midpoint.eastM, 0.0001)
+    }
+
+    @Test
+    fun `reset restores the default reacquisition blend duration`() {
+        val fusion = PositionFusion()
+        fusion.setReacquisitionBlendMs(3000L)
+        fusion.reset()
+        fusion.update(0L, GnssMode.REACQUISITION, drEastM = 0.0, drNorthM = 0.0, newFixEastM = 10.0, newFixNorthM = 0.0)
+        // Back to the 1000ms default — fully converged by t=1000ms, not still blending.
+        val atOneSecond = fusion.update(1000L, GnssMode.REACQUISITION, drEastM = 0.0, drNorthM = 0.0, newFixEastM = 10.0, newFixNorthM = 0.0)
+        assertEquals(10.0, atOneSecond.eastM, 0.0001)
+    }
+
+    @Test
+    fun `blendDurationForDriftMs returns the minimum for zero predicted drift`() {
+        assertEquals(
+            PositionFusion.MIN_ADAPTIVE_REACQUISITION_BLEND_MS,
+            PositionFusion.blendDurationForDriftMs(0f),
+        )
+    }
+
+    @Test
+    fun `blendDurationForDriftMs scales linearly with predicted drift below the clamp`() {
+        // 10m at 30ms/m = 300ms on top of the 500ms floor = 800ms.
+        assertEquals(800L, PositionFusion.blendDurationForDriftMs(10f))
+    }
+
+    @Test
+    fun `blendDurationForDriftMs clamps to the maximum for a large predicted drift`() {
+        assertEquals(
+            PositionFusion.MAX_ADAPTIVE_REACQUISITION_BLEND_MS,
+            PositionFusion.blendDurationForDriftMs(500f),
+        )
+    }
 }

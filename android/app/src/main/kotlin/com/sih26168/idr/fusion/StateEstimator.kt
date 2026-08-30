@@ -7,6 +7,7 @@ import com.sih26168.idr.gnss.GnssModeRepository
 import com.sih26168.idr.gnss.GnssQuality
 import com.sih26168.idr.map.MapConstraint
 import com.sih26168.idr.ml.MlVelocityRepository
+import com.sih26168.idr.ml.ReacquisitionDriftModel
 import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlinx.coroutines.CoroutineScope
@@ -131,6 +132,20 @@ data class FusedPositionUiState(
  * SAME "settable field read on the collecting coroutine" pattern
  * [BaselineDeadReckoningRepository.walkingModeEnabled] already
  * establishes, not a new style introduced here.
+ *
+ * Later addition: PRD.md Section 17's "AI-based" GNSS+INS fusion half
+ * (previously entirely classical — STATUS_AND_ROADMAP.md's own flagged
+ * decision point). [reacquisitionDriftModel] predicts EXPECTED along-
+ * track DR drift (meters) the INSTANT REACQUISITION begins, from
+ * [outageSpeedStats]' running mean/std of DR speed accumulated over the
+ * outage plus its real elapsed duration — [PositionFusion.blendDurationForDriftMs]
+ * turns that into an adaptive REACQUISITION blend duration, set via
+ * [PositionFusion.setReacquisitionBlendMs] BEFORE [positionFusion]'s own
+ * `update()` runs this same tick. [reacquisitionDriftModel] is nullable,
+ * same resilience pattern [mlVelocityRepository] already establishes — if
+ * the ONNX asset fails to load, [positionFusion] simply keeps its
+ * [PositionFusion.DEFAULT_REACQUISITION_BLEND_MS] fixed value, the exact
+ * previous classical behavior.
  */
 class StateEstimator(
     private val gnssModeRepository: GnssModeRepository,
@@ -138,6 +153,7 @@ class StateEstimator(
     private val mlVelocityRepository: MlVelocityRepository?,
     private val scope: CoroutineScope,
     private val positionFusion: PositionFusion = PositionFusion(),
+    private val reacquisitionDriftModel: ReacquisitionDriftModel? = null,
 ) {
     private val _state = MutableStateFlow(FusedPositionUiState())
     val state: StateFlow<FusedPositionUiState> = _state.asStateFlow()
@@ -148,6 +164,14 @@ class StateEstimator(
     private var previousMode: GnssMode? = null
     private var lastDriftSummary: DriftSummaryResult? = null
     private val driftHistory = mutableListOf<DriftSummaryResult>()
+
+    // Running mean/std of DR speed DURING the current outage (reset every
+    // time GNSS_AIDED is good, accumulated every tick it isn't) — the SAME
+    // two statistics ml/train_reacquisition_model.py computed over its
+    // simulated outage windows, feeding [reacquisitionDriftModel] at the
+    // instant REACQUISITION begins. See [RunningStats]'s own doc for why
+    // Welford's algorithm, not a stored sample list.
+    private val outageSpeedStats = RunningStats()
 
     // Active route geometry (lat/lon, WGS84 degrees) to road-snap against —
     // null while no route is active. Deliberately plain lat/lon pairs, not
@@ -190,6 +214,7 @@ class StateEstimator(
         previousMode = null
         lastDriftSummary = null
         driftHistory.clear()
+        outageSpeedStats.reset()
         _state.value = FusedPositionUiState()
 
         collectJob = scope.launch {
@@ -254,6 +279,26 @@ class StateEstimator(
                 val drEastM = if (useMl) mlState!!.positionEastM else physicsState.positionEastM
                 val drNorthM = if (useMl) mlState!!.positionNorthM else physicsState.positionNorthM
 
+                // PRD.md Section 17's "AI-based" fusion input: accumulates
+                // whichever DR source is actually active this tick (same
+                // selection as drEastM/drNorthM above) into
+                // [outageSpeedStats], matching ml/train_reacquisition_model.py's
+                // use of the velocity model's own predictions as the "live
+                // on-device signal." Reset the instant GNSS is trustworthy
+                // again (a new outage's stats must not include the
+                // previous one's) — the SAME trigger boundary
+                // [lastAidedAtMs] itself resets on, just above.
+                val currentSpeedMps = if (useMl && mlState?.predictedVelocityCorrectedMps != null) {
+                    mlState.predictedVelocityCorrectedMps.toDouble()
+                } else {
+                    hypot(physicsState.velocityEastMps, physicsState.velocityNorthMps)
+                }
+                if (gnssState.mode == GnssMode.GNSS_AIDED && GnssQuality.isGood(gnssState.fixAgeMs, fix.accuracyM)) {
+                    outageSpeedStats.reset()
+                } else {
+                    outageSpeedStats.accumulate(currentSpeedMps)
+                }
+
                 var newFixEastM: Double? = null
                 var newFixNorthM: Double? = null
                 if (gnssState.mode == GnssMode.REACQUISITION) {
@@ -299,6 +344,25 @@ class StateEstimator(
                         "Outage #${driftHistory.size} drift: ${lastDriftSummary!!.driftMeters}m " +
                             "over ${lastDriftSummary!!.distanceTravelledMeters}m travelled",
                     )
+
+                    // PRD.md Section 17's "AI-based" fusion: predicts THIS
+                    // outage's expected drift from its real duration + the
+                    // DR speed statistics just accumulated above, and sets
+                    // positionFusion's blend duration for it BEFORE the
+                    // update() call below sees REACQUISITION mode for the
+                    // first time this outage — see PositionFusion's own doc
+                    // for the full reasoning and the "why not Kalman/EKF"
+                    // scope note.
+                    val outageDurationS = lastAidedAtMs?.let { (nowMs - it) / 1000f } ?: 0f
+                    val predictedDriftM = reacquisitionDriftModel?.predict(
+                        outageDurationS = outageDurationS,
+                        avgPredictedSpeedMps = outageSpeedStats.mean().toFloat(),
+                        predictedSpeedStdMps = outageSpeedStats.populationStdDev().toFloat(),
+                    )
+                    if (predictedDriftM != null) {
+                        positionFusion.setReacquisitionBlendMs(PositionFusion.blendDurationForDriftMs(predictedDriftM))
+                        Log.i(TAG, "Outage #${driftHistory.size} predicted drift: ${predictedDriftM}m (adaptive blend set)")
+                    }
                 }
                 previousMode = gnssState.mode
 

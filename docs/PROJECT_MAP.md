@@ -1548,7 +1548,137 @@ Important functions/classes: update(nowMs, mode, drEastM, drNorthM,
   internals; matching by default is intentional but not structurally
   enforced), falling back to raw DR passthrough if no fix is available
   yet that tick.
-Connected to: fusion/StateEstimator -> PositionFusion -> FusedPositionUiState
+  UPDATE (2026-08-30, PRD.md Section 17's "AI-based" GNSS+INS fusion —
+  previously entirely classical, per STATUS_AND_ROADMAP.md's own flagged
+  decision point): `reacquisitionBlendMs` is now a `var`, settable via
+  `setReacquisitionBlendMs()` — StateEstimator.kt calls it with
+  `blendDurationForDriftMs()`'s output right before the tick that first
+  enters REACQUISITION, fed by ml/ReacquisitionDriftModel.kt's predicted
+  along-track drift for that specific outage.
+  `blendDurationForDriftMs(predictedDriftMeters)` (companion function):
+  MIN_ADAPTIVE_REACQUISITION_BLEND_MS=500ms +
+  BLEND_MS_PER_METER_OF_PREDICTED_DRIFT=30.0 * predictedDriftMeters,
+  clamped to [500, 3000]ms — engineering defaults, unvalidated against a
+  real outdoor test drive (CLAUDE.md Rule 13). Deliberately NOT a
+  Kalman/EKF state update (CLAUDE.md's "What Not To Build"/PRD.md
+  Section 7) — still the same simple linear-interpolation blend as
+  before, just with a data-informed duration. If
+  ReacquisitionDriftModel failed to load, `reacquisitionBlendMs` simply
+  stays at DEFAULT_REACQUISITION_BLEND_MS (1000ms) — the exact previous
+  classical behavior, same resilience pattern as the ML velocity path.
+Connected to: fusion/StateEstimator -> PositionFusion -> FusedPositionUiState;
+  ml/ReacquisitionDriftModel -> PositionFusion.setReacquisitionBlendMs() (2026-08-30)
+
+fusion/RunningStats.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: A running (online, Welford's algorithm) mean/population-
+  standard-deviation accumulator over a stream of scalar samples — built
+  to feed ml/ReacquisitionDriftModel.kt's avgPredictedSpeedMps/
+  predictedSpeedStdMps features with "the mean/std of DR speed samples
+  seen so far during the CURRENT GNSS outage," without storing the full
+  sample history. Welford's algorithm computes the SAME population
+  variance numpy.std()'s default (ddof=0) computes in
+  ml/train_reacquisition_model.py — this class exists specifically so
+  StateEstimator's live accumulation matches that training-time
+  statistic, not a different one.
+Inputs: accumulate(value: Double) per sample.
+Outputs: mean(), populationStdDev(), sampleCount.
+Pure Kotlin, no Android dependency, unit-testable (CLAUDE.md Rule 19) —
+  see RunningStatsTest.kt (5 cases, including an exact match against a
+  textbook numpy mean=5.0/std=2.0 dataset).
+Connected to: fusion/StateEstimator -> RunningStats -> ml/ReacquisitionDriftModel.predict()
+
+ml/ReacquisitionDriftModel.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: ONNX Runtime Mobile wrapper for the trained reacquisition-drift
+  LinearRegression model (ml/train_reacquisition_model.py/
+  ml/export_reacquisition_model.py) — PRD.md Section 17's "AI-based" half
+  of the GNSS+INS Fusion Engine. Predicts EXPECTED along-track DR
+  position drift (meters) at the moment GNSS reacquires. LinearRegression,
+  not RandomForestRegressor, was the MEASURED choice (CLAUDE.md
+  Rule 3/11) — see ml/train_reacquisition_model.py's own printed
+  comparison: with only 3 features and ~1,200 simulated training
+  samples, the linear model's held-out MAE (14.224m)/RMSE (17.895m) beat
+  both RandomForestRegressor (MAE 15.060m/RMSE 18.813m) and the best
+  1-parameter physics-formula baseline (MAE 14.887m/RMSE 18.663m) — a
+  real but modest improvement, honestly reported, not oversold.
+Inputs: outageDurationS, avgPredictedSpeedMps, predictedSpeedStdMps
+  (Float each).
+Outputs: Float — predicted along-track drift, meters, clamped to >= 0
+  (the fitted LinearRegression has no non-negativity constraint; a
+  short/slow outage can produce a small negative raw prediction from the
+  fitted intercept, confirmed during training).
+Important functions/classes: predict() — loads
+  models/reacquisition_drift_v1.onnx (bundled asset, ~0.25KB, committed
+  like velocity_v1.onnx — see models/README.md) once at construction via
+  loadFromAssets(context), then single-row inference per REACQUISITION
+  event (NOT per tick). Input/output tensor names ("input"/"variable")
+  verified via onnxruntime's Python API before hardcoding, same skl2onnx
+  defaults VelocityModel.kt already uses regardless of regressor type.
+Connected to: MainActivity (loads it, separate try/catch from the
+  velocity model — an independent failure mode) -> StateEstimator ->
+  PositionFusion.setReacquisitionBlendMs()
+
+ml/train_reacquisition_model.py
+Status: IMPLEMENTED (2026-08-30)
+Purpose: Trains + evaluates the reacquisition-drift regressor. IO-VNBD
+  has no real GNSS outages (continuously GNSS-aided recording), so
+  outages are SIMULATED — a random start row + random duration (5-60s,
+  an engineering range unvalidated against real outdoor outage lengths,
+  CLAUDE.md Rule 13) within one trip, using the ALREADY-TRAINED velocity
+  model's predictions over that window as the "live on-device
+  prediction" signal. Target is ALONG-TRACK drift
+  (cumsum(|predicted_speed - true_speed| * dt) over the window) — NOT
+  full 2D position drift, deliberately: this dataset has no reliable
+  WORLD-frame heading to reconstruct a synthetic 2D trajectory from (only
+  vehicle-frame forward/lateral, and GNSS course only changes every ~9s
+  — far too coarse), and along-track integration error is the dominant
+  real-world DR drift component anyway once the non-holonomic constraint
+  already suppresses lateral drift.
+  Split discipline (same as train_velocity_model.py): outage samples
+  drawn ONLY from the 14 trips already held out from velocity-model
+  TRAINING (so drift labels reflect genuinely unseen-trip prediction
+  quality), then those 14 trips split AGAIN (10 drift-train/4 drift-val)
+  so this model's own reported accuracy is ALSO on held-out trips.
+Inputs: data/processed/io_vnbd_features.parquet (same file
+  feature_extraction.py produces for the velocity model).
+Outputs: printed MAE/RMSE comparison — constant-mean baseline, two
+  1-parameter physics-formula baselines (std*duration and
+  avgspeed*duration), LinearRegression, RandomForestRegressor. Explicitly
+  measures ML against simple deterministic baselines before choosing one
+  (CLAUDE.md Rule 3) — see ml/ReacquisitionDriftModel.kt's entry for the
+  real numbers and which one won.
+Important functions/classes: simulate_outage_samples() (one trip's
+  random outage windows -> 3 features + drift label),
+  build_drift_dataset() (runs that over a list of trips and concatenates).
+Unit tests: tests/ml/test_train_reacquisition_model.py (6 cases,
+  synthetic trips only — perfect-prediction gives exactly zero drift;
+  constant-offset prediction gives the analytically expected
+  `error * duration`; minimum window-size enforcement; a too-short trip
+  yields zero samples; deterministic with a fixed rng seed; output
+  column set matches the declared feature/label columns).
+Connected to: data/processed/io_vnbd_features.parquet -> train_reacquisition_model.py
+  -> (printed comparison only — export_reacquisition_model.py produces the shipped artifact)
+
+ml/export_reacquisition_model.py
+Status: IMPLEMENTED (2026-08-30)
+Purpose: Exports the FINAL LinearRegression drift model to ONNX +
+  output-parity check (CLAUDE.md Rule 20), mirroring export_model.py's
+  own "retrain on ALL data once train/val has validated the approach"
+  pattern — retrains the velocity model on all 72 trips, simulates
+  outages across all 72 using ITS predictions, trains LinearRegression on
+  the full simulated set (5,600 samples), exports, and verifies parity.
+Outputs: models/reacquisition_drift_v1.onnx (~0.25KB). Measured parity:
+  max abs diff 0.000011m, mean abs diff 0.000002m, 500/500 samples within
+  the 1e-3m tolerance.
+Unit tests: tests/ml/test_export_reacquisition_model.py (2 cases,
+  mirroring test_export_model.py's pattern exactly — exported ONNX
+  matches sklearn predictions; the parity check itself correctly detects
+  a real, deliberately-introduced mismatch).
+Connected to: train_reacquisition_model.py's helpers (reused directly,
+  not duplicated) -> export_reacquisition_model.py -> models/reacquisition_drift_v1.onnx
+  -> android/app/src/main/assets/reacquisition_drift_v1.onnx (manually
+  copied, same convention as velocity_v1.onnx) -> ml/ReacquisitionDriftModel.kt
 
 fusion/StateEstimator.kt
 Status: IMPLEMENTED (Slice 7, 2026-08-25)
@@ -1626,10 +1756,26 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   in MainActivity's debug screen for demo honesty (CLAUDE.md Rule 13) —
   not shown as a separate map overlay, to avoid growing MapScreen's UI
   surface for what is fundamentally a debug/verification signal.
+  UPDATE (2026-08-30, PRD.md Section 17's "AI-based" fusion): a new
+  `outageSpeedStats` (fusion/RunningStats.kt) accumulates whichever DR
+  source is active each tick (same selection as drEastM/drNorthM),
+  reset the instant GNSS is good again. At the SAME "entering
+  REACQUISITION" instant DriftSummary is already snapshotted, this class
+  now ALSO computes the real elapsed outage duration and calls
+  `reacquisitionDriftModel?.predict(...)`, then
+  `positionFusion.setReacquisitionBlendMs(PositionFusion.blendDurationForDriftMs(...))`
+  — BEFORE `positionFusion.update()` sees REACQUISITION mode for the
+  first time this outage, so the very first blend tick already uses the
+  adaptive duration. `reacquisitionDriftModel` is a new nullable
+  constructor param, same resilience pattern as `mlVelocityRepository` —
+  null (ONNX load failure) means `positionFusion` simply keeps its fixed
+  1-second default, the exact previous classical behavior. Logged
+  (`Log.i`) alongside the existing drift-summary log line.
 Connected to: GnssModeRepository, BaselineDeadReckoningRepository,
   MlVelocityRepository -> StateEstimator -> MainActivity (Compose UI);
   fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8);
-  ui/screens/MapScreen.kt -> StateEstimator.setActiveRouteGeometry() -> map/MapConstraint.snapToRoad() -> FusedPositionUiState.fusedEastM/fusedNorthM
+  ui/screens/MapScreen.kt -> StateEstimator.setActiveRouteGeometry() -> map/MapConstraint.snapToRoad() -> FusedPositionUiState.fusedEastM/fusedNorthM;
+  fusion/RunningStats, ml/ReacquisitionDriftModel -> StateEstimator -> fusion/PositionFusion.setReacquisitionBlendMs() (2026-08-30)
 
 fusion/DriftSummary.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
