@@ -218,18 +218,24 @@ fun MapScreen(
     }
 
     // Live heading for the navigation screen's "heading-up" map rotation
-    // (ui/map/StreetMapView.kt's headingDeg param) — prefers a live GNSS
-    // bearing (most accurate while GNSS_AIDED and actually moving), else
-    // falls back to the physics DR velocity vector's own heading (works
-    // through a GNSS outage, same physics/ML fallback theme as the rest of
-    // this app), else holds the last confident heading rather than
-    // spinning the map at near-zero speed (bearing is meaningless when
-    // barely moving — same principle StationaryDetector already applies
-    // to ZUPT).
-    var lastConfidentHeadingDeg by remember { mutableStateOf(0f) }
+    // (ui/map/StreetMapView.kt's headingDeg param) AND the current-position
+    // marker's own directional-arrow rotation (that same file's
+    // markerHeadingDeg param) — prefers a live GNSS bearing (most accurate
+    // while GNSS_AIDED and actually moving), else falls back to the
+    // physics DR velocity vector's own heading (works through a GNSS
+    // outage, same physics/ML fallback theme as the rest of this app),
+    // else holds the last confident heading rather than spinning the map/
+    // arrow at near-zero speed (bearing is meaningless when barely moving
+    // — same principle StationaryDetector already applies to ZUPT).
+    // Nullable (not defaulted to 0f) specifically so the marker arrow
+    // stays a plain non-directional dot (StreetMapView's own null-heading
+    // fallback) until a REAL heading reading has ever been obtained this
+    // run, rather than claiming a fake "pointing north" direction before
+    // any GNSS bearing or DR velocity has actually been observed.
+    var lastConfidentHeadingDeg by remember { mutableStateOf<Float?>(null) }
     val gnssBearing = gnssState.latestFix?.bearingDeg
     val speedForHeadingMps = hypot(drState.velocityEastMps, drState.velocityNorthMps)
-    val headingDeg: Float = when {
+    val headingDeg: Float? = when {
         gnssState.mode == GnssMode.GNSS_AIDED && gnssBearing != null -> gnssBearing.also { lastConfidentHeadingDeg = it }
         speedForHeadingMps > 0.5 -> {
             val bearingDeg = Math.toDegrees(atan2(drState.velocityEastMps, drState.velocityNorthMps)).toFloat()
@@ -263,6 +269,12 @@ fun MapScreen(
             isDarkTheme = isDarkTheme,
             routeGeometry = activeRoute?.geometry,
             headingDeg = if (isNavigating) headingDeg else null,
+            // Unlike the map-rotation headingDeg above (gated to
+            // isNavigating), the marker's own directional arrow is fed
+            // real heading whenever one is available — STATUS_AND_ROADMAP.md
+            // Tier-1 item #1, "rotate it with heading" applies generally,
+            // not only during turn-by-turn.
+            markerHeadingDeg = headingDeg,
             onMapViewReady = { mapViewRef = it },
             modifier = Modifier.fillMaxSize(),
         )

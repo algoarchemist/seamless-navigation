@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.DashPathEffect
 import android.graphics.Paint
+import android.graphics.Path
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -14,6 +15,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
@@ -88,6 +90,19 @@ private val STREET_TILE_SOURCE = TileSourceFactory.MAPNIK
 // genuine several-meter walk still re-centers promptly.
 private const val MIN_RECENTER_DISTANCE_M = 3.0
 
+// Engineering default (CLAUDE.md Rule 13) — not measured against a
+// specific device, picked by feel (typical map-marker tween duration,
+// similar order of magnitude to Google Maps' own live-tracking dot).
+// Deliberately LONGER than a single sensor/GNSS tick (~100ms at this
+// pipeline's ~10Hz rate, CLAUDE.md Rule 10) — the marker-animation
+// LaunchedEffect below is restarted (cancel + relaunch from wherever the
+// marker currently sits) on every new tick rather than run to
+// completion, which is what turns a series of discrete position jumps
+// into one continuous smoothed motion; the duration only sets how
+// aggressively each new tick's target gets chased, not how long any one
+// animation is expected to fully finish.
+private const val MARKER_ANIMATION_DURATION_MS = 300L
+
 /**
  * One-time osmdroid setup (tile cache location + required user-agent —
  * OSM's tile usage policy blocks requests with no/default user agent).
@@ -134,6 +149,22 @@ private class CurrentPositionOverlay : Overlay() {
     var anchor: GeoPoint? = null
     var mode: GnssMode = GnssMode.GNSS_AIDED
 
+    /**
+     * Screen-space clockwise-degrees rotation to draw the directional
+     * arrow marker at, or null to fall back to the plain (non-directional)
+     * dot. This is NOT the same number as device heading — it's already
+     * had the map's own current rotation (`MapView.setMapOrientation`)
+     * subtracted out by the caller (see StreetMapView's `update` block,
+     * where it's computed), because osmdroid pre-rotates the canvas this
+     * `draw()` receives by that same amount before invoking any overlay
+     * (CLAUDE.md Rule 14 — stating the frame at the boundary): drawing the
+     * arrow at the raw device heading on an ALREADY-rotated canvas would
+     * double-apply the map's rotation. UNVERIFIED ON A REAL DEVICE
+     * (CLAUDE.md Rule 13), same caveat StreetMapView's own headingDeg
+     * param already carries for the map-rotation half of this.
+     */
+    var iconRotationDeg: Float? = null
+
     private val haloPaint = Paint().apply { color = AccentBlue.copy(alpha = 0.18f).toArgb(); isAntiAlias = true }
     private val ringPaint = Paint().apply {
         color = AccentBlue.toArgb()
@@ -142,6 +173,13 @@ private class CurrentPositionOverlay : Overlay() {
         strokeWidth = 6f
     }
     private val dotPaint = Paint().apply { color = AccentBlueLight.toArgb(); isAntiAlias = true }
+    private val arrowFillPaint = Paint().apply { color = AccentBlueLight.toArgb(); isAntiAlias = true; style = Paint.Style.FILL }
+    private val arrowOutlinePaint = Paint().apply {
+        color = android.graphics.Color.WHITE
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+    }
     private val anchorPaint = Paint().apply { color = CtaRed.toArgb(); isAntiAlias = true }
     private val linePaint = Paint().apply {
         color = CtaRed.toArgb()
@@ -171,7 +209,30 @@ private class CurrentPositionOverlay : Overlay() {
 
         canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 44f, haloPaint)
         canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 16f, ringPaint)
-        canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 11f, dotPaint)
+
+        val rotationDeg = iconRotationDeg
+        if (rotationDeg != null) {
+            // Directional chevron in place of the plain dot — only drawn
+            // once a real heading exists (see StreetMapView's
+            // markerHeadingDeg param doc for when that is/isn't the case).
+            canvas.save()
+            canvas.rotate(rotationDeg, point.x.toFloat(), point.y.toFloat())
+            val arrowPath = buildArrowPath(point.x.toFloat(), point.y.toFloat())
+            canvas.drawPath(arrowPath, arrowFillPaint)
+            canvas.drawPath(arrowPath, arrowOutlinePaint)
+            canvas.restore()
+        } else {
+            canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 11f, dotPaint)
+        }
+    }
+
+    /** A small "up"-pointing chevron centered at ([cx],[cy]) — rotated by the caller, not here. */
+    private fun buildArrowPath(cx: Float, cy: Float): Path = Path().apply {
+        moveTo(cx, cy - 12f)
+        lineTo(cx - 9f, cy + 8f)
+        lineTo(cx, cy + 3f)
+        lineTo(cx + 9f, cy + 8f)
+        close()
     }
 }
 
@@ -215,6 +276,18 @@ fun StreetMapView(
      * heading outdoors yet.
      */
     headingDeg: Float? = null,
+    /**
+     * Real device/travel heading (degrees clockwise from north — same
+     * WORLD-frame convention as [headingDeg], CLAUDE.md Rule 14), used to
+     * rotate the current-position MARKER icon into a directional arrow.
+     * Unlike [headingDeg] (which only rotates the whole MAP, and only
+     * while navigating — see MapScreen's `isNavigating` gating), this is
+     * meant to be fed whenever a real heading is available at all, so the
+     * marker itself points the right way even when the map stays
+     * north-up. Null falls back to the previous plain (non-directional)
+     * dot marker — STATUS_AND_ROADMAP.md Tier-1 item #1.
+     */
+    markerHeadingDeg: Float? = null,
     onMapViewReady: (MapView) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -322,6 +395,54 @@ fun StreetMapView(
         }
     }
 
+    // REAL on-device finding: `overlay.position` used to be written
+    // directly in the `update` block below, every recomposition (i.e.
+    // every ~10Hz sensor/GNSS tick) — so the DRAWN marker snapped from
+    // point to point exactly like the map camera used to before the
+    // isFollowingLocation/setCenter fix above, just for the dot/arrow
+    // itself rather than the viewport. This interpolates the marker's
+    // drawn position smoothly instead — deliberately a SEPARATE concern
+    // from the camera-recenter logic above (which stays instant
+    // `setCenter`, not `animateTo`, for the already-documented
+    // onScroll/isProgrammaticMove reason): this only changes where the
+    // marker is DRAWN on whatever viewport the camera logic already
+    // decided on, so it cannot reintroduce that bug.
+    //
+    // Keyed on the raw (currentLatDeg, currentLonDeg) params, not a
+    // derived GeoPoint (a new GeoPoint instance every recomposition would
+    // never compare `==` to the previous key and would restart this
+    // effect on every single recomposition regardless of an actual
+    // position change).
+    LaunchedEffect(currentLatDeg, currentLonDeg) {
+        val target = if (currentLatDeg != null && currentLonDeg != null) {
+            GeoPoint(currentLatDeg, currentLonDeg)
+        } else {
+            null
+        }
+        val start = overlay.position
+        if (target == null || start == null) {
+            // No real drawn position to animate FROM (first fix ever
+            // this run) or no target to animate TO (fix lost) — snap
+            // instead of interpolating a meaningless jump against null.
+            overlay.position = target
+            mapView.invalidate()
+            return@LaunchedEffect
+        }
+        val startLatDeg = start.latitude
+        val startLonDeg = start.longitude
+        val deltaLatDeg = target.latitude - startLatDeg
+        val deltaLonDeg = target.longitude - startLonDeg
+        val startFrameNanos = withFrameNanos { it }
+        var t: Float
+        do {
+            val nowFrameNanos = withFrameNanos { it }
+            val elapsedMs = (nowFrameNanos - startFrameNanos) / 1_000_000L
+            t = (elapsedMs.toFloat() / MARKER_ANIMATION_DURATION_MS).coerceIn(0f, 1f)
+            overlay.position = GeoPoint(startLatDeg + deltaLatDeg * t, startLonDeg + deltaLonDeg * t)
+            mapView.invalidate()
+        } while (t < 1f)
+    }
+
     Box(modifier = modifier.fillMaxSize()) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -339,10 +460,20 @@ fun StreetMapView(
                 // clockwise by the given degrees, so to make the device's
                 // own heading point "up" the map must be rotated by the
                 // OPPOSITE (negative) amount.
-                view.setMapOrientation(if (headingDeg != null) -headingDeg else 0f)
+                val mapOrientationDeg = if (headingDeg != null) -headingDeg else 0f
+                view.setMapOrientation(mapOrientationDeg)
+                // Subtract the map's own rotation back out so the arrow
+                // always points at the REAL travel direction on screen —
+                // see CurrentPositionOverlay.iconRotationDeg's own doc for
+                // why this subtraction is needed (osmdroid pre-rotates the
+                // canvas this overlay draws into by mapOrientationDeg).
+                overlay.iconRotationDeg = markerHeadingDeg?.let { it - mapOrientationDeg }
                 if (currentLatDeg != null && currentLonDeg != null) {
                     val point = GeoPoint(currentLatDeg, currentLonDeg)
-                    overlay.position = point
+                    // overlay.position is NOT written here — the marker-
+                    // animation LaunchedEffect above owns it, smoothing
+                    // between successive ticks. This block only decides
+                    // whether/where the CAMERA recenters.
                     val previousCenter = lastCenteredPoint.value
                     val shouldRecenter = isFollowingLocation &&
                         (previousCenter == null || previousCenter.distanceToAsDouble(point) >= MIN_RECENTER_DISTANCE_M)

@@ -31,6 +31,7 @@ import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.ui.components.DriftSummaryCard
 import com.sih26168.idr.ui.components.FloatingIconButton
 import com.sih26168.idr.ui.components.GnssModeChangeBanner
+import com.sih26168.idr.ui.components.GnssReacquiredBanner
 import com.sih26168.idr.ui.components.StatusChip
 import com.sih26168.idr.ui.components.VehicleMode
 import com.sih26168.idr.ui.components.VehicleModeSelector
@@ -111,6 +112,24 @@ internal fun StatusOverlayContent(
         transition.fromMode == GnssMode.TRANSITION &&
         transition.atMs != dismissedTransitionAtMs
 
+    // Symmetric counterpart (STATUS_AND_ROADMAP.md Tier-1 item #2,
+    // "GNSS reacquired" banner). Mirrors showModeChangeBanner's own
+    // narrowing above for the same reason: `fromMode == REACQUISITION` is
+    // the one path into GNSS_AIDED that follows a GENUINE outage (the
+    // state machine actually spent time in DEAD_RECKONING first) — a
+    // TRANSITION -> GNSS_AIDED recovery never left GNSS_AIDED long enough
+    // to have shown the "lost" banner in the first place (see that
+    // exclusion's own comment above), so it's excluded here too rather
+    // than announcing a "reacquisition" that was never really lost.
+    // `dismissedReacquisitionAtMs` follows the same per-timestamp-dismiss
+    // pattern as `dismissedTransitionAtMs` so a second real outage later
+    // in the same session re-shows this banner too.
+    var dismissedReacquisitionAtMs by remember { mutableStateOf<Long?>(null) }
+    val showReacquiredBanner = transition != null &&
+        transition.toMode == GnssMode.GNSS_AIDED &&
+        transition.fromMode == GnssMode.REACQUISITION &&
+        transition.atMs != dismissedReacquisitionAtMs
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -161,6 +180,11 @@ internal fun StatusOverlayContent(
             if (showModeChangeBanner) {
                 key(transition!!.atMs) {
                     GnssModeChangeBanner(onDismiss = { dismissedTransitionAtMs = transition.atMs })
+                }
+            }
+            if (showReacquiredBanner) {
+                key(transition!!.atMs) {
+                    GnssReacquiredBanner(onDismiss = { dismissedReacquisitionAtMs = transition.atMs })
                 }
             }
             if (isPipelinePaused) {

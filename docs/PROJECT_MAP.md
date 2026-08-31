@@ -2143,9 +2143,70 @@ Important concepts/assumptions: StatusOverlayContent triggers this off
   (StatusOverlayContent-local state, keyed by the transition's own
   timestamp) lets the banner re-show on a SECOND real outage later in the
   same session instead of staying permanently dismissed after the first.
-  Only the GNSS_AIDED -> DEAD_RECKONING direction was requested/built;
-  the symmetric "GNSS reacquired" case is NOT implemented.
-Connected to: gnss/GnssModeRepository.kt (GnssModeUiState.lastTransition) -> StatusOverlayContent.kt -> GnssModeChangeBanner
+UPDATE (2026-08-31, STATUS_AND_ROADMAP.md Tier-1 item #2): the symmetric
+  "GNSS reacquired" direction is now built too —
+  `GnssReacquiredBanner`, a second public composable in this same file,
+  sharing layout/dismiss behavior with `GnssModeChangeBanner` via a new
+  private `ModeChangeBanner(title, message, backgroundColor, onDismiss,
+  ...)` both now call (extracted once a second real caller existed).
+  Solid `GnssAidedColor` background (the same color already used for the
+  GNSS_AIDED status chip) marks it as the "good news" counterpart to
+  `GnssModeChangeBanner`'s `DeadReckoningColor` alert. Triggered by
+  StatusOverlayContent's new `showReacquiredBanner`, narrowed the same
+  way as `showModeChangeBanner`: `fromMode == REACQUISITION && toMode ==
+  GNSS_AIDED` (a GENUINE outage actually ending), excluding a
+  `TRANSITION -> GNSS_AIDED` recovery blip that was never long enough to
+  have shown the "lost" banner in the first place. Own
+  `dismissedReacquisitionAtMs` state, same per-timestamp-dismiss pattern.
+Connected to: gnss/GnssModeRepository.kt (GnssModeUiState.lastTransition) ->
+  StatusOverlayContent.kt -> GnssModeChangeBanner / GnssReacquiredBanner
+
+ui/map/StreetMapView.kt
+Status: IMPLEMENTED (Slice 8b) — marker animation + directional heading
+  arrow added 2026-08-31 (STATUS_AND_ROADMAP.md Tier-1 item #1)
+Purpose: Real osmdroid/OpenStreetMap tile base layer plus the
+  current-position halo/ring marker, outage-anchor dashed line, and
+  active-route polyline — see this file's own extensive header doc
+  comment for the CARTO->MAPNIK tile-source history and the
+  setCenter-vs-animateTo camera-follow bug fix.
+UPDATE (2026-08-31): the DRAWN marker position used to be written
+  directly into `CurrentPositionOverlay.position` every recomposition
+  (~10Hz, one per sensor/GNSS tick), which snapped the dot from point to
+  point exactly like the map CAMERA used to before the existing
+  isFollowingLocation/setCenter fix — just for the marker rather than the
+  viewport. A new `LaunchedEffect(currentLatDeg, currentLonDeg)` now
+  interpolates `overlay.position` linearly over `MARKER_ANIMATION_
+  DURATION_MS` (300ms, an engineering default — CLAUDE.md Rule 13) using
+  `withFrameNanos`, cancelled/relaunched (not run to completion) on every
+  new tick so a live stream of ticks reads as one continuous smoothed
+  motion rather than discrete completed tweens. Deliberately kept
+  SEPARATE from the camera-recenter logic (which still uses instant
+  `setCenter`, unchanged) — animating the CAMERA was already tried and
+  reverted for a real, documented reason (spurious onScroll callbacks
+  fooling the follow/user-pan gesture detector); this only changes where
+  the marker is drawn on whatever viewport that logic already picked, so
+  it cannot reintroduce that bug.
+  Also new: a `markerHeadingDeg: Float?` param (fed unconditionally from
+  MapScreen's already-computed `headingDeg`, not gated to
+  `isNavigating` the way the map-rotation `headingDeg` param is) rotates
+  the marker into a directional chevron/arrow
+  (`CurrentPositionOverlay.iconRotationDeg`, drawn in place of the plain
+  dot) instead of a non-directional dot. Rotation math subtracts the
+  map's own current rotation back out (`markerHeadingDeg -
+  mapOrientationDeg`) so the arrow always points at the REAL device
+  heading on screen regardless of whether the map itself is currently
+  north-up or heading-up-rotated — UNVERIFIED ON A REAL DEVICE
+  (CLAUDE.md Rule 13), same caveat the pre-existing map-rotation
+  `headingDeg` param already carried, since it assumes osmdroid
+  pre-rotates the canvas before invoking overlay `draw()` calls.
+  MapScreen.kt's own `lastConfidentHeadingDeg`/`headingDeg` were changed
+  from a `Float` defaulted to 0f to a nullable `Float?` defaulted to
+  null, specifically so the marker arrow stays a plain dot until a REAL
+  heading (GNSS bearing or DR velocity vector) has actually been
+  observed this run, rather than claiming a fake "pointing north"
+  direction before any real reading exists.
+Connected to: ui/screens/MapScreen.kt (currentLatDeg/currentLonDeg,
+  headingDeg, markerHeadingDeg) -> StreetMapView -> CurrentPositionOverlay
 
 ui/map/TrackCanvas.kt
 Status: REMOVED (2026-08-30) — was IMPLEMENTED (Slice 8, 2026-08-25)

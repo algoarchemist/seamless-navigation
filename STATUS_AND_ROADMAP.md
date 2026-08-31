@@ -18,7 +18,7 @@ no benchmark number here is invented (per `CLAUDE.md` Rule 13).
 | 3 | Advanced Map-Matching & Kinematic Constraints | 🟡 MVP-level map snap + Turning exemption implemented (2026-08-30), see below | `map/MapConstraint.kt`, `motion/TurningDetector.kt`, `dr/NonHolonomicConstraint.kt` |
 | 4 | GNSS+INS Fusion Engine | 🟡 AI-based adaptive REACQUISITION blend implemented (2026-08-30), see below | `ml/ReacquisitionDriftModel.kt`, `fusion/PositionFusion.kt`, `fusion/RunningStats.kt` |
 | 5 | Seamless GNSS Deficit Handler | 🟡 Implemented, timing unvalidated | `gnss/GnssOutageDetector.kt` |
-| 6 | Real-time Navigation Interface | 🟡 Mostly implemented, icon doesn't animate | `ui/map/StreetMapView.kt`, `ui/screens/MapScreen.kt` |
+| 6 | Real-time Navigation Interface | 🟡 Marker now animates + rotates with heading (2026-08-31), symmetric GNSS-reacquired banner added, see below | `ui/map/StreetMapView.kt`, `ui/screens/MapScreen.kt`, `ui/components/GnssModeChangeBanner.kt` |
 
 ## 1. In-Vehicle Alignment & Calibration Engine — 🟡 yaw shared + auto-recalibration, implemented 2026-08-30
 
@@ -203,7 +203,7 @@ drift number that can honestly be quoted (per CLAUDE.md Rule 13). The
 tooling to capture one already exists (`capture/DriveDataLogger.kt` +
 `scripts/analyze_drive_log.py`) — it just hasn't been run outdoors yet.
 
-## 6. Real-time Navigation Interface — 🟡 mostly implemented, icon doesn't animate
+## 6. Real-time Navigation Interface — 🟡 marker animates + rotates, reacquired banner added (2026-08-31)
 
 **What exists and is genuinely real-time:** a live OpenStreetMap
 (`osmdroid`) map, destination search (Nominatim), turn-by-turn routing
@@ -211,14 +211,24 @@ tooling to capture one already exists (`capture/DriveDataLogger.kt` +
 motion label, alignment) all driven by live `StateFlow`s updating at
 sensor/GNSS tick rate.
 
-**Gap against the literal ask:** the position marker in
-`StreetMapView.kt` is a static dot/halo that **snaps** to each new
-position via `setCenter` rather than animating between points, and there
-is no directional vehicle-icon rotation tied to heading on the marker
-itself (heading-up map rotation exists separately but is flagged in code
-as "unverified on a real device"). The GNSS-lost banner
-(`GnssModeChangeBanner.kt`) is one-directional — there's no symmetric
-"GNSS reacquired" banner.
+**Closed 2026-08-31 (STATUS_AND_ROADMAP.md Tier-1 #1/#2):** the position
+marker's DRAWN position now interpolates smoothly between ticks instead
+of snapping (a `LaunchedEffect`/`withFrameNanos` tween in
+`StreetMapView.kt`, deliberately kept separate from the camera-recenter
+logic, which stays instant `setCenter` on purpose — see that file's own
+doc for why), and rotates into a directional chevron once a real
+GNSS-bearing/DR-velocity heading exists (`markerHeadingDeg`, fed
+unconditionally, not gated to turn-by-turn navigation the way the
+map's own heading-up rotation is). `GnssModeChangeBanner.kt` now also
+has a symmetric `GnssReacquiredBanner`, shown on a genuine
+`REACQUISITION -> GNSS_AIDED` transition.
+
+**Still missing relative to the literal ask:** the marker's rotation math
+(and the map's own heading-up rotation it shares the counter-rotation
+math with) is UNVERIFIED ON A REAL DEVICE against a live compass heading
+outdoors (CLAUDE.md Rule 13) — no confirmed-correct on-device screenshot
+or video exists yet showing the arrow pointing the right way while
+actually driving/turning.
 
 ## Explicitly out of scope — do not build these
 
@@ -236,13 +246,26 @@ Strategies) first.
 ## Roadmap
 
 ### Tier 1 — cheap, high demo impact
-1. **Animate the position marker + rotate it with heading** in
+1. ~~**Animate the position marker + rotate it with heading** in
    `StreetMapView.kt` (replace the `setCenter` snap with interpolated
-   movement). Directly closes the "smooth, uninterrupted vehicle icon"
-   gap and is the single highest-visibility fix for a demo.
-2. **Add the symmetric "GNSS reacquired" banner** next to the existing
+   movement).~~ **DONE (2026-08-31)** — see `docs/PROJECT_MAP.md`'s
+   `ui/map/StreetMapView.kt` entry. The DRAWN marker position now
+   interpolates smoothly between ticks (a `LaunchedEffect` +
+   `withFrameNanos` tween, kept deliberately separate from the
+   already-fixed camera-recenter logic, which stays instant `setCenter`
+   on purpose) and rotates into a directional chevron once a real
+   heading exists. Still needs a real outdoor test drive to confirm the
+   rotation math reads correctly on a live compass heading (CLAUDE.md
+   Rule 13) — the map-rotation math it shares this caveat with was
+   already flagged unverified before this change.
+2. ~~**Add the symmetric "GNSS reacquired" banner** next to the existing
    `GnssModeChangeBanner.kt`, so both directions of the mode transition
-   are visibly announced.
+   are visibly announced.~~ **DONE (2026-08-31)** — `GnssReacquiredBanner`
+   in that same file, triggered by `StatusOverlayContent.kt`'s new
+   `showReacquiredBanner`, mirroring the existing lost-banner's
+   `fromMode`/`toMode` narrowing so it only fires on a genuine outage
+   actually ending (`REACQUISITION -> GNSS_AIDED`), not a brief
+   `TRANSITION -> GNSS_AIDED` recovery blip.
 3. **Run one real outdoor drive** with a deliberate GNSS-denied stretch
    (tunnel/underpass/parking structure) using the already-built
    `DriveDataLogger.kt` + `scripts/analyze_drive_log.py` tooling. This

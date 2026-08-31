@@ -22,6 +22,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.sih26168.idr.ui.theme.DeadReckoningColor
 import com.sih26168.idr.ui.theme.GlassCardRadius
+import com.sih26168.idr.ui.theme.GnssAidedColor
 import kotlinx.coroutines.delay
 
 /**
@@ -45,9 +46,60 @@ import kotlinx.coroutines.delay
  * [DeadReckoningColor] itself constant across light/dark theme: this is a
  * fixed-color alert surface, and TextPrimary would lose contrast against
  * it in light mode (where TextPrimary is near-black).
+ *
+ * Shares its layout/dismiss behavior with [GnssReacquiredBanner] (the
+ * symmetric "back to GNSS" counterpart, STATUS_AND_ROADMAP.md Tier-1
+ * item #2) via the private [ModeChangeBanner] both now call — pulled out
+ * once a second real caller existed, rather than speculatively before
+ * one did.
  */
 @Composable
 fun GnssModeChangeBanner(
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+    autoDismissMs: Long = 4_000L,
+) {
+    ModeChangeBanner(
+        title = "GNSS signal lost",
+        message = "Switched to dead reckoning — position is now estimated from motion sensors.",
+        backgroundColor = DeadReckoningColor,
+        onDismiss = onDismiss,
+        modifier = modifier,
+        autoDismissMs = autoDismissMs,
+    )
+}
+
+/**
+ * The symmetric counterpart to [GnssModeChangeBanner]: shown the moment
+ * the state machine confirms a real GNSS fix again (REACQUISITION ->
+ * GNSS_AIDED — see `ui/screens/StatusOverlayContent.kt`'s
+ * `showReacquiredBanner`, mirroring that file's own `showModeChangeBanner`
+ * gating). [GnssAidedColor] (the same color [com.sih26168.idr.ui.screens.StatusOverlayContent]
+ * already uses for the GNSS_AIDED status chip) marks this as the "good
+ * news" counterpart to [DeadReckoningColor]'s outage alert, same
+ * solid-background-for-a-momentary-alert reasoning as that banner.
+ */
+@Composable
+fun GnssReacquiredBanner(
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+    autoDismissMs: Long = 4_000L,
+) {
+    ModeChangeBanner(
+        title = "GNSS signal reacquired",
+        message = "Back on live GPS — dead-reckoning estimate has been corrected.",
+        backgroundColor = GnssAidedColor,
+        onDismiss = onDismiss,
+        modifier = modifier,
+        autoDismissMs = autoDismissMs,
+    )
+}
+
+@Composable
+private fun ModeChangeBanner(
+    title: String,
+    message: String,
+    backgroundColor: Color,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
     autoDismissMs: Long = 4_000L,
@@ -61,18 +113,18 @@ fun GnssModeChangeBanner(
         modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(GlassCardRadius))
-            .background(DeadReckoningColor)
+            .background(backgroundColor)
             .padding(horizontal = 16.dp, vertical = 12.dp),
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "GNSS signal lost",
+                text = title,
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
                 color = Color.White,
             )
             Text(
-                text = "Switched to dead reckoning — position is now estimated from motion sensors.",
+                text = message,
                 style = MaterialTheme.typography.labelMedium,
                 color = Color.White.copy(alpha = 0.9f),
             )
