@@ -18,13 +18,22 @@ motion-classification stand-ins, a Figma-derived UI with Drive/Map/
 History tabs, real OpenStreetMap street tiles, and full search ->
 route -> turn-by-turn navigation against live Nominatim/OSRM services.
 `train_motion_classifier.py` remains PLANNED (blocked on self-captured
-Pothole/Phone-Moved labels IO-VNBD doesn't provide). A true outdoor
-GNSS_AIDED lock (needed to verify TRANSITION/REACQUISITION blending and
-live turn-by-turn progress against real motion) has not yet happened
-this project — every fix so far has come from indoor/marginal-signal
-on-device testing, which has itself surfaced and fixed several real
-bugs (noisy Doppler speed, REACQUISITION flapping, a missing map
-anchor, tile-loading fights with `animateTo`, and others).
+Pothole/Phone-Moved labels IO-VNBD doesn't provide). UPDATE (2026-09-01):
+a real outdoor GNSS_AIDED lock has now happened (325.9s drive, 3
+GNSS_AIDED segments up to 149.9s, 3 genuine DEAD_RECKONING stretches up
+to 37.8s) — see DriveDataLogger.kt's entry below for the full result.
+It surfaced a real, measured finding: StationaryDetector's ZUPT is 100%
+false-negative on real urban-traffic data and no fixed accel/gyro
+threshold fixes it (the two classes don't cleanly separate) — flagged,
+not silently patched. Before that drive, every fix had come from
+indoor/marginal-signal on-device testing, which had itself surfaced and
+fixed several real bugs (noisy Doppler speed, REACQUISITION flapping, a
+missing map anchor, tile-loading fights with `animateTo`, and others).
+Same day: SensorRecorder.kt gained a `CaptureLabel`
+(NONE/POTHOLE/PHONE_MOVED) marker mechanism and two debug-screen buttons
+so a real self-captured labeled drive can now be recorded — tooling
+only so far, no labeled drive has actually been captured yet, so
+`train_motion_classifier.py` stays PLANNED.
 
 **The full chronological history — every dated bug fix, scope decision,
 and on-device verification — now lives in `summary.txt` at the repo
@@ -553,6 +562,15 @@ Important concepts/assumptions: orientation and accel come from
   enough from true vehicle heading to flip the map ~180 degrees on GNSS
   reacquisition — see alignment/AlignmentRepository.kt's entry above and
   PRD.md Section 15's 2026-08-28 amendment.
+  UPDATE (2026-09-01, following the real outdoor drive's ZUPT finding —
+  see DriveDataLogger.kt's entry): also computes
+  rawLinearAccelMagnitudeMps2/rawGyroMagnitudeRadPerSec from the SAME
+  east/north/up + gyro components the filtered magnitude uses, just
+  BEFORE LowPassFilter.filter() runs on them, and publishes both onto
+  DeadReckoningState. StationaryDetector still gates on the FILTERED
+  fields only — the raw fields exist purely so a future drive log can
+  compare raw vs. filtered separability offline (see
+  scripts/analyze_drive_log.py's report_raw_vs_filtered).
 Bug found + fixed during Slice 4 on-device verification (2026-08-25):
   lastProcessedAccelTimestampNs was originally a Long defaulting to 0L
   as the "no sample yet" sentinel. On the very first accel sample of a
@@ -819,14 +837,27 @@ Purpose: A minimal, one-off data-capture tool (CLAUDE.md Rule 18) for
   file IO inside the class itself, so the elapsed-ms math stays
   plain-JVM unit-testable (CLAUDE.md Rule 19); writing the JSON to disk
   is `MainActivity`'s job.
-Inputs: record() takes one sensor tick (timestampNs + accel/gyro/orientation floats).
+Inputs: record() takes one sensor tick (timestampNs + accel/gyro/orientation
+  floats + a label String, added 2026-09-01, default CaptureLabel.NONE).
 Outputs: toJsonArray() — hand-written JSON (no new dependency, CLAUDE.md
-  Rule 2), a flat array of flat per-tick objects.
+  Rule 2), a flat array of flat per-tick objects, each now including its
+  `label`.
 Important functions/classes: record() (elapsedMs computed relative to
   the FIRST recorded tick's timestampNs, same boot-time-monotonic clock
   family as every other sensor timestamp in this codebase — CLAUDE.md
   Rule 9/14, NOT wall-clock); reset(); recordedCount.
-Connected to: MainActivity (Start/Stop Recording button, own
+  UPDATE (2026-09-01, following the real outdoor drive's ZUPT finding —
+  see DriveDataLogger.kt's entry): added `CaptureLabel` (NONE/POTHOLE/
+  PHONE_MOVED — the only two PRD.md Section 14 classes IO-VNBD has no
+  ground truth for, per the Phase 4 finding below) and a `label` field on
+  SensorRecordEntry, set from OUTSIDE this class by whichever label
+  MainActivity's marker buttons say is active at record() time — this
+  class stays a dumb recorder, it doesn't derive labels from the sensor
+  values itself. This is the tooling for PRD.md Section 24's "self-
+  captured labelled data" step, not the captured data itself — no real
+  labeled drive has been recorded with it yet.
+Connected to: MainActivity (Start/Stop Recording button + Mark
+  Pothole/Phone Moved buttons, 2026-09-01, own
   sensorRepository.state collector) -> SensorRecorder -> JSON file
   (getExternalFilesDir(null), pulled via `adb pull` for offline
   inspection)
@@ -874,6 +905,93 @@ Real usage (2026-08-29): smoke-tested indoors (phone handled, not a real
   drive with an intentional GNSS-denied stretch (tunnel/underpass/
   parking structure) is still needed before any of the three threshold
   groups above can be called validated.
+REAL OUTDOOR DRIVE (2026-09-01): first genuine outdoor test drive,
+  325.9s / 3246 rows at a real ~10 Hz. GNSS_AIDED achieved a real
+  multi-minute lock (3 segments, up to 149.9s), with 3 genuine
+  DEAD_RECKONING stretches (up to 37.8s) and clean TRANSITION/
+  REACQUISITION segments (878-1003ms, close to the 1000ms dwell
+  constants) — the "no true outdoor GNSS_AIDED lock yet" gap noted
+  elsewhere in this file is now closed. GNSS fix accuracy was good
+  (p50=3.0m, p90=5.9m) with one outlier (max=114.9m) GnssQuality's
+  25m ceiling correctly should reject.
+  REAL FINDING — ZUPT is not usable as-is: cross-checked against GNSS
+  speed (independent ground truth) while GNSS_AIDED, StationaryDetector's
+  isStationary flag was 100% false-negative (280/280 truly-stopped rows
+  not flagged) and 0% false-positive. The filtered accel/gyro magnitude
+  distributions for truly-stationary vs. truly-moving rows overlap
+  heavily (stationary accel p50=1.517 m/s^2 vs. moving accel p50=1.656
+  m/s^2) — see scripts/analyze_drive_log.py's new
+  report_zupt_threshold_sweep, which grid-searched accel/gyro thresholds
+  against this same log and found NO combination keeps both false
+  negatives and false positives low (best combined-error point:
+  accel<=2.25 m/s^2, gyro<=0.10 rad/s -> still ~23.6% FN / ~23.1% FP).
+  This matches StationaryDetector.kt's own documented "constant-velocity
+  motion looks stationary too" limitation, now measured on real urban-
+  traffic data rather than assumed. NOT fixed by retuning the fixed
+  threshold — CLAUDE.md Rule 18 prototype-first approach was applied
+  (grid search before any code change) and the honest conclusion is this
+  needs either GNSS-speed gating (only available while GNSS_AIDED,
+  i.e. not during the outages ZUPT exists for) or the real ML motion
+  classifier's Stationary class (train_motion_classifier.py, still
+  PLANNED) — not a better fixed accel/gyro threshold. Left unchanged in
+  Kotlin pending that; flagged here rather than silently shipped as
+  "validated." Full narrative in summary.txt's 2026-09-01 entry.
+  Follow-up instrumentation added the same day: DeadReckoningState/
+  DriveLogEntry now also carry rawLinearAccelMagnitudeMps2/
+  rawGyroMagnitudeRadPerSec (PRE-filter, computed in
+  BaselineDeadReckoningRepository right before LowPassFilter.filter()
+  runs) so a FUTURE drive log can compare raw vs. filtered separability
+  and let LowPassFilter's cutoffHz itself be tuned — today's log
+  predates these fields, so that comparison isn't possible yet (see
+  scripts/analyze_drive_log.py's report_raw_vs_filtered, which degrades
+  gracefully on older logs missing these columns).
+
+scripts/analyze_drive_log.py
+Status: IMPLEMENTED
+Purpose: Single responsibility (CLAUDE.md Rule 5): turn a DriveDataLogger
+  CSV into a real, printed answer for whether the app's "engineering
+  default, not yet validated" thresholds (GnssQuality's max-accuracy/
+  max-fix-age, GnssOutageDetector's four dwell constants,
+  StationaryDetector's ZUPT accel/gyro/dwell thresholds) hold up against
+  one real drive — the offline half of the DriveDataLogger.kt prototype
+  described in that file's own doc (CLAUDE.md Rule 18). Deliberately only
+  REPORTS — never edits the Kotlin constants itself, since trading off
+  false-positive vs. false-negative ZUPT (or a flappier vs. slower GNSS
+  state machine) is a human judgment call, not something to auto-apply.
+Inputs: one positional csv_path (a drive_log_<ts>.csv pulled via
+  `adb pull` from the app's Start/Stop debug-screen logger).
+Outputs: stdout report only — overview (tick count/duration/observed
+  Hz), real GNSS-mode segment durations, GNSS fix-quality percentiles,
+  a ZUPT false-positive/false-negative confusion check against GNSS
+  speed as independent ground truth, a ZUPT threshold grid-sweep, and a
+  raw-vs-filtered accel/gyro comparison. Exit 1 if the CSV doesn't exist
+  or is missing a required column.
+Important functions: load_log (schema check), report_mode_segments
+  (groups consecutive same-mode rows into real dwell segments),
+  report_zupt_validation (GNSS speed < 0.3 m/s while GNSS_AIDED as
+  ground truth for "was it really stationary" — independent of the
+  accel/gyro signal being validated, so not circular),
+  sweep_zupt_thresholds (added 2026-09-01, after the first real drive
+  found ZUPT 100% false-negative — grid-searches accel/gyro threshold
+  combinations against the SAME ground truth to check whether a
+  different FIXED threshold would fix it, or whether the two classes
+  just aren't separable this way on real data; see the REAL OUTDOOR
+  DRIVE finding in DriveDataLogger.kt's entry above for the answer),
+  report_raw_vs_filtered (added 2026-09-01, compares
+  rawLinearAccelMagnitudeMps2 against the filtered magnitude when a log
+  has both — lets LowPassFilter's cutoffHz be tuned from a future log,
+  not just the StationaryDetector threshold; degrades gracefully via
+  has_raw_columns on older logs that predate these fields).
+Unit tests: tests/scripts/test_analyze_drive_log.py (6 cases, added
+  2026-09-01, synthetic data only — CLAUDE.md Rule 19) — sweep finds a
+  zero-error threshold when classes are perfectly separable; sweep
+  correctly finds NO zero-error threshold when classes fully overlap
+  (proves the sweep can detect "not separable," not just always find a
+  win); DEAD_RECKONING-mode rows (no independent ground truth) are
+  excluded from the sweep; has_raw_columns true/false on logs with/
+  without the 2026-09-01 raw fields. `python -m pytest
+  tests/scripts/test_analyze_drive_log.py` — 6/6 pass; full suite
+  (`python -m pytest tests/`) — 43/43 pass, no regressions.
 
 android/app/src/test/kotlin/com/sih26168/idr/sensors/SampleRateTest.kt
 Status: IMPLEMENTED

@@ -26,6 +26,16 @@ data class DriveLogEntry(
     /** UPDATE (2026-08-30): low-pass FILTERED, not raw — see DeadReckoningState's own doc. */
     val gyroMagnitudeRadPerSec: Double,
     val isStationary: Boolean,
+    /**
+     * UPDATE (2026-09-01): PRE-filter magnitude, added after the real
+     * outdoor drive found ZUPT 100% false-negative against filtered-only
+     * logging — lets `scripts/analyze_drive_log.py` compare raw vs.
+     * filtered separability and tune `LowPassFilter`'s cutoffHz itself,
+     * not just the StationaryDetector threshold. See DeadReckoningState's
+     * own doc.
+     */
+    val rawLinearAccelMagnitudeMps2: Double,
+    val rawGyroMagnitudeRadPerSec: Double,
 )
 
 /**
@@ -67,6 +77,8 @@ class DriveDataLogger {
         linearAccelMagnitudeMps2: Double,
         gyroMagnitudeRadPerSec: Double,
         isStationary: Boolean,
+        rawLinearAccelMagnitudeMps2: Double,
+        rawGyroMagnitudeRadPerSec: Double,
     ) {
         val start = startTimestampNs ?: timestampNs.also { startTimestampNs = it }
         val elapsedMs = (timestampNs - start) / 1_000_000L
@@ -81,6 +93,8 @@ class DriveDataLogger {
             linearAccelMagnitudeMps2 = linearAccelMagnitudeMps2,
             gyroMagnitudeRadPerSec = gyroMagnitudeRadPerSec,
             isStationary = isStationary,
+            rawLinearAccelMagnitudeMps2 = rawLinearAccelMagnitudeMps2,
+            rawGyroMagnitudeRadPerSec = rawGyroMagnitudeRadPerSec,
         )
     }
 
@@ -92,7 +106,8 @@ class DriveDataLogger {
     fun toCsv(): String {
         val sb = StringBuilder()
         sb.append("elapsedMs,gnssMode,gnssFixAccuracyM,gnssFixAgeMs,gnssSpeedMps,")
-        sb.append("drVelocityEastMps,drVelocityNorthMps,linearAccelMagnitudeMps2,gyroMagnitudeRadPerSec,isStationary\n")
+        sb.append("drVelocityEastMps,drVelocityNorthMps,linearAccelMagnitudeMps2,gyroMagnitudeRadPerSec,isStationary,")
+        sb.append("rawLinearAccelMagnitudeMps2,rawGyroMagnitudeRadPerSec\n")
         entries.forEach { e ->
             sb.append(e.elapsedMs).append(',')
             sb.append(e.gnssMode).append(',')
@@ -103,7 +118,9 @@ class DriveDataLogger {
             sb.append(e.drVelocityNorthMps).append(',')
             sb.append(e.linearAccelMagnitudeMps2).append(',')
             sb.append(e.gyroMagnitudeRadPerSec).append(',')
-            sb.append(e.isStationary)
+            sb.append(e.isStationary).append(',')
+            sb.append(e.rawLinearAccelMagnitudeMps2).append(',')
+            sb.append(e.rawGyroMagnitudeRadPerSec)
             sb.append('\n')
         }
         return sb.toString()

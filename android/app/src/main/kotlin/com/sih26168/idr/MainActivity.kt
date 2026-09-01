@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -30,6 +31,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.sih26168.idr.alignment.AlignmentRepository
+import com.sih26168.idr.capture.CaptureLabel
 import com.sih26168.idr.capture.DriveDataLogger
 import com.sih26168.idr.capture.SensorRecorder
 import com.sih26168.idr.dr.BaselineDeadReckoningRepository
@@ -59,6 +61,7 @@ import java.io.File
 import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -111,6 +114,13 @@ data class DriveLogUiState(
     val lastSavedFileName: String? = null,
 )
 
+// How long a single "Mark Pothole" tap keeps CaptureLabel.POTHOLE active
+// on recorded ticks — an engineering default (a real pothole shock is
+// much shorter than this; the window is deliberately generous so a
+// slightly-late tap still captures the real event), not yet validated
+// against a real self-captured drive (CLAUDE.md Rule 13).
+private const val POTHOLE_MARKER_WINDOW_MS = 500L
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var sensorRepository: SensorRepository
@@ -149,6 +159,25 @@ class MainActivity : ComponentActivity() {
     private val recordingState: StateFlow<RecordingUiState> = _recordingState.asStateFlow()
     private var recorderCollectJob: Job? = null
     private var lastProcessedRecorderAccelTimestampNs: Long? = null
+
+    // 2026-09-01: the two PRD.md Section 14 classes IO-VNBD has no ground
+    // truth for (see SensorRecordEntry's own doc) — tapped live during a
+    // real self-captured drive, not derived from sensor values. Pothole is
+    // MOMENTARY (a brief shock, so the tap just opens a short labeling
+    // window around the moment it happened — POTHOLE_MARKER_WINDOW_MS is a
+    // generous over-estimate of a real pothole event's duration, an
+    // engineering default like the rest of this project's unvalidated
+    // thresholds, CLAUDE.md Rule 13); Phone Moved is a STATE the phone
+    // stays in until tapped again, so it's a plain toggle.
+    private var isPotholeMarkerActive by mutableStateOf(false)
+    private var isPhoneMovedActive by mutableStateOf(false)
+    private var potholeMarkerJob: Job? = null
+
+    private fun currentCaptureLabel(): String = when {
+        isPotholeMarkerActive -> CaptureLabel.POTHOLE
+        isPhoneMovedActive -> CaptureLabel.PHONE_MOVED
+        else -> CaptureLabel.NONE
+    }
 
     // One-off data-capture tool (capture/DriveDataLogger.kt) — gathers a
     // real test drive's GNSS+DR ticks so the "engineering default, not
@@ -307,6 +336,10 @@ class MainActivity : ComponentActivity() {
                         driveLogState = driveLogUiState,
                         onStartDriveLog = ::startDriveLog,
                         onStopDriveLog = ::stopDriveLogAndSave,
+                        isPotholeMarkerActive = isPotholeMarkerActive,
+                        isPhoneMovedActive = isPhoneMovedActive,
+                        onMarkPothole = ::markPothole,
+                        onTogglePhoneMoved = ::togglePhoneMoved,
                     )
                 } else {
                     // Slice 8b: two tabs (Map/History) share the SAME live
@@ -448,6 +481,7 @@ class MainActivity : ComponentActivity() {
                     azimuthRad = orientation.azimuthRad,
                     pitchRad = orientation.pitchRad,
                     rollRad = orientation.rollRad,
+                    label = currentCaptureLabel(),
                 )
                 _recordingState.value = _recordingState.value.copy(recordedCount = sensorRecorder.recordedCount)
             }
@@ -477,6 +511,8 @@ class MainActivity : ComponentActivity() {
                     linearAccelMagnitudeMps2 = dr.linearAccelMagnitudeMps2,
                     gyroMagnitudeRadPerSec = dr.gyroMagnitudeRadPerSec,
                     isStationary = dr.isStationary,
+                    rawLinearAccelMagnitudeMps2 = dr.rawLinearAccelMagnitudeMps2,
+                    rawGyroMagnitudeRadPerSec = dr.rawGyroMagnitudeRadPerSec,
                 )
                 _driveLogState.value = _driveLogState.value.copy(recordedCount = driveDataLogger.recordedCount)
             }
@@ -501,7 +537,26 @@ class MainActivity : ComponentActivity() {
     private fun startRecording() {
         sensorRecorder.reset()
         lastProcessedRecorderAccelTimestampNs = null
+        isPotholeMarkerActive = false
+        isPhoneMovedActive = false
+        potholeMarkerJob?.cancel()
         _recordingState.value = RecordingUiState(isRecording = true, recordedCount = 0)
+    }
+
+    // Re-triggerable: tapping again while a window is already open just
+    // restarts the window (covers back-to-back potholes) rather than
+    // stacking jobs that could each independently clear the flag early.
+    private fun markPothole() {
+        potholeMarkerJob?.cancel()
+        isPotholeMarkerActive = true
+        potholeMarkerJob = lifecycleScope.launch {
+            delay(POTHOLE_MARKER_WINDOW_MS)
+            isPotholeMarkerActive = false
+        }
+    }
+
+    private fun togglePhoneMoved() {
+        isPhoneMovedActive = !isPhoneMovedActive
     }
 
     // Writing the JSON off the main thread (Dispatchers.IO) — CLAUDE.md
@@ -559,6 +614,10 @@ private fun IdrSensorScreen(
     driveLogState: DriveLogUiState,
     onStartDriveLog: () -> Unit,
     onStopDriveLog: () -> Unit,
+    isPotholeMarkerActive: Boolean,
+    isPhoneMovedActive: Boolean,
+    onMarkPothole: () -> Unit,
+    onTogglePhoneMoved: () -> Unit,
 ) {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
@@ -588,6 +647,20 @@ private fun IdrSensorScreen(
                             "are logged with millisecond timestamps to a JSON file on Stop."
                     },
                 )
+                // PRD.md Section 24's self-captured Pothole/Phone-Moved
+                // labels (2026-09-01) — only meaningful while recordingState
+                // is active, but left tappable regardless so a stray tap
+                // before Start is harmless (currentCaptureLabel() is only
+                // read from inside the recording loop, which is itself
+                // gated on isRecording).
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onMarkPothole) {
+                        Text(text = if (isPotholeMarkerActive) "Pothole marked!" else "Mark Pothole")
+                    }
+                    Button(onClick = onTogglePhoneMoved) {
+                        Text(text = if (isPhoneMovedActive) "Phone Moved (tap to end)" else "Mark Phone Moved")
+                    }
+                }
 
                 // Real test-drive logger (capture/DriveDataLogger.kt,
                 // 2026-08-29) — for validating gnss/GnssQuality.kt,

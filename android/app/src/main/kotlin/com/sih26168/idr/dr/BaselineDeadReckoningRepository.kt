@@ -194,6 +194,23 @@ class BaselineDeadReckoningRepository(
                 val linearAccelEastMps2 = if (potholeShockDetectedThisTick) 0.0 else linearAccel[0].toDouble()
                 val linearAccelNorthMps2 = if (potholeShockDetectedThisTick) 0.0 else linearAccel[1].toDouble()
 
+                // Raw (pre-filter) ZUPT input magnitude — published on
+                // DeadReckoningState purely for offline analysis (see that
+                // class's own doc), computed from the SAME east/north/up +
+                // gyro components the filtered version below uses, just
+                // before LowPassFilter.filter() runs on them. Not used by
+                // StationaryDetector itself, which still gates on filtered.
+                val rawLinearAccelMagnitudeMps2 = sqrt(
+                    linearAccelEastMps2 * linearAccelEastMps2 +
+                        linearAccelNorthMps2 * linearAccelNorthMps2 +
+                        linearAccel[2] * linearAccel[2],
+                )
+                val rawGyroMagnitudeRadPerSec = sqrt(
+                    gyro.xRadPerSec * gyro.xRadPerSec +
+                        gyro.yRadPerSec * gyro.yRadPerSec +
+                        gyro.zRadPerSec * gyro.zRadPerSec,
+                ).toDouble()
+
                 // PRD.md Section 11's low-pass vibration filter — smooths
                 // everyday road/engine-vibration noise out of the signal
                 // BEFORE it reaches the double-integrator and the ZUPT
@@ -292,6 +309,8 @@ class BaselineDeadReckoningRepository(
                     gyroMagnitudeRadPerSec = gyroMagnitudeRadPerSec,
                     isStationary = stationary,
                     isTurning = turning,
+                    rawLinearAccelMagnitudeMps2 = rawLinearAccelMagnitudeMps2,
+                    rawGyroMagnitudeRadPerSec = rawGyroMagnitudeRadPerSec,
                 )
             }
         }
