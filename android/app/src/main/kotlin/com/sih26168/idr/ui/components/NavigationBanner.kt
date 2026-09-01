@@ -26,7 +26,7 @@ import kotlin.math.roundToInt
  * 2026-08-26 on explicit user request. Split into two pieces placed at the
  * top and bottom of the map (`ui/screens/MapScreen.kt`), the same
  * top/bottom split Google Maps and most nav apps use (and the same split
- * this screen already used for `DestinationSearchBar`/`ActiveRouteCard`):
+ * this screen already used for the idle search bar/`ActiveRouteCard`):
  *
  * - [NavigationInstructionCard] (top): the CURRENT instruction
  *   (`route.steps[currentStepIndex]`) in large text + live

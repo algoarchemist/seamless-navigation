@@ -8,6 +8,7 @@ import com.sih26168.idr.fusion.VelocityBiasCalibrator
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
 import com.sih26168.idr.gnss.GnssQuality
+import com.sih26168.idr.motion.LongitudinalMotionClassifier
 import com.sih26168.idr.motion.MotionStateClassifier
 import com.sih26168.idr.motion.PotholeShockDetector
 import com.sih26168.idr.sensors.SampleRate
@@ -49,6 +50,10 @@ data class MlVelocityUiState(
     val isCruising: Boolean = false,
     /** PotholeShockDetector fired this tick — forward/lateral accel was discounted before feature extraction. */
     val potholeShockDetectedThisTick: Boolean = false,
+    /** LongitudinalMotionClassifier: vehicle-frame forward acceleration is above the Accelerating threshold this tick. */
+    val isAccelerating: Boolean = false,
+    /** LongitudinalMotionClassifier: vehicle-frame forward acceleration is below the (negative) Braking threshold this tick. */
+    val isBraking: Boolean = false,
 )
 
 // If no GNSS fix has ever been received, fixAgeMs is Long.MAX_VALUE —
@@ -63,10 +68,17 @@ private const val MAX_ELAPSED_SINCE_FIX_S = 999f
 /**
  * Slice 6 (ML inference wired in, per CLAUDE.md's slice order): the
  * Android/coroutine glue connecting SensorRepository + GnssModeRepository's
- * streams to AlignmentRepository's shared alignment estimate, FeatureExtractor,
- * and VelocityModel,
- * republishing the live ML-predicted velocity AND (as of this change)
- * an ML-driven WORLD-frame position estimate as its own StateFlow.
+ * streams to FeatureExtractor and VelocityModel, republishing the live
+ * ML-predicted velocity AND (as of this change) an ML-driven WORLD-frame
+ * position estimate as its own StateFlow.
+ *
+ * UPDATE: phone-to-vehicle yaw alignment is no longer owned here — it now
+ * lives in [com.sih26168.idr.alignment.AlignmentRepository], a SHARED
+ * estimate also read by dr/BaselineDeadReckoningRepository.kt (see that
+ * repository's own doc and AlignmentRepository's for why: this class used
+ * to be alignment tracking's only home, which meant it silently stopped
+ * existing whenever the ONNX model failed to load, and the physics path
+ * had no access to it at all).
  *
  * Deliberately a SEPARATE, PARALLEL repository to
  * BaselineDeadReckoningRepository (CLAUDE.md Rule 5) — it does NOT
@@ -104,9 +116,11 @@ private const val MAX_ELAPSED_SINCE_FIX_S = 999f
  * [com.sih26168.idr.dr.BaselineDeadReckoningRepository] baseline stays
  * untouched by any ML signal, per CLAUDE.md Rule 3); [potholeShockDetector]
  * discounts forward/lateral accel on a detected vertical shock before it
- * reaches [featureExtractor], per PRD.md Section 14's `Pothole` effect.
- * Both are deterministic stand-ins, not the trained PRD Section 14
- * classifier — see their own class docs for why.
+ * reaches [featureExtractor], per PRD.md Section 14's `Pothole` effect;
+ * [longitudinalMotionClassifier] (2026-08-30) flags Accelerating/Braking
+ * from the SAME alignment-corrected `accelForwardMps2` the model
+ * consumes. All three are deterministic stand-ins, not the trained PRD
+ * Section 14 classifier — see their own class docs for why.
  */
 class MlVelocityRepository(
     private val sensorRepository: SensorRepository,
@@ -121,6 +135,7 @@ class MlVelocityRepository(
     private val motionStateClassifier: MotionStateClassifier = MotionStateClassifier(),
     private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
     private val velocityGuard: VelocityGuard = VelocityGuard(),
+    private val longitudinalMotionClassifier: LongitudinalMotionClassifier = LongitudinalMotionClassifier(),
 ) {
     private val _state = MutableStateFlow(MlVelocityUiState())
     val state: StateFlow<MlVelocityUiState> = _state.asStateFlow()
@@ -161,9 +176,10 @@ class MlVelocityRepository(
 
                 // Round 2 (2026-08-28): reads the ONE shared alignment
                 // estimate from AlignmentRepository instead of owning/
-                // evaluating an AlignmentEstimator directly — see that
-                // class's doc for why (BaselineDeadReckoningRepository
-                // now reads the same shared value for the physics path).
+                // evaluating an AlignmentEstimator directly — the SAME
+                // shared value dr/BaselineDeadReckoningRepository.kt also
+                // reads, so both DR paths agree on one real yaw offset
+                // instead of each maintaining its own independent estimate.
                 val alignment = alignmentRepository.state.value
 
                 // WORLD-frame linear acceleration — reuses Slice 3's
@@ -211,6 +227,13 @@ class MlVelocityRepository(
                 val accelLateralMps2 =
                     (discountedLinearAccelEast * lateralEast + discountedLinearAccelNorth * lateralNorth).toFloat()
                 val accelUpMps2 = linearAccel[2]
+
+                // PRD.md Section 14's Accelerating/Braking classes — a
+                // deterministic sign/magnitude stand-in over the SAME
+                // vehicle-frame forward-acceleration feature the ONNX
+                // model itself consumes (see LongitudinalMotionClassifier's
+                // own doc for why this is ML-path-only).
+                val longitudinalClassification = longitudinalMotionClassifier.classify(accelForwardMps2)
 
                 // Yaw rate: rotate the RAW gyro vector into world frame the
                 // same way as accel (angular velocity transforms as a
@@ -319,6 +342,8 @@ class MlVelocityRepository(
                     positionNorthM = positionState.positionNorthM,
                     isCruising = motionClassification.isCruising,
                     potholeShockDetectedThisTick = potholeShockDetectedThisTick,
+                    isAccelerating = longitudinalClassification.isAccelerating,
+                    isBraking = longitudinalClassification.isBraking,
                 )
             }
         }

@@ -5,6 +5,7 @@ import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
 import org.osmdroid.tileprovider.cachemanager.CacheManager
+import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 
@@ -30,6 +31,21 @@ import org.osmdroid.views.MapView
  *
  * Only one saved route is kept at a time (this trip alone, per the
  * request) — saving a new one overwrites the last.
+ *
+ * [prefetchLiveZoomTiles] (added 2026-08-29, user-requested "smoother
+ * working" — no tile pre-fetch beyond the explicit download button, so
+ * browsing the live map along a route could still stutter on a slow
+ * connection) is a THIRD, separate piece from the two above: an
+ * AUTOMATIC, silent prefetch of the route corridor fired the instant a
+ * route is computed (`MapScreen.kt`, no button tap needed), scoped down
+ * from [downloadRouteTiles]'s full [MIN_ZOOM]..[MAX_ZOOM] range to just
+ * the single zoom level `ui/map/StreetMapView.kt` actually displays while
+ * driving (18) — a deliberately smaller, lighter background download than
+ * the explicit "Download offline" button's guaranteed-offline promise,
+ * since this fires without the user's explicit consent to the data usage
+ * (see that function's own doc for the exact tradeoff this was scoped
+ * against). Both share [downloadTiles], the actual [CacheManager] call —
+ * only the zoom RANGE and whether it's user-visible differ.
  */
 object OfflineRouteCache {
 
@@ -39,6 +55,9 @@ object OfflineRouteCache {
     private const val MIN_ZOOM = 14
     private const val MAX_ZOOM = 18
 
+    /** StreetMapView's own live-viewing zoom (`controller.setZoom(18.0)`) — kept as one named constant so [prefetchLiveZoomTiles] can never silently drift out of sync with what the map actually displays. */
+    private const val LIVE_VIEWING_ZOOM = 18
+
     fun downloadRouteTiles(
         context: Context,
         mapView: MapView,
@@ -46,13 +65,91 @@ object OfflineRouteCache {
         onProgress: (downloaded: Int, total: Int) -> Unit,
         onComplete: () -> Unit,
         onFailed: () -> Unit,
+    ) = downloadTiles(context, mapView, routeGeometry, MIN_ZOOM, MAX_ZOOM, onProgress, onComplete, onFailed)
+
+    /**
+     * Silent, automatic, best-effort — fired once per newly-computed
+     * route (see `MapScreen.kt`'s Start button), no progress UI, and a
+     * failure (no network, tile source rejects bulk caching, etc.) is
+     * swallowed rather than surfaced: this is a "smoother if it works"
+     * optimization layered on top of the map's existing normal on-demand
+     * tile loading, not a promise the way the explicit download button
+     * is — a failure here changes nothing the user would notice (the map
+     * simply falls back to fetching tiles live, exactly like today).
+     * Single zoom level ([LIVE_VIEWING_ZOOM]) rather than
+     * [downloadRouteTiles]'s full range specifically to keep the
+     * automatic/no-consent data usage modest (user-scoped decision,
+     * 2026-08-29 — the wider range was considered and deliberately not
+     * used here).
+     */
+    fun prefetchLiveZoomTiles(context: Context, mapView: MapView, routeGeometry: List<GeoPoint>) {
+        downloadTiles(
+            context = context,
+            mapView = mapView,
+            routeGeometry = routeGeometry,
+            minZoom = LIVE_VIEWING_ZOOM,
+            maxZoom = LIVE_VIEWING_ZOOM,
+            onProgress = { _, _ -> },
+            onComplete = {},
+            onFailed = {},
+        )
+    }
+
+    // REAL CRASH FOUND + FIXED (2026-08-29, user report: "if i start the
+    // destination the app is closing"): CacheManager.downloadAreaAsync()
+    // runs on an AsyncTask, and when the current tile source's policy
+    // rejects bulk downloads, it throws TileSourcePolicyException from
+    // INSIDE that background task's doInBackground() — a synchronous
+    // try/catch around the CacheManager(mapView) constructor call below
+    // (which is a DIFFERENT, earlier failure mode) can never catch that,
+    // since the exception happens later, asynchronously, on the AsyncTask's
+    // own thread; left uncaught there, it crashes the whole app. Confirmed
+    // via `adb logcat -b crash`: TileSourceFactory.MAPNIK is built with
+    // `new TileSourcePolicy(2, 15)` — flags=15 sets FLAG_NO_BULK, meaning
+    // osmdroid PERMANENTLY refuses bulk/CacheManager downloads against
+    // MAPNIK, honoring OpenStreetMap's own real tile usage policy
+    // (operations.osmfoundation.org/policies/tiles — "no bulk downloading"
+    // against the free tile.openstreetmap.org server). This was silently
+    // broken since `ui/map/StreetMapView.kt`'s 2026-08-26 CARTO->MAPNIK
+    // switch (that file's own doc comment) — [downloadRouteTiles]'s
+    // explicit "Download offline" button has carried this exact same
+    // crash ever since, just apparently never tapped/tested against
+    // MAPNIK until [prefetchLiveZoomTiles] started calling this code
+    // automatically. Fixed by checking [OnlineTileSourceBase.getTileSourcePolicy]
+    // BEFORE calling downloadAreaAsync — the same check CacheManager's own
+    // internal preCheck() does, just performed early enough here to fail
+    // synchronously via [onFailed] instead of asynchronously crashing.
+    // HONEST CONSEQUENCE, not silently glossed over (CLAUDE.md Rule 13):
+    // since this restriction is PERMANENT for MAPNIK (not a transient
+    // network failure), both [downloadRouteTiles] and [prefetchLiveZoomTiles]
+    // will now always/only call onFailed() and never actually cache
+    // anything — bulk tile pre-fetch cannot work at all against the
+    // current tile source. See PROJECT_MAP.md/summary.txt for the
+    // decision this raises (keep as a permanently-no-op safe failure,
+    // remove the feature, or switch tile source).
+    private fun downloadTiles(
+        context: Context,
+        mapView: MapView,
+        routeGeometry: List<GeoPoint>,
+        minZoom: Int,
+        maxZoom: Int,
+        onProgress: (downloaded: Int, total: Int) -> Unit,
+        onComplete: () -> Unit,
+        onFailed: () -> Unit,
     ) {
+        val tileSource = mapView.tileProvider.tileSource
+        if (tileSource is OnlineTileSourceBase && !tileSource.tileSourcePolicy.acceptsBulkDownload()) {
+            onFailed()
+            return
+        }
+
         val cacheManager = try {
             CacheManager(mapView)
         } catch (e: Exception) {
-            // TileSourcePolicyException etc. — the current tile source
-            // doesn't allow bulk caching. Surfaced as a normal failure,
-            // not a crash (same resilience pattern as RoutingRepository).
+            // A different failure mode than the policy check above (e.g.
+            // a malformed/unreadable tile cache) — surfaced as a normal
+            // failure, not a crash (same resilience pattern as
+            // RoutingRepository).
             onFailed()
             return
         }
@@ -70,7 +167,7 @@ object OfflineRouteCache {
             }
             override fun onTaskFailed(errors: Int) = onFailed()
         }
-        cacheManager.downloadAreaAsync(context, points, MIN_ZOOM, MAX_ZOOM, callback)
+        cacheManager.downloadAreaAsync(context, points, minZoom, maxZoom, callback)
     }
 
     fun saveRoute(context: Context, route: RouteResult) {

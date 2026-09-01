@@ -13,6 +13,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -29,6 +30,8 @@ import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.ui.components.DriftSummaryCard
 import com.sih26168.idr.ui.components.FloatingIconButton
+import com.sih26168.idr.ui.components.GnssModeChangeBanner
+import com.sih26168.idr.ui.components.GnssReacquiredBanner
 import com.sih26168.idr.ui.components.StatusChip
 import com.sih26168.idr.ui.components.VehicleMode
 import com.sih26168.idr.ui.components.VehicleModeSelector
@@ -42,11 +45,11 @@ import kotlin.math.hypot
 
 /**
  * The status overlay (GNSS mode/speed/motion/alignment header, vehicle-mode
- * selector + recalibrate + drift-summary footer) shared by BOTH
- * [DriveScreen] (over [com.sih26168.idr.ui.map.TrackCanvas]'s abstract
- * local-meter grid) and [MapScreen] (over
- * [com.sih26168.idr.ui.map.StreetMapView]'s real street tiles, Slice 8b) —
- * extracted here so the two base layers can share one FR10 status
+ * selector + recalibrate + drift-summary footer) used by [MapScreen] (over
+ * [com.sih26168.idr.ui.map.StreetMapView]'s real street tiles, Slice 8b).
+ * Originally shared with the abstract-grid DriveScreen too (removed once
+ * MapScreen's real map made it redundant) — extracted as its own
+ * composable so a future second base layer could share one FR10 status
  * implementation instead of two copies drifting apart. Every value
  * displayed traces back to the same real repositories both screens were
  * already reading (CLAUDE.md Rule 8), unchanged by this extraction.
@@ -72,20 +75,60 @@ internal fun StatusOverlayContent(
     // with ActiveRouteCard/NavigationEtaBar — both occupy the same
     // bottom-of-screen area once a route is active, producing an illegible
     // overlapping mess (confirmed on a real S24 FE). MapScreen now passes
-    // false while a route is active/navigating; DriveScreen (which has no
-    // competing bottom content) keeps the default true.
+    // false while a route is active/navigating; the default true is for
+    // when there is no competing bottom content (no active route).
     showBottomBar: Boolean = true,
 ) {
     var dismissedDrift by remember(fusedState.driftSummary) { mutableStateOf(false) }
 
     val speedMps = estimateSpeedMps(drState, mlState, gnssState, fusedState)
-    val motionLabel = estimateMotionLabel(mlState, speedMps)
+    val motionLabel = estimateMotionLabel(drState, mlState, speedMps)
     val gnssColor = when (gnssState.mode) {
         GnssMode.GNSS_AIDED -> GnssAidedColor
         GnssMode.TRANSITION -> TransitionColor
         GnssMode.DEAD_RECKONING -> DeadReckoningColor
         GnssMode.REACQUISITION -> ReacquisitionColor
     }
+
+    // User-requested (2026-08-29) "popup when switching from gnss aided to
+    // dead reckoning mode" — keyed off GnssModeRepository's own
+    // `lastTransition` (already logged per CLAUDE.md Rule 17), not a
+    // locally-tracked `gnssState.mode` diff, so this can't drift out of
+    // sync with what actually got logged. Deliberately narrowed to
+    // `fromMode == TRANSITION`: that's the one path into DEAD_RECKONING
+    // that genuinely started from GNSS_AIDED (see GnssOutageDetector's
+    // state diagram doc comment) — REACQUISITION bailing back to
+    // DEAD_RECKONING re-enters the same mode but was never GNSS_AIDED to
+    // begin with, so it's excluded to avoid re-notifying on every failed
+    // reacquisition attempt during a marginal-GNSS stretch.
+    // `dismissedTransitionAtMs` remembers WHICH transition (by timestamp)
+    // was last dismissed/auto-dismissed, so re-entering DEAD_RECKONING a
+    // second time later in the same session re-shows the banner instead
+    // of staying permanently dismissed after the first outage.
+    var dismissedTransitionAtMs by remember { mutableStateOf<Long?>(null) }
+    val transition = gnssState.lastTransition
+    val showModeChangeBanner = transition != null &&
+        transition.toMode == GnssMode.DEAD_RECKONING &&
+        transition.fromMode == GnssMode.TRANSITION &&
+        transition.atMs != dismissedTransitionAtMs
+
+    // Symmetric counterpart (STATUS_AND_ROADMAP.md Tier-1 item #2,
+    // "GNSS reacquired" banner). Mirrors showModeChangeBanner's own
+    // narrowing above for the same reason: `fromMode == REACQUISITION` is
+    // the one path into GNSS_AIDED that follows a GENUINE outage (the
+    // state machine actually spent time in DEAD_RECKONING first) — a
+    // TRANSITION -> GNSS_AIDED recovery never left GNSS_AIDED long enough
+    // to have shown the "lost" banner in the first place (see that
+    // exclusion's own comment above), so it's excluded here too rather
+    // than announcing a "reacquisition" that was never really lost.
+    // `dismissedReacquisitionAtMs` follows the same per-timestamp-dismiss
+    // pattern as `dismissedTransitionAtMs` so a second real outage later
+    // in the same session re-shows this banner too.
+    var dismissedReacquisitionAtMs by remember { mutableStateOf<Long?>(null) }
+    val showReacquiredBanner = transition != null &&
+        transition.toMode == GnssMode.GNSS_AIDED &&
+        transition.fromMode == GnssMode.REACQUISITION &&
+        transition.atMs != dismissedReacquisitionAtMs
 
     Column(
         modifier = Modifier
@@ -132,6 +175,16 @@ internal fun StatusOverlayContent(
                     TextButton(onClick = onShowDebugScreen) {
                         Text(text = "Debug", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
                     }
+                }
+            }
+            if (showModeChangeBanner) {
+                key(transition!!.atMs) {
+                    GnssModeChangeBanner(onDismiss = { dismissedTransitionAtMs = transition.atMs })
+                }
+            }
+            if (showReacquiredBanner) {
+                key(transition!!.atMs) {
+                    GnssReacquiredBanner(onDismiss = { dismissedReacquisitionAtMs = transition.atMs })
                 }
             }
             if (isPipelinePaused) {
@@ -270,13 +323,18 @@ internal fun estimateSpeedMps(
 }
 
 // PRD.md FR10's "current motion class" (see also Section 14) — this
-// project only implements a REAL subset of the full 8-class taxonomy
-// (docs/PROJECT_MAP.md: the trained classifier is still blocked on
-// labeled data). Priority order below shows ONLY what's real: Pothole
-// (motion/PotholeShockDetector) -> Cruising (motion/MotionStateClassifier)
-// -> Stationary -> a generic "Moving" fallback. No Turning/Accelerating/
-// Braking/Phone-Moved label is ever shown, since those detectors don't
-// exist (CLAUDE.md Rule 13).
+// project only implements a REAL subset of the full 8-class taxonomy via
+// deterministic stand-ins (docs/PROJECT_MAP.md: the actual TRAINED
+// classifier is still blocked on labeled data, CLAUDE.md Rule 13).
+// UPDATE (2026-08-30): Turning (dr/TurningDetector.kt, via
+// DeadReckoningState.isTurning) and Accelerating/Braking
+// (motion/LongitudinalMotionClassifier.kt) are now real signals and shown
+// here too — priority order below is a DISPLAY choice (only one label
+// fits), not a claim these are mutually exclusive underlying states (a
+// car can genuinely be turning AND accelerating at once). Phone Moved is
+// deliberately still NOT shown here — it is a one-shot reset EVENT
+// (motion/PhoneMovedDetector.kt, logged via alignment/AlignmentRepository.kt),
+// not an ongoing motion state a per-tick label fits well.
 private const val STATIONARY_SPEED_EPSILON_MPS = 0.3
 
 // BUG FIX (2026-08-26, real outdoor walking test): this used to recompute
@@ -291,8 +349,11 @@ private const val STATIONARY_SPEED_EPSILON_MPS = 0.3
 // other. Threshold also raised from 0.05 to 0.3 m/s — 0.05 was tight
 // enough that ordinary GNSS speed noise near walking pace could still
 // read as "Stationary" even while genuinely moving.
-internal fun estimateMotionLabel(mlState: MlVelocityUiState, speedMps: Float): String = when {
+internal fun estimateMotionLabel(drState: DeadReckoningState, mlState: MlVelocityUiState, speedMps: Float): String = when {
     mlState.potholeShockDetectedThisTick -> "Pothole"
+    drState.isTurning -> "Turning"
+    mlState.isAccelerating -> "Accelerating"
+    mlState.isBraking -> "Braking"
     mlState.isCruising -> "Cruising"
     speedMps < STATIONARY_SPEED_EPSILON_MPS -> "Stationary"
     else -> "Moving"

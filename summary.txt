@@ -1603,3 +1603,232 @@ buttons distinguishable at 96dp). Both fixes confirmed on-device via
 screenshot + a simulated pan gesture: tiles now load fully (real road
 names/buildings visible), a pan gesture stays put instead of snapping
 back, and the new button correctly resumes following and re-centers.
+
+
+SLICE 8 (UI restyle) — Google Maps-style destination search screen
+---------------------------------------------------------------------
+User supplied a screenshot of Google Maps' own destination-search
+screen and asked for the same in this app. Restyled
+ui/screens/SearchScreen.kt to match: a rounded search pill (back arrow +
+text field + mic/clear button), a Home/Work quick-access row, and a
+"Recent" list shown while the query field is empty.
+
+Two pieces of the reference needed real data behind them rather than
+being copied as static decoration: Home/Work now read/write through a
+new routing/SavedPlacesRepository (SharedPreferences) -- a slot reads
+back "Set location" until the user has actually picked one; tapping an
+unset slot switches the screen into a pick-and-save mode instead of
+faking an address. "Recent" now reads/writes through a new
+routing/RecentSearchRepository (SharedPreferences + org.json),
+most-recent-first, capped at 8 real past picks.
+
+Two things visible in the screenshot were deliberately left out rather
+than built as decoration: the per-row business-hours line ("Open .
+Closes 22:00") -- Nominatim, this app's only geocoding source, has no
+opening-hours data to show there -- and the third "... More" shortcut,
+which in real Google Maps opens additional saved lists this app has no
+equivalent of. The mic button is wired to Android's own
+android.speech.RecognizerIntent (a platform API, not a new dependency)
+rather than left as a decorative icon that does nothing when tapped; a
+device with no speech-recognition app shows a real error instead of
+silently failing. New hand-drawn icons (ic_home, ic_work, ic_mic,
+ic_recent) plus the standard AOSP "place" glyph (ic_place) were added
+under res/drawable/ rather than pulling in the material-icons-extended
+dependency for a handful of icons, the same tradeoff ic_car.xml/
+ic_motorcycle.xml/ic_walk.xml already made.
+
+Verified with a Gradle Kotlin compile (no test device available for
+this session) -- functional on-device verification (mic permission
+flow, saved-place persistence across app restarts) is still pending a
+real test pass.
+
+
+SLICE 9 (tooling) — real-drive threshold validation logger + analysis script
+-------------------------------------------------------------------------------
+User asked to validate the three "engineering default, not yet
+validated" threshold groups (gnss/GnssQuality.kt's max-accuracy/max-fix-
+age, gnss/GnssOutageDetector.kt's four hysteresis dwell constants, dr/
+StationaryDetector.kt's ZUPT accel/gyro/dwell thresholds) against a real
+driving test's data, instead of leaving them as guesses. Since no such
+data existed yet, built the tooling needed to capture and analyze it:
+
+Android side: dr/BaselinePhysicsIntegrator.kt's DeadReckoningState now
+also carries the raw ZUPT inputs (linearAccelMagnitudeMps2,
+gyroMagnitudeRadPerSec) and decision (isStationary) that
+BaselineDeadReckoningRepository was already computing every tick but
+previously discarded after using them. A new capture/DriveDataLogger.kt
+(same one-off-tool pattern as the existing capture/SensorRecorder.kt)
+logs one CSV row per DR tick combining that state with GnssModeRepository's
+live GNSS mode/accuracy/fix-age/speed at the same instant. A new
+"Start/Stop drive log" button on the debug screen controls it, saving a
+CSV to the app's external files directory on Stop.
+
+Python side: a new scripts/analyze_drive_log.py (pandas, already a
+dependency via ml/inspect_dataset.py) loads a pulled CSV and reports:
+real GNSS-mode segment durations (comparable against the four dwell
+constants), GNSS accuracy distribution while GNSS_AIDED (comparable
+against GnssQuality's 25m threshold), and a ZUPT confusion-matrix-style
+check -- using GNSS speed while GNSS_AIDED as an INDEPENDENT ground
+truth for "actually moving" (independent of the accel/gyro inputs ZUPT
+itself uses, avoiding a circular validation) -- reporting false-positive
+and false-negative rates for the current 0.25 m/s^2 / 0.05 rad/s / 300ms
+thresholds. The script only reports; it deliberately does not auto-edit
+the Kotlin constants, since trading off ZUPT false-positives against
+false-negatives (or a flappier vs slower GNSS state machine) is a human
+judgment call, not something to silently apply from one script run.
+
+Verified end-to-end on-device: built, installed, ran the drive-log
+button indoors for ~35s (phone handled, not a real drive) -- captured
+4742 rows at the device's real observed sensor rate (~135 Hz for this
+stretch; the device's accel/gyro deliver up to ~200 Hz, faster than the
+~10 Hz nominal design target, which just means a richer log), pulled the
+CSV via adb, and ran scripts/analyze_drive_log.py against the real file
+without error. This proves the tooling works end-to-end -- it does NOT
+constitute the actual validation. HONEST GAP: no real outdoor driving
+test has been run yet; that -- with a deliberate GNSS-denied stretch
+(tunnel/underpass/parking structure) -- is still the needed next step
+before any of the three threshold groups can be called validated rather
+than guessed.
+
+
+REAL BUG FOUND + FIXED (2026-08-29) -- sensor delivery running ~15-20x faster than designed
+---------------------------------------------------------------------------------------------
+User asked "what can be added for smoother working" -- flagged that the
+drive-log tooling from the previous entry had itself already surfaced a
+real number worth investigating: the debug screen's "Accel observed
+rate" consistently read ~199 Hz, not the ~10 Hz PRD.md Section 8/11
+target sensors/SensorRepository.kt requests via registerListener's
+100ms period. Investigated: Android documents that period as a HINT,
+not a guarantee, and this test device (Oppo/ColorOS) was confirmed
+ignoring it, delivering accel/gyro/orientation at up to ~200 Hz
+regardless.
+
+That over-delivery was reaching every downstream consumer completely
+unthrottled: dr/BaselineDeadReckoningRepository's physics integrator +
+ZUPT ran 15-20x more often than designed (wasted CPU/battery, a real
+jank source), Compose recomposed DriveScreen/MapScreen at the same
+rate, and -- the most serious find -- ml/MlVelocityRepository ran full
+ONNX inference on every one of those ticks too, AND fed
+features/FeatureExtractor.kt's rolling window (10 samples, meant to be
+a ~1.0s trailing window matched to ml/train_velocity_model.py's own
+~10 Hz training-data rate) only ~50ms of real elapsed time per update.
+That is a silent train/inference PARITY break, not just a performance
+one -- the on-device feature vectors were being computed over a
+completely different real-world timescale than what the model was
+trained to expect.
+
+Fixed once at the source (sensors/SensorRepository.kt), not patched in
+each consumer separately: the listener now independently throttles
+PUBLISHING each sensor type to real ~10 Hz (separate
+lastPublished*TimestampNs trackers per type, gated on real elapsed
+time), while accelHz/gyroHz/orientationHz are deliberately left
+computed from the true unthrottled raw arrival rate so the "observed
+rate" readout stays honest -- throttling that too would have hidden
+this exact bug from ever surfacing again.
+
+Verified on-device with the same drive-log tooling used to find it:
+pulled a CSV before the fix (1601 ticks in a ~4-8s window) and after
+(261 ticks over a precisely measured 26.05s span) -- mean inter-tick
+interval measured directly from the CSV's own elapsedMs column: 100.2ms
+(9.98 Hz), matching the ~10 Hz target almost exactly. All existing unit
+tests still pass; full debug + release Kotlin compile clean.
+
+
+SLICE 9 (UI/smoothness) — automatic tile pre-fetch for a newly-active route
+-------------------------------------------------------------------------------
+User flagged (from an earlier "how to make the app better" list): map
+browsing along an active route could still stutter on a slow connection,
+since tile pre-fetch only ever happened via the explicit "Download
+offline" button on ActiveRouteCard. Asked to implement automatic
+pre-fetch.
+
+Real tradeoff surfaced before building: an automatic background
+download uses mobile data without the explicit consent an intentional
+button-tap represents, unlike the existing offline-download feature.
+Asked the user to pick a scope rather than assuming one; chose "whole
+route, live-zoom-only" -- silently prefetch the full route corridor the
+instant a route is computed, but at just the ONE zoom level
+StreetMapView actually displays while driving (18), not the wider 14-18
+range the explicit download button uses -- meaningfully less background
+data than a full offline save, while still covering the whole trip.
+
+routing/OfflineRouteCache.kt refactored: both the existing
+downloadRouteTiles (explicit button, full 14-18 range, progress UI) and
+the new prefetchLiveZoomTiles (automatic, single zoom level 18, no
+progress UI, silent on failure) now share one private downloadTiles
+helper wrapping the same CacheManager call -- only the zoom range and
+whether it's user-visible differ. ui/screens/MapScreen.kt's Start button
+now calls prefetchLiveZoomTiles right after a route computes
+successfully, before the routing UI even updates.
+
+Verified end-to-end on-device: cleared the app's entire osmdroid tile
+cache (adb run-as rm -rf), searched + selected a real destination,
+tapped Start, then pulled and inspected the cache's SQLite database
+directly (adb exec-out through Bash, not PowerShell -- PowerShell's `>`
+redirect was found to corrupt binary pulls by prepending a UTF-8 BOM,
+worth remembering for any future binary adb pull). Tile row count went
+from 0 (freshly cleared) to 24 real rows, with the explicit "Download
+offline" button never touched -- confirms the automatic prefetch fires
+and writes real tiles into the exact same cache StreetMapView already
+reads from, with no separate code path.
+
+
+REAL CRASH FOUND + FIXED (2026-08-29) -- "if i start the destination the app is closing"
+-------------------------------------------------------------------------------------------
+User reported the app closing the moment they tapped Start after
+picking a destination -- reproduced immediately on-device (confirmed
+via `ps` showing the process gone and `adb logcat -b crash` showing a
+FATAL EXCEPTION on the AsyncTask thread).
+
+Root cause: the automatic tile-prefetch feature added earlier this
+session was calling CacheManager.downloadAreaAsync(), which runs on an
+AsyncTask and throws TileSourcePolicyException from INSIDE that
+background task's doInBackground() when the tile source's policy
+rejects bulk downloads. The only try/catch OfflineRouteCache.downloadTiles
+had wrapped just the CacheManager(mapView) constructor call -- it could
+never catch this, since the real failure happens later, asynchronously,
+on the AsyncTask's own worker thread, left uncaught until Android's
+runtime rethrows it and kills the process.
+
+Decompiled the bundled osmdroid-android-6.1.20 runtime jar with javap
+to find the actual cause rather than guessing: TileSourceFactory.MAPNIK
+is constructed with `new TileSourcePolicy(2, 15)` -- flags=15 sets
+FLAG_NO_BULK, meaning osmdroid PERMANENTLY refuses CacheManager bulk
+downloads against MAPNIK. This isn't a bug in osmdroid; it's osmdroid
+correctly honoring OpenStreetMap's own real tile usage policy ("no bulk
+downloading" against the free tile.openstreetmap.org server -- see
+operations.osmfoundation.org/policies/tiles). That means this exact
+crash has existed since ui/map/StreetMapView.kt's 2026-08-26 CARTO ->
+MAPNIK switch -- the pre-existing explicit "Download offline" button on
+ActiveRouteCard has been carrying the identical latent crash this whole
+time, just apparently never tapped/tested against MAPNIK until this
+session's automatic prefetch started exercising the same code path on
+every single route computed.
+
+Fixed by checking OnlineTileSourceBase.getTileSourcePolicy().
+acceptsBulkDownload() BEFORE ever calling downloadAreaAsync (the same
+check CacheManager's own internal preCheck() does, just performed
+early enough to fail synchronously via onFailed() instead of crashing
+asynchronously). Also corrected the explicit download button's failure
+message from "check network" (implies a retriable, transient cause) to
+"isn't available for this map source right now" (the real, permanent
+cause) -- CLAUDE.md Rule 13 still applies to a bug-fix's own honesty,
+not just to the original feature copy.
+
+HONEST OPEN QUESTION, not resolved in this fix: since FLAG_NO_BULK is
+permanent for MAPNIK, BOTH downloadRouteTiles (explicit button) and
+prefetchLiveZoomTiles (automatic) now always/only fail gracefully --
+neither can ever actually cache a tile against the current tile source.
+Bulk tile pre-fetch is a structural dead end here, not something a
+smarter retry or better error handling can route around. Whether to
+leave this as a permanently-safe no-op, remove the offline-download
+feature outright, or migrate to a tile source whose policy allows bulk
+download is flagged to the user as an open decision, not made
+unilaterally in this fix.
+
+Verified on-device end to end: reproduced the crash pre-fix, applied
+the fix, rebuilt, reinstalled, and repeated the EXACT same search ->
+select -> Start sequence -- route computed successfully (real 11.2km /
+11min route to Chennai Corporation, ActiveRouteCard rendered normally),
+process stayed alive, crash buffer stayed empty. All existing unit
+tests still pass; debug compile clean.

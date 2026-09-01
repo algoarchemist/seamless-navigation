@@ -1,14 +1,22 @@
 package com.sih26168.idr.ui.screens
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -20,6 +28,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.sih26168.idr.dr.DeadReckoningState
@@ -30,21 +39,20 @@ import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.routing.GeocodeResult
-import com.sih26168.idr.routing.GeocodeSearchOutcome
-import com.sih26168.idr.routing.GeocodingRepository
 import com.sih26168.idr.routing.OfflineRouteCache
 import com.sih26168.idr.routing.RouteProgress
 import com.sih26168.idr.routing.RouteResult
 import com.sih26168.idr.routing.RoutingRepository
 import com.sih26168.idr.ui.components.ActiveRouteCard
-import com.sih26168.idr.ui.components.DestinationSearchBar
 import com.sih26168.idr.ui.components.NavigationEtaBar
 import com.sih26168.idr.ui.components.NavigationInstructionCard
 import com.sih26168.idr.ui.components.VehicleMode
 import com.sih26168.idr.ui.map.StreetMapView
 import com.sih26168.idr.ui.theme.CtaRed
+import com.sih26168.idr.ui.theme.GlassCardRadius
+import com.sih26168.idr.ui.theme.GlassSurface
 import com.sih26168.idr.ui.theme.TextPrimary
-import kotlinx.coroutines.delay
+import com.sih26168.idr.ui.theme.TextSecondary
 import kotlinx.coroutines.launch
 import org.osmdroid.views.MapView
 
@@ -56,9 +64,9 @@ import org.osmdroid.views.MapView
  * (`routing/GeocodingRepository.kt`, OpenStreetMap Nominatim), real
  * routing (`routing/RoutingRepository.kt`, OSRM), and real offline
  * caching of that one trip's tiles + route data
- * (`routing/OfflineRouteCache.kt`). Same [StatusOverlayContent] as
- * [DriveScreen] underneath — the GNSS/DR status readout is unaffected by
- * any of this; search/routing is layered on top as its own state machine
+ * (`routing/OfflineRouteCache.kt`). Uses [StatusOverlayContent] for the
+ * GNSS/DR status readout, unaffected by any of this; search/routing is
+ * layered on top as its own state machine
  * (idle -> destination selected -> route active).
  *
  * HONEST LIMITATION (CLAUDE.md Rule 13): no live "next turn in X m"
@@ -82,6 +90,15 @@ fun MapScreen(
     onShowDebugScreen: () -> Unit,
     onTogglePipelinePause: () -> Unit,
     onVehicleModeChange: (VehicleMode) -> Unit,
+    /**
+     * PRD.md Section 19's MVP map constraint: hands the active route's
+     * geometry (or null, once it ends) to `fusion/StateEstimator.kt` so it
+     * can road-snap the fused DR position against it during an outage —
+     * see [com.sih26168.idr.fusion.StateEstimator.setActiveRouteGeometry]'s
+     * own doc for why this crosses from UI state into that lower layer via
+     * a plain callback instead of StateEstimator reading UI state directly.
+     */
+    onActiveRouteGeometryChanged: (List<Pair<Double, Double>>?) -> Unit = {},
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -183,10 +200,16 @@ fun MapScreen(
     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
 
     // Search/routing state — independent of the GNSS/DR state above.
+    // 2026-08-28, user-requested "search destination like Google Maps,
+    // redirects to map page when searched": the live in-progress query/
+    // results/error used to live here and drive a floating dropdown drawn
+    // over the map. That's now entirely owned by the full-page
+    // ui/screens/SearchScreen.kt instead — this screen only keeps the
+    // FINAL chosen destination (searchQuery here becomes display-only:
+    // the selected place's name, or the collapsed bar's placeholder) plus
+    // whether that full page is currently showing.
     var searchQuery by remember { mutableStateOf("") }
-    var searchResults by remember { mutableStateOf<List<GeocodeResult>>(emptyList()) }
-    var searchError by remember { mutableStateOf<String?>(null) }
-    var isSearching by remember { mutableStateOf(false) }
+    var showSearchScreen by remember { mutableStateOf(false) }
     var selectedDestination by remember { mutableStateOf<GeocodeResult?>(null) }
     var isRouting by remember { mutableStateOf(false) }
     var routingError by remember { mutableStateOf<String?>(null) }
@@ -195,6 +218,15 @@ fun MapScreen(
     // mode, Google Maps-like)": a third state past route-active, entered
     // via ActiveRouteCard's new "Go" button.
     var isNavigating by remember { mutableStateOf(false) }
+
+    // Pushes the active route's geometry (or null, once it ends) down to
+    // fusion/StateEstimator.kt for road-snapping — see
+    // onActiveRouteGeometryChanged's own doc. Converted from osmdroid's
+    // GeoPoint to plain lat/lon pairs here, at the UI boundary, so that
+    // lower layer stays free of a map-library dependency.
+    LaunchedEffect(activeRoute) {
+        onActiveRouteGeometryChanged(activeRoute?.geometry?.map { it.latitude to it.longitude })
+    }
 
     // Live route progress — projects the route geometry into the SAME
     // local East/North frame fusion/StateEstimator.kt's anchor already
@@ -225,7 +257,9 @@ fun MapScreen(
     }
 
     // Live heading for the navigation screen's "heading-up" map rotation
-    // (ui/map/StreetMapView.kt's headingDeg param).
+    // (ui/map/StreetMapView.kt's headingDeg param) AND the current-position
+    // marker's own directional-arrow rotation (that same file's
+    // markerHeadingDeg param, STATUS_AND_ROADMAP.md Tier-1 item #1).
     //
     // Round 2 (2026-08-28): this used to be computed HERE with a hard
     // cutover between GNSS bearing and a DR-derived bearing at the
@@ -248,34 +282,11 @@ fun MapScreen(
         }
     }
 
-    // Debounced real Nominatim search — fires ~500ms after typing stops,
-    // not on every keystroke (Nominatim's usage policy caps ~1 req/sec).
-    LaunchedEffect(searchQuery) {
-        if (searchQuery.isBlank()) {
-            searchResults = emptyList()
-            searchError = null
-            return@LaunchedEffect
-        }
-        delay(500)
-        isSearching = true
-        // BUG FIX (2026-08-26, user report: "SRM Ramapuram not showing" /
-        // "most Chennai places not visible") — GeocodingRepository.search
-        // used to collapse every failure into an empty list, identical to a
-        // real "no matches." Now it reports which one actually happened, so
-        // a real cause (bad network, Nominatim rate-limit/403 on this
-        // device's IP, etc.) is visible instead of looking like a typo.
-        when (val outcome = GeocodingRepository.search(searchQuery)) {
-            is GeocodeSearchOutcome.Success -> {
-                searchResults = outcome.results
-                searchError = if (outcome.results.isEmpty()) "No matches for \"$searchQuery\"" else null
-            }
-            is GeocodeSearchOutcome.Failure -> {
-                searchResults = emptyList()
-                searchError = outcome.reason
-            }
-        }
-        isSearching = false
-    }
+    // Back from the full-page search screen returns to the map, same
+    // priority convention MainActivity's own BackHandler already uses for
+    // tab switching — this one is added later/deeper in the composition so
+    // it wins over MainActivity's while the search page is open.
+    BackHandler(enabled = showSearchScreen) { showSearchScreen = false }
 
     Box(modifier = Modifier.fillMaxSize()) {
         StreetMapView(
@@ -287,6 +298,12 @@ fun MapScreen(
             isDarkTheme = isDarkTheme,
             routeGeometry = activeRoute?.geometry,
             headingDeg = if (isNavigating) headingDeg else null,
+            // Unlike the map-rotation headingDeg above (gated to
+            // isNavigating), the marker's own directional arrow is fed
+            // real heading whenever one is available — STATUS_AND_ROADMAP.md
+            // Tier-1 item #1, "rotate it with heading" applies generally,
+            // not only during turn-by-turn.
+            markerHeadingDeg = headingDeg,
             onMapViewReady = { mapViewRef = it },
             modifier = Modifier.fillMaxSize(),
         )
@@ -325,34 +342,31 @@ fun MapScreen(
         // would be more correct but is more than this fix needs right now.
         if (activeRoute == null) {
             Column(modifier = Modifier.fillMaxWidth().padding(top = 300.dp, start = 16.dp, end = 16.dp)) {
-                DestinationSearchBar(
-                    query = searchQuery,
-                    onQueryChange = {
-                        searchQuery = it
-                        selectedDestination = null
-                        routingError = null
-                        searchError = null
-                    },
-                    results = if (selectedDestination == null) searchResults else emptyList(),
-                    isSearching = isSearching,
-                    onSelectResult = { result ->
-                        selectedDestination = result
-                        searchQuery = result.displayName
-                        searchResults = emptyList()
-                        searchError = null
-                    },
-                )
-                // BUG FIX (2026-08-26): previously a search that matched
-                // nothing AND a search that failed outright (bad network,
-                // Nominatim rate-limiting this device's IP, etc.) both
-                // rendered as "no dropdown appeared," with no way to tell
-                // which one happened. Now the real reason is shown.
-                if (searchError != null && selectedDestination == null) {
+                // 2026-08-28, user-requested "search destination like Google
+                // Maps, redirects to map page when searched": this used to be
+                // a live, typeable DestinationSearchBar with its dropdown
+                // floating directly over the map. Now it's a collapsed,
+                // tappable bar — tapping it (whether idle or to change an
+                // already-chosen destination) opens the full ui/screens/
+                // SearchScreen.kt page; picking a result there closes that
+                // page and lands back here with selectedDestination set,
+                // same as Google Maps returning you to the map after search.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(GlassCardRadius))
+                        .background(GlassSurface, RoundedCornerShape(GlassCardRadius))
+                        .clickable { showSearchScreen = true }
+                        .padding(16.dp),
+                ) {
+                    Icon(Icons.Filled.Search, contentDescription = null, tint = TextSecondary)
                     Text(
-                        text = searchError!!,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = CtaRed,
-                        modifier = Modifier.padding(top = 4.dp, start = 4.dp),
+                        text = selectedDestination?.displayName?.takeIf { it.isNotBlank() }
+                            ?: "Search destination…",
+                        color = if (selectedDestination != null) TextPrimary else TextSecondary,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(start = 12.dp),
                     )
                 }
                 if (selectedDestination != null) {
@@ -382,6 +396,29 @@ fun MapScreen(
                                     activeRoute = route
                                     searchQuery = ""
                                     selectedDestination = null
+                                    // User-requested "smoother working"
+                                    // (2026-08-29): silently warms the tile
+                                    // cache for this route's corridor at the
+                                    // live-viewing zoom level, so browsing
+                                    // the map along the route is less likely
+                                    // to stutter waiting on a live tile
+                                    // fetch — separate from, and lighter
+                                    // than, the explicit "Download offline"
+                                    // button on ActiveRouteCard (see
+                                    // OfflineRouteCache.prefetchLiveZoomTiles's
+                                    // own doc for the data-usage tradeoff
+                                    // this was deliberately scoped against).
+                                    // Best-effort: mapViewRef should already
+                                    // be set (the user is looking at the map
+                                    // to have reached this button), but a
+                                    // null skips silently rather than crash —
+                                    // this is an optimization, not a
+                                    // guarantee, same as the function's own
+                                    // silent-failure behavior on a genuine
+                                    // network/cache error.
+                                    mapViewRef?.let { mapView ->
+                                        OfflineRouteCache.prefetchLiveZoomTiles(context, mapView, route.geometry)
+                                    }
                                 }
                             }
                         },
@@ -446,7 +483,21 @@ fun MapScreen(
                                 routeGeometry = route.geometry,
                                 onProgress = { downloaded, total -> downloadStatus = "Downloading… $downloaded/$total tiles" },
                                 onComplete = { downloadStatus = "Saved for offline use." },
-                                onFailed = { downloadStatus = "Offline download failed — check network." },
+                                // REAL FINDING (2026-08-29, from the crash
+                                // fix in OfflineRouteCache.kt): this will
+                                // currently ALWAYS fail, every time, not
+                                // just on a bad connection — the live tile
+                                // source (osmdroid's MAPNIK) permanently
+                                // refuses bulk downloads by policy (honoring
+                                // OpenStreetMap's own "no bulk downloading"
+                                // tile usage terms), so "check network"
+                                // would be a misleading, retriable-sounding
+                                // message for a non-retriable cause. Says so
+                                // honestly instead (CLAUDE.md Rule 13) —
+                                // whether this button should be reworked or
+                                // removed given it can't currently succeed
+                                // at all is a separate, larger decision.
+                                onFailed = { downloadStatus = "Offline download isn't available for this map source right now." },
                             )
                         },
                         onEnd = {
@@ -457,6 +508,23 @@ fun MapScreen(
                     )
                 }
             }
+        }
+
+        // Full-page search — drawn LAST so it covers the entire map screen
+        // (tiles, status overlay, everything above), same as Google Maps
+        // replacing the whole screen with its search page rather than
+        // layering a dropdown on top of the live map.
+        if (showSearchScreen) {
+            SearchScreen(
+                initialQuery = selectedDestination?.displayName ?: "",
+                onBack = { showSearchScreen = false },
+                onResultSelected = { result ->
+                    selectedDestination = result
+                    searchQuery = result.displayName
+                    routingError = null
+                    showSearchScreen = false
+                },
+            )
         }
     }
 }

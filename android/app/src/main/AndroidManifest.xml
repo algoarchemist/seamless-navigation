@@ -19,6 +19,16 @@
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="true" />
     <uses-feature android:name="android.hardware.location.gps" android:required="true" />
 
+    <!-- Android 11+ (API 30) package-visibility rules hide implicit-intent
+         targets unless declared here — without this, ui/screens/
+         SearchScreen.kt's mic button could fail to resolve the system
+         speech-recognition activity even on a device that has one. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+    </queries>
+
     <application
         android:label="@string/app_name"
         android:theme="@style/Theme.IDR"

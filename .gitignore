@@ -35,9 +35,11 @@ data/processed/*
 # docs/PROJECT_MAP.md for the full reasoning.
 models/*.onnx
 !models/velocity_v1.onnx
+!models/reacquisition_drift_v1.onnx
 models/*.tflite
 android/app/src/main/assets/*.onnx
 !android/app/src/main/assets/velocity_v1.onnx
+!android/app/src/main/assets/reacquisition_drift_v1.onnx
 
 # OS/editor cruft
 .DS_Store
