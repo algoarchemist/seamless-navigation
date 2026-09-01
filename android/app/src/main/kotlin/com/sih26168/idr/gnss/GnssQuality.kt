@@ -37,4 +37,26 @@ object GnssQuality {
         if (accuracyM > maxAccuracyM) return false
         return true
     }
+
+    /**
+     * (Round 2 addition, 2026-08-28 — PRD.md FR13/Section 17) Continuous
+     * confidence weight in [0, 1] for a GNSS fix, for use INSIDE a fusion
+     * blend that wants to trust a very accurate fix more than a marginal
+     * one — [isGood] remains the state machine's own binary enter/exit
+     * trigger (Section 18, unchanged); this is a separate, additional
+     * signal, not a replacement for it. A fix right at [maxAccuracyM]
+     * (the edge [isGood] still accepts) gets a weight near 0; a fix much
+     * more precise than that gets a weight near 1.
+     *
+     * Linear falloff — not modeled on any real GNSS confidence curve
+     * (Location's own accuracy is already a 68%-confidence radius, not a
+     * linear trust measure), a deliberately simple starting point per
+     * CLAUDE.md Rule 13: no invented sophistication before it's measured
+     * against a real outage/reacquisition run.
+     */
+    fun confidenceWeight(accuracyM: Float?, maxAccuracyM: Float = DEFAULT_MAX_ACCURACY_M): Float {
+        if (accuracyM == null) return 0f
+        if (accuracyM <= 0f) return 1f
+        return (1f - accuracyM / maxAccuracyM).coerceIn(0f, 1f)
+    }
 }

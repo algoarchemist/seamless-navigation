@@ -2,6 +2,7 @@ package com.sih26168.idr
 
 import android.Manifest
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -28,9 +29,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import com.sih26168.idr.alignment.AlignmentRepository
+import com.sih26168.idr.capture.DriveDataLogger
 import com.sih26168.idr.capture.SensorRecorder
 import com.sih26168.idr.dr.BaselineDeadReckoningRepository
 import com.sih26168.idr.dr.DeadReckoningState
+import com.sih26168.idr.dr.WorldFrameAcceleration
 import com.sih26168.idr.fusion.DrSource
 import com.sih26168.idr.fusion.FusedPositionUiState
 import com.sih26168.idr.fusion.StateEstimator
@@ -39,17 +43,20 @@ import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.gnss.LocationRepository
 import com.sih26168.idr.ml.MlVelocityRepository
 import com.sih26168.idr.ml.MlVelocityUiState
+import com.sih26168.idr.ml.ReacquisitionDriftModel
 import com.sih26168.idr.ml.VelocityModel
+import com.sih26168.idr.motion.FloorChangeRepository
+import com.sih26168.idr.motion.FloorChangeUiState
 import com.sih26168.idr.sensors.SensorRepository
 import com.sih26168.idr.sensors.SensorUiState
 import com.sih26168.idr.ui.components.AppTab
 import com.sih26168.idr.ui.components.BottomNavBar
 import com.sih26168.idr.ui.components.VehicleMode
-import com.sih26168.idr.ui.screens.DriveScreen
 import com.sih26168.idr.ui.screens.HistoryScreen
 import com.sih26168.idr.ui.screens.MapScreen
 import com.sih26168.idr.ui.theme.IdrTheme
 import java.io.File
+import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -77,8 +84,12 @@ import kotlinx.coroutines.withContext
  * fourth, additional position display, not a replacement for the other
  * two (same "show it side by side" philosophy as Slice 6).
  * Orientation is DEVICE-relative-to-WORLD frame only (CLAUDE.md
- * Rule 9/14) — no vehicle-frame alignment for the position estimate
- * (AlignmentEstimator only feeds the ML feature path so far).
+ * Rule 9/14). (Round 2, 2026-08-28): [AlignmentRepository] is now a
+ * single shared instance feeding BOTH the ML feature path and the
+ * physics DR path's non-holonomic-constraint heading — Round 1 only fed
+ * the former, which is what let the physics-path heading flip the map on
+ * reacquisition (see [AlignmentRepository]'s and
+ * [BaselineDeadReckoningRepository]'s docs).
  */
 data class RecordingUiState(
     val isRecording: Boolean = false,
@@ -86,15 +97,32 @@ data class RecordingUiState(
     val lastSavedFileName: String? = null,
 )
 
+/**
+ * UI state for capture/DriveDataLogger.kt's Start/Stop button (added
+ * 2026-08-29) — same shape as [RecordingUiState], kept as its own type
+ * rather than reused: this logs GNSS+DR state for threshold validation
+ * during a real test drive, a different real-world scenario from
+ * [RecordingUiState]'s stationary motion-classifier capture, and the two
+ * are started/stopped independently.
+ */
+data class DriveLogUiState(
+    val isLogging: Boolean = false,
+    val recordedCount: Int = 0,
+    val lastSavedFileName: String? = null,
+)
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var sensorRepository: SensorRepository
+    private lateinit var floorChangeRepository: FloorChangeRepository
+    private lateinit var alignmentRepository: AlignmentRepository
     private lateinit var deadReckoningRepository: BaselineDeadReckoningRepository
     private lateinit var locationRepository: LocationRepository
     private lateinit var gnssModeRepository: GnssModeRepository
     private lateinit var stateEstimator: StateEstimator
     private var mlVelocityRepository: MlVelocityRepository? = null
     private var velocityModel: VelocityModel? = null
+    private var reacquisitionDriftModel: ReacquisitionDriftModel? = null
 
     // 2026-08-26, user-requested Pause button: a `by mutableStateOf`
     // property (not a plain `var`) so Compose recomposes the Pause/Resume
@@ -122,6 +150,19 @@ class MainActivity : ComponentActivity() {
     private var recorderCollectJob: Job? = null
     private var lastProcessedRecorderAccelTimestampNs: Long? = null
 
+    // One-off data-capture tool (capture/DriveDataLogger.kt) — gathers a
+    // real test drive's GNSS+DR ticks so the "engineering default, not
+    // yet validated" thresholds in gnss/GnssQuality.kt, gnss/
+    // GnssOutageDetector.kt, and dr/StationaryDetector.kt can be checked
+    // against real data via scripts/analyze_drive_log.py, instead of
+    // staying guesses indefinitely. Same "reads already-real values,
+    // doesn't touch the shipped pipeline" separation as sensorRecorder
+    // above (CLAUDE.md Rule 8).
+    private val driveDataLogger = DriveDataLogger()
+    private val _driveLogState = MutableStateFlow(DriveLogUiState())
+    private val driveLogState: StateFlow<DriveLogUiState> = _driveLogState.asStateFlow()
+    private var driveLogCollectJob: Job? = null
+
     // Must be registered before the activity reaches STARTED — a property
     // initializer (runs during construction, before onCreate) satisfies that.
     private val requestLocationPermission = registerForActivityResult(
@@ -141,16 +182,44 @@ class MainActivity : ComponentActivity() {
         // not a claimed behavior of the shipped navigation logic itself.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         sensorRepository = SensorRepository(applicationContext)
+        // Round 2 (2026-08-28 — PRD.md FR12): independent of GNSS/DR
+        // entirely (see FloorChangeRepository's doc), so it only needs
+        // sensorRepository — constructed here, ahead of everything else
+        // that reads sensorRepository, purely by convention (no ordering
+        // dependency actually exists between this and the other
+        // repositories below).
+        floorChangeRepository = FloorChangeRepository(sensorRepository, lifecycleScope)
         locationRepository = LocationRepository(applicationContext)
         // GnssModeRepository must exist before BaselineDeadReckoningRepository —
         // Slice 5 wires the DR odometer's reset behavior to the GNSS mode.
         gnssModeRepository = GnssModeRepository(locationRepository, lifecycleScope)
-        deadReckoningRepository = BaselineDeadReckoningRepository(sensorRepository, gnssModeRepository, lifecycleScope)
+        // PRD.md Section 15's phone-to-vehicle yaw alignment — ONE shared
+        // instance, constructed before AND passed into both DR paths below,
+        // so physics and ML agree on a single real alignment estimate
+        // instead of each tracking (or, previously, only the ML path
+        // tracking) its own. See AlignmentRepository's own doc for why this
+        // used to live privately inside MlVelocityRepository, and why the
+        // physics path needed it too (BaselineDeadReckoningRepository's own
+        // doc) — independent of the ONNX model below, so this fix keeps
+        // working even on a build where the model fails to load.
+        alignmentRepository = AlignmentRepository(sensorRepository, gnssModeRepository, lifecycleScope)
+        deadReckoningRepository = BaselineDeadReckoningRepository(
+            sensorRepository,
+            gnssModeRepository,
+            lifecycleScope,
+            alignmentRepository,
+        )
 
         try {
             val model = VelocityModel.loadFromAssets(applicationContext)
             velocityModel = model
-            mlVelocityRepository = MlVelocityRepository(sensorRepository, gnssModeRepository, model, lifecycleScope)
+            mlVelocityRepository = MlVelocityRepository(
+                sensorRepository,
+                gnssModeRepository,
+                model,
+                lifecycleScope,
+                alignmentRepository,
+            )
         } catch (e: Exception) {
             // Loading a bundled asset / building an ONNX session can fail
             // in ways specific to the model file (missing, truncated,
@@ -160,12 +229,32 @@ class MainActivity : ComponentActivity() {
             _mlModelLoadError.value = e.message ?: e::class.simpleName ?: "unknown error"
         }
 
-        // Constructed after the try/catch above so it sees the FINAL
-        // mlVelocityRepository value (null if the ONNX model failed to
-        // load) — StateEstimator falls back to physics-only fusion in
-        // that case rather than crashing (CLAUDE.md Rule 13's resilience
-        // pattern, same as everywhere else the ML half is optional).
-        stateEstimator = StateEstimator(gnssModeRepository, deadReckoningRepository, mlVelocityRepository, lifecycleScope)
+        // PRD.md Section 17's "AI-based" fusion half — a SEPARATE try/catch
+        // from the velocity model above: this model's own load failure
+        // (missing/corrupt asset) must not be conflated with, or block,
+        // the velocity model's independent success/failure. StateEstimator
+        // treats a null value here the exact same resilience way it
+        // already treats a null mlVelocityRepository — falls back to the
+        // previous fixed-1-second classical blend, not a crash.
+        try {
+            reacquisitionDriftModel = ReacquisitionDriftModel.loadFromAssets(applicationContext)
+        } catch (e: Exception) {
+            Log.w("MainActivity", "reacquisition_drift_v1.onnx failed to load — classical fixed-blend fusion only", e)
+        }
+
+        // Constructed after the try/catch blocks above so it sees the FINAL
+        // mlVelocityRepository/reacquisitionDriftModel values (null if
+        // either ONNX model failed to load) — StateEstimator falls back to
+        // physics-only fusion / a fixed classical blend in that case rather
+        // than crashing (CLAUDE.md Rule 13's resilience pattern, same as
+        // everywhere else the ML half is optional).
+        stateEstimator = StateEstimator(
+            gnssModeRepository,
+            deadReckoningRepository,
+            mlVelocityRepository,
+            lifecycleScope,
+            reacquisitionDriftModel = reacquisitionDriftModel,
+        )
 
         setContent {
             val uiState by sensorRepository.state.collectAsState()
@@ -173,27 +262,29 @@ class MainActivity : ComponentActivity() {
             val gnssState by gnssModeRepository.state.collectAsState()
             val mlState by (mlVelocityRepository?.state ?: MutableStateFlow(MlVelocityUiState())).collectAsState()
             val fusedState by stateEstimator.state.collectAsState()
+            val floorState by floorChangeRepository.state.collectAsState()
             val mlError by mlModelLoadError.collectAsState()
             val recState by recordingState.collectAsState()
+            val driveLogUiState by driveLogState.collectAsState()
             var showDebugScreen by remember { mutableStateOf(false) }
-            var selectedTab by remember { mutableStateOf(AppTab.DRIVE) }
+            var selectedTab by remember { mutableStateOf(AppTab.MAP) }
             var isDarkTheme by remember { mutableStateOf(true) }
             var vehicleMode by remember { mutableStateOf<VehicleMode?>(null) }
             BackHandler(enabled = showDebugScreen) { showDebugScreen = false }
             // User-reported bug (2026-08-26): with no BackHandler at all on
-            // the normal Drive/Map/History tabs, the system back button fell
+            // the normal Map/History tabs, the system back button fell
             // straight through to ComponentActivity's default behavior
             // (finish the Activity) from ANY tab, closing the whole app
-            // instead of navigating within it — surprising from Map/History,
-            // where a user expects Back to return to the main Drive screen
+            // instead of navigating within it — surprising from History,
+            // where a user expects Back to return to the main Map screen
             // first, same as any standard bottom-nav app. Only enabled when
-            // NOT already on Drive (and not on the debug screen, which the
-            // handler above already owns) so Back from Drive itself still
+            // NOT already on Map (and not on the debug screen, which the
+            // handler above already owns) so Back from Map itself still
             // falls through to the normal "exit app" behavior — the
             // conventional bottom-nav-app convention (only the true home tab
             // exits on Back).
-            BackHandler(enabled = !showDebugScreen && selectedTab != AppTab.DRIVE) {
-                selectedTab = AppTab.DRIVE
+            BackHandler(enabled = !showDebugScreen && selectedTab != AppTab.MAP) {
+                selectedTab = AppTab.MAP
             }
 
             // Walking mode actually changes DR behavior (see
@@ -201,7 +292,7 @@ class MainActivity : ComponentActivity() {
             // this is the one place that live selection reaches the
             // repository, same "Compose state -> plain mutable field on a
             // non-Composable repository" pattern onRecalibrate already uses
-            // for mlVelocityRepository.resetAlignment().
+            // for alignmentRepository.reset().
             LaunchedEffect(vehicleMode) {
                 deadReckoningRepository.walkingModeEnabled = vehicleMode == VehicleMode.WALKING
             }
@@ -209,38 +300,32 @@ class MainActivity : ComponentActivity() {
             IdrTheme(darkTheme = isDarkTheme) {
                 if (showDebugScreen) {
                     IdrSensorScreen(
-                        uiState, drState, gnssState, mlState, fusedState, mlError, recState,
+                        uiState, drState, gnssState, mlState, fusedState, floorState, mlError, recState,
                         sensorRepository.hasRequiredSensors(),
                         onStartRecording = ::startRecording,
                         onStopRecording = ::stopRecordingAndSave,
+                        driveLogState = driveLogUiState,
+                        onStartDriveLog = ::startDriveLog,
+                        onStopDriveLog = ::stopDriveLogAndSave,
                     )
                 } else {
-                    // Slice 8b: three tabs (Drive/Map/History) share the SAME
-                    // live state above — switching tabs never re-reads a
+                    // Slice 8b: two tabs (Map/History) share the SAME live
+                    // state above — switching tabs never re-reads a
                     // different data source, only changes which screen
-                    // presents it (DriveScreen's abstract grid, MapScreen's
-                    // real street tiles, or HistoryScreen's measured-drift
-                    // log). The tab bar lives outside all three screens so
-                    // each screen's own bottom-aligned content (vehicle
-                    // selector, drift card) never overlaps it.
+                    // presents it (MapScreen's real street tiles, or
+                    // HistoryScreen's measured-drift log). The DRIVE tab's
+                    // abstract local-meter grid (ui/screens/DriveScreen.kt,
+                    // ui/map/TrackCanvas.kt) was removed once MapScreen's
+                    // real map + routing made it redundant — it showed the
+                    // same StatusOverlayContent as MapScreen but over a
+                    // fake grid instead of a real street map, so it added
+                    // no capability MapScreen didn't already have. The tab
+                    // bar lives outside both screens so each screen's own
+                    // bottom-aligned content (vehicle selector, drift card)
+                    // never overlaps it.
                     Column(modifier = Modifier.fillMaxSize()) {
                         Column(modifier = Modifier.weight(1f).fillMaxWidth()) {
                             when (selectedTab) {
-                                AppTab.DRIVE -> DriveScreen(
-                                    drState = drState,
-                                    gnssState = gnssState,
-                                    mlState = mlState,
-                                    fusedState = fusedState,
-                                    mlModelLoadError = mlError,
-                                    isDarkTheme = isDarkTheme,
-                                    isPipelinePaused = isPipelinePaused,
-                                    vehicleMode = vehicleMode,
-                                    onToggleTheme = { isDarkTheme = !isDarkTheme },
-                                    onRecalibrate = { mlVelocityRepository?.resetAlignment() },
-                                    onShowDebugScreen = { showDebugScreen = true },
-                                    onTogglePipelinePause = ::togglePipelinePause,
-                                    onVehicleModeChange = { vehicleMode = it },
-                                )
                                 AppTab.MAP -> MapScreen(
                                     drState = drState,
                                     gnssState = gnssState,
@@ -251,10 +336,11 @@ class MainActivity : ComponentActivity() {
                                     isPipelinePaused = isPipelinePaused,
                                     vehicleMode = vehicleMode,
                                     onToggleTheme = { isDarkTheme = !isDarkTheme },
-                                    onRecalibrate = { mlVelocityRepository?.resetAlignment() },
+                                    onRecalibrate = alignmentRepository::reset,
                                     onShowDebugScreen = { showDebugScreen = true },
                                     onTogglePipelinePause = ::togglePipelinePause,
                                     onVehicleModeChange = { vehicleMode = it },
+                                    onActiveRouteGeometryChanged = stateEstimator::setActiveRouteGeometry,
                                 )
                                 AppTab.HISTORY -> HistoryScreen(driftHistory = fusedState.driftHistory)
                             }
@@ -276,12 +362,20 @@ class MainActivity : ComponentActivity() {
     // stateEstimator — see the original inline comments this replaced).
     private fun startPipeline() {
         sensorRepository.start()
+        // Independent of GNSS/DR (see FloorChangeRepository's doc) — only
+        // needs sensorRepository, which is already started above.
+        floorChangeRepository.start()
         gnssModeRepository.start()
         if (locationRepository.hasLocationPermission()) {
             locationRepository.start()
         } else {
             requestLocationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
         }
+        // Before deadReckoningRepository/mlVelocityRepository — both read
+        // alignmentRepository.state.value synchronously each tick, so it
+        // must already be collecting (same "GnssModeRepository before
+        // BaselineDeadReckoningRepository" ordering rationale as above).
+        alignmentRepository.start()
         deadReckoningRepository.start()
         mlVelocityRepository?.start()
         stateEstimator.start()
@@ -296,9 +390,11 @@ class MainActivity : ComponentActivity() {
     private fun stopPipeline() {
         stateEstimator.stop()
         mlVelocityRepository?.stop()
+        deadReckoningRepository.stop()
+        alignmentRepository.stop()
+        floorChangeRepository.stop()
         gnssModeRepository.stop()
         locationRepository.stop()
-        deadReckoningRepository.stop()
         sensorRepository.stop()
     }
 
@@ -356,17 +452,49 @@ class MainActivity : ComponentActivity() {
                 _recordingState.value = _recordingState.value.copy(recordedCount = sensorRecorder.recordedCount)
             }
         }
+
+        // Same always-collecting / gated-by-flag convention as the
+        // recorder loop above — ticks off deadReckoningRepository's own
+        // StateFlow (already ~10 Hz, one emission per real accel sample,
+        // per BaselineDeadReckoningRepository's own dedup guard) rather
+        // than re-deriving a separate tick source. GNSS state is read via
+        // `.value` at the same instant (same synchronous-snapshot pattern
+        // BaselineDeadReckoningRepository itself already uses to read
+        // gnssModeRepository.state.value.mode), so each row is GNSS+DR at
+        // the same moment without needing a `combine()` flow.
+        driveLogCollectJob = lifecycleScope.launch {
+            deadReckoningRepository.state.collect { dr ->
+                if (!_driveLogState.value.isLogging) return@collect
+                val gnss = gnssModeRepository.state.value
+                driveDataLogger.record(
+                    timestampNs = System.nanoTime(),
+                    gnssMode = gnss.mode.name,
+                    gnssFixAccuracyM = gnss.latestFix?.accuracyM,
+                    gnssFixAgeMs = gnss.fixAgeMs,
+                    gnssSpeedMps = gnss.latestFix?.speedMps,
+                    drVelocityEastMps = dr.velocityEastMps,
+                    drVelocityNorthMps = dr.velocityNorthMps,
+                    linearAccelMagnitudeMps2 = dr.linearAccelMagnitudeMps2,
+                    gyroMagnitudeRadPerSec = dr.gyroMagnitudeRadPerSec,
+                    isStationary = dr.isStationary,
+                )
+                _driveLogState.value = _driveLogState.value.copy(recordedCount = driveDataLogger.recordedCount)
+            }
+        }
     }
 
     override fun onPause() {
         recorderCollectJob?.cancel()
         recorderCollectJob = null
+        driveLogCollectJob?.cancel()
+        driveLogCollectJob = null
         stopPipeline()
         super.onPause()
     }
 
     override fun onDestroy() {
         velocityModel?.close()
+        reacquisitionDriftModel?.close()
         super.onDestroy()
     }
 
@@ -392,6 +520,27 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    private fun startDriveLog() {
+        driveDataLogger.reset()
+        _driveLogState.value = DriveLogUiState(isLogging = true, recordedCount = 0)
+    }
+
+    // Same off-main-thread write as stopRecordingAndSave() above (CLAUDE.md
+    // Android Rule 7) — CSV, not JSON, specifically so scripts/
+    // analyze_drive_log.py can load it with pandas.read_csv directly.
+    private fun stopDriveLogAndSave() {
+        _driveLogState.value = _driveLogState.value.copy(isLogging = false)
+        val csv = driveDataLogger.toCsv()
+        val fileName = "drive_log_${System.currentTimeMillis()}.csv"
+        lifecycleScope.launch(Dispatchers.IO) {
+            val file = File(getExternalFilesDir(null), fileName)
+            file.writeText(csv)
+            withContext(Dispatchers.Main) {
+                _driveLogState.value = _driveLogState.value.copy(lastSavedFileName = fileName)
+            }
+        }
+    }
 }
 
 @Composable
@@ -401,11 +550,15 @@ private fun IdrSensorScreen(
     gnssState: GnssModeUiState,
     mlState: MlVelocityUiState,
     fusedState: FusedPositionUiState,
+    floorState: FloorChangeUiState,
     mlModelLoadError: String?,
     recordingState: RecordingUiState,
     hasRequiredSensors: Boolean,
     onStartRecording: () -> Unit,
     onStopRecording: () -> Unit,
+    driveLogState: DriveLogUiState,
+    onStartDriveLog: () -> Unit,
+    onStopDriveLog: () -> Unit,
 ) {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
@@ -433,6 +586,31 @@ private fun IdrSensorScreen(
                     } else {
                         "Not recording. Move the phone after tapping Start — accel/gyro/orientation " +
                             "are logged with millisecond timestamps to a JSON file on Stop."
+                    },
+                )
+
+                // Real test-drive logger (capture/DriveDataLogger.kt,
+                // 2026-08-29) — for validating gnss/GnssQuality.kt,
+                // gnss/GnssOutageDetector.kt, and dr/StationaryDetector.kt's
+                // "engineering default, not yet validated" thresholds
+                // against a real drive: tap Start before setting off, tap
+                // Stop after, then `adb pull` the saved CSV and run
+                // scripts/analyze_drive_log.py against it.
+                Button(onClick = if (driveLogState.isLogging) onStopDriveLog else onStartDriveLog) {
+                    Text(text = if (driveLogState.isLogging) "Stop drive log" else "Start drive log")
+                }
+                Text(
+                    text = if (driveLogState.isLogging) {
+                        "Logging GNSS+DR state for threshold validation... %d ticks captured so far.".format(
+                            driveLogState.recordedCount,
+                        )
+                    } else if (driveLogState.lastSavedFileName != null) {
+                        "Last drive log: %d ticks saved to %s (app-external-files dir)".format(
+                            driveLogState.recordedCount, driveLogState.lastSavedFileName,
+                        )
+                    } else {
+                        "Not logging. Start before a real test drive, Stop after — saves a CSV of " +
+                            "GNSS mode/accuracy/speed + DR velocity/ZUPT state per tick."
                     },
                 )
 
@@ -493,10 +671,11 @@ private fun IdrSensorScreen(
                     ),
                 )
                 Text(
-                    text = "^ ZUPT (zero-velocity when stationary) and a simplified " +
-                        "non-holonomic constraint are applied (Slice 5), but there is " +
-                        "still no accelerometer bias correction and no vehicle-frame " +
-                        "alignment — still expect drift during real motion.",
+                    text = "^ ZUPT (zero-velocity when stationary), a simplified " +
+                        "non-holonomic constraint (Slice 5), and (Round 2, 2026-08-28) the " +
+                        "same phone-to-vehicle yaw alignment the ML path uses are applied — " +
+                        "but there is still no accelerometer bias correction, so still " +
+                        "expect drift during real motion.",
                 )
 
                 Text(text = "GNSS mode: ${gnssState.mode}")
@@ -527,8 +706,9 @@ private fun IdrSensorScreen(
                     Text(text = "ML velocity model failed to load: $mlModelLoadError")
                 } else {
                     Text(
-                        text = if (mlState.predictedVelocityCorrectedMps != null) {
-                            "ML predicted forward speed: %.2f m/s corrected (raw=%.2f, learned bias=%.2f)".format(
+                        text = if (mlState.predictedVelocityDampedMps != null) {
+                            "ML predicted forward speed: %.2f m/s damped (corrected=%.2f, raw=%.2f, learned bias=%.2f)".format(
+                                mlState.predictedVelocityDampedMps,
                                 mlState.predictedVelocityCorrectedMps,
                                 mlState.predictedVelocityRawMps,
                                 mlState.velocityBiasMps,
@@ -540,8 +720,17 @@ private fun IdrSensorScreen(
                     Text(
                         text = "^ bias is an online correction learned from GNSS speed while " +
                             "GNSS_AIDED (PRD Section 17) — held constant, still applied, during " +
-                            "an outage; 0.00 until GNSS has been good and moving above ~18 km/h.",
+                            "an outage; 0.00 until GNSS has been good and moving above ~18 km/h. " +
+                            "\"damped\" (Round 2) is corrected + VelocityGuard's OOD guard/EMA " +
+                            "smoothing — this is what actually feeds the position below now.",
                     )
+                    if (mlState.isVelocityOutOfDistribution) {
+                        Text(
+                            text = "^ OOD GUARD FIRED this tick — raw prediction was implausible " +
+                                "(NaN/infinite or > the plausible-speed bound); held the last " +
+                                "accepted value instead of integrating it.",
+                        )
+                    }
                     Text(
                         text = "ML-based DR position (WORLD frame, m since GNSS last good): " +
                             "east=%.2f north=%.2f".format(mlState.positionEastM, mlState.positionNorthM),
@@ -588,6 +777,32 @@ private fun IdrSensorScreen(
                         text = "^ deterministic vertical-accel threshold, PRD Section 14's Pothole " +
                             "effect — NOT validated against real pothole data (none exists yet).",
                     )
+                    Text(
+                        text = when {
+                            mlState.isAccelerating -> "Longitudinal motion: ACCELERATING this tick"
+                            mlState.isBraking -> "Longitudinal motion: BRAKING this tick"
+                            else -> "Longitudinal motion: neither Accelerating nor Braking this tick"
+                        },
+                    )
+                    Text(
+                        text = "^ deterministic sign/magnitude threshold on the SAME alignment-" +
+                            "corrected forward-acceleration feature the ONNX model consumes — PRD " +
+                            "Section 14's Accelerating/Braking classes (see " +
+                            "LongitudinalMotionClassifier.kt), NOT validated against real labeled data.",
+                    )
+                    Text(
+                        text = if (drState.isTurning) {
+                            "Turning: DETECTED this tick — non-holonomic lateral-velocity " +
+                                "suppression is relaxed while this is true"
+                        } else {
+                            "Turning: not detected this tick"
+                        },
+                    )
+                    Text(
+                        text = "^ deterministic yaw-rate threshold, PRD Section 14's Turning class " +
+                            "(see TurningDetector.kt) — physics-path signal, shown here alongside " +
+                            "the other ML-side motion signals for one combined readout.",
+                    )
                 }
 
                 Text(
@@ -606,6 +821,88 @@ private fun IdrSensorScreen(
                                 fusedState.secondsSinceLastGnssAided,
                             )
                     },
+                )
+
+                // Round 2 (2026-08-28 — PRD.md FR12): barometer-based
+                // floor/level-change detection.
+                Text(
+                    text = if (!floorState.hasBarometer) {
+                        "Floor detection: this device has no barometer."
+                    } else {
+                        "Floor detection: relative altitude=%.2fm, total floors changed=%d%s".format(
+                            floorState.relativeAltitudeM,
+                            floorState.totalFloorsChanged,
+                            if (floorState.floorChangeDetected) {
+                                " — FLOOR CHANGE just detected (%s)".format(
+                                    if (floorState.floorDelta > 0) "up" else "down",
+                                )
+                            } else {
+                                ""
+                            },
+                        )
+                    },
+                )
+                Text(
+                    text = "^ deterministic threshold on relative barometric altitude " +
+                        "(PRD Section 2/3's multi-level-parking scenario) — NOT validated " +
+                        "against a real multi-level test yet (CLAUDE.md Rule 13).",
+                )
+
+                // Round 2 (2026-08-28 — PRD.md Section 11): gravity-sensor
+                // cross-check. Purely observational — this does NOT feed
+                // the DR pipeline; it lets a real test drive compare our
+                // own manual gravity subtraction against Android's own
+                // fused sensors before deciding whether to switch
+                // (CLAUDE.md Rule 3: a real comparison, not an assumption).
+                val ourLinearAccel = if (state.latestAccel != null && state.latestOrientation != null) {
+                    val world = WorldFrameAcceleration.rotateDeviceToWorld(
+                        deviceX = state.latestAccel.xMps2,
+                        deviceY = state.latestAccel.yMps2,
+                        deviceZ = state.latestAccel.zMps2,
+                        rotationMatrixDeviceToWorld = state.latestOrientation.rotationMatrixDeviceToWorld,
+                    )
+                    WorldFrameAcceleration.removeGravity(world)
+                } else {
+                    null
+                }
+                val ourLinearAccelMagnitude = ourLinearAccel?.let {
+                    sqrt(it[0] * it[0] + it[1] * it[1] + it[2] * it[2])
+                }
+                val androidLinearAccelMagnitude = state.latestLinearAcceleration?.let {
+                    sqrt(it.xMps2 * it.xMps2 + it.yMps2 * it.yMps2 + it.zMps2 * it.zMps2)
+                }
+                Text(
+                    text = "Gravity-removal cross-check (m/s^2 magnitude): ours=%s, Android's own=%s".format(
+                        ourLinearAccelMagnitude?.let { "%.3f".format(it) } ?: "n/a",
+                        androidLinearAccelMagnitude?.let { "%.3f".format(it) } ?: "n/a (no TYPE_LINEAR_ACCELERATION on this device)",
+                    ),
+                )
+                Text(
+                    text = "^ instrumentation only (PRD Section 11) — not wired into the DR " +
+                        "pipeline; compare these two on a real drive before deciding whether " +
+                        "to switch dr/WorldFrameAcceleration's manual subtraction for Android's " +
+                        "own fused sensor (CLAUDE.md Rule 3: adopt only on a measured win).",
+                )
+
+                Text(
+                    text = if (fusedState.roadSnapped) {
+                        // distanceToRoadM is always non-null alongside
+                        // roadSnapped=true (StateEstimator sets both
+                        // together) — the ?: 0.0 is just to keep
+                        // String.format's numeric conversion happy with a
+                        // non-null Double type, not a real fallback path.
+                        "Map constraint: SNAPPED this tick, %.1fm from the active route's road " +
+                            "geometry".format(fusedState.distanceToRoadM ?: 0.0)
+                    } else {
+                        "Map constraint: not snapped this tick (no active route, no GNSS anchor " +
+                            "yet, GNSS_AIDED already trusted, moving too slowly for a reliable " +
+                            "heading, or nothing within snap range/heading tolerance)"
+                    },
+                )
+                Text(
+                    text = "^ PRD Section 19 MVP map constraint (map/MapConstraint.kt) — nearest-" +
+                        "road-snap + heading-compatibility check against the active route's real " +
+                        "OSRM geometry, NOT a general road dataset or an HMM map matcher.",
                 )
             }
         }

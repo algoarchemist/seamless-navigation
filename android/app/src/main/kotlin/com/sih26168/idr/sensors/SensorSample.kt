@@ -60,3 +60,15 @@ data class OrientationSample(
     // is a well-known footgun).
     val rotationMatrixDeviceToWorld: List<Float>,
 )
+
+/**
+ * A single barometer reading (Round 2 addition, 2026-08-28 — PRD.md
+ * FR12). Units: hPa, per Android's SensorEvent convention for
+ * TYPE_PRESSURE. Not all devices have a barometer — see
+ * SensorRepository.hasBarometer(); consumers must treat its absence as a
+ * normal, honest case, not an error.
+ */
+data class PressureSample(
+    val timestampNs: Long,
+    val pressureHpa: Float,
+)

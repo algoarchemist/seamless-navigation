@@ -26,7 +26,7 @@ import com.sih26168.idr.ui.theme.GlassSurface
  * Presentation-page instance (45% flat fill, flat 1px stroke); pass
  * `fill = BottomSheetFill` / a gradient `border` built from
  * `BottomSheetBorderStart`/`BottomSheetBorderEnd` for the Drag-Gesture-page
- * instance DriveScreen.kt's live bottom sheet uses instead. `cornerRadius`
+ * instance a live bottom sheet uses instead. `cornerRadius`
  * defaults to the smaller [GlassCardRadius] (40dp reads oversized on a
  * compact status chip/card — see Shape.kt's note), with the real 40dp
  * available via `LargeGlassCardRadius` for bottom-sheet-scale cards.

@@ -1,5 +1,6 @@
 package com.sih26168.idr.gnss
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -50,5 +51,30 @@ class GnssQualityTest {
                 accuracyM = GnssQuality.DEFAULT_MAX_ACCURACY_M + 0.1f,
             ),
         )
+    }
+
+    @Test
+    fun `confidenceWeight is null-safe zero when no fix has ever been received`() {
+        assertEquals(0f, GnssQuality.confidenceWeight(accuracyM = null), 0.0001f)
+    }
+
+    @Test
+    fun `confidenceWeight is near 1 for a very accurate fix`() {
+        assertEquals(0.96f, GnssQuality.confidenceWeight(accuracyM = 1f, maxAccuracyM = 25f), 0.0001f)
+    }
+
+    @Test
+    fun `confidenceWeight is 0 at the maxAccuracyM boundary isGood still accepts`() {
+        assertEquals(0f, GnssQuality.confidenceWeight(accuracyM = 25f, maxAccuracyM = 25f), 0.0001f)
+    }
+
+    @Test
+    fun `confidenceWeight clamps to 0 past the boundary rather than going negative`() {
+        assertEquals(0f, GnssQuality.confidenceWeight(accuracyM = 100f, maxAccuracyM = 25f), 0.0001f)
+    }
+
+    @Test
+    fun `confidenceWeight is 1 for a zero-or-better accuracy reading`() {
+        assertEquals(1f, GnssQuality.confidenceWeight(accuracyM = 0f, maxAccuracyM = 25f), 0.0001f)
     }
 }

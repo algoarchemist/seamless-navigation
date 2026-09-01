@@ -37,9 +37,25 @@ data class FusedPosition(val eastM: Double, val northM: Double)
  *   [reacquisitionBlendMs]. Falls back to the raw DR passthrough if no fix
  *   is available yet that tick (honest degrade, not a crash or a stale
  *   guess).
+ *
+ * UPDATE (PRD.md Section 17's "AI-based" GNSS+INS fusion — previously
+ * entirely classical, per this class's own doc and STATUS_AND_ROADMAP.md's
+ * flagged decision point): [reacquisitionBlendMs] is now a `var`, settable
+ * via [setReacquisitionBlendMs] BEFORE the tick that first enters
+ * REACQUISITION — [com.sih26168.idr.fusion.StateEstimator] calls it with
+ * [blendDurationForDriftMs]'s output, fed by
+ * [com.sih26168.idr.ml.ReacquisitionDriftModel]'s predicted along-track
+ * drift for this specific outage. Deliberately NOT a Kalman/EKF state
+ * update (CLAUDE.md's "What Not To Build" / PRD.md Section 7) — this
+ * remains the same simple, transparent linear-interpolation blend as
+ * before, just with a DATA-INFORMED duration instead of a fixed constant.
+ * If the model is unavailable ([com.sih26168.idr.ml.ReacquisitionDriftModel]
+ * failed to load, same resilience pattern as [com.sih26168.idr.ml.VelocityModel]),
+ * [reacquisitionBlendMs] simply stays at [DEFAULT_REACQUISITION_BLEND_MS]
+ * — the exact previous, classical behavior.
  */
 class PositionFusion(
-    private val reacquisitionBlendMs: Long = DEFAULT_REACQUISITION_BLEND_MS,
+    private var reacquisitionBlendMs: Long = DEFAULT_REACQUISITION_BLEND_MS,
 ) {
     companion object {
         // Deliberately a separate constant from GnssOutageDetector's own
@@ -49,6 +65,40 @@ class PositionFusion(
         // intentional (a REACQUISITION-mode blend that outlasts the mode
         // itself would be a visible bug) but not structurally enforced.
         const val DEFAULT_REACQUISITION_BLEND_MS = 1_000L
+
+        // Engineering defaults, unvalidated against a real outdoor test
+        // drive (CLAUDE.md Rule 13) — bounds chosen to stay within the
+        // same rough order of magnitude as the previous fixed 1-second
+        // default (never a runaway multi-minute blend), while still
+        // letting a genuinely large predicted drift smooth its correction
+        // out over meaningfully longer than a near-zero-drift outage.
+        const val MIN_ADAPTIVE_REACQUISITION_BLEND_MS = 500L
+        const val MAX_ADAPTIVE_REACQUISITION_BLEND_MS = 3_000L
+        const val BLEND_MS_PER_METER_OF_PREDICTED_DRIFT = 30.0
+
+        /**
+         * Maps [com.sih26168.idr.ml.ReacquisitionDriftModel]'s predicted
+         * along-track drift (meters) to a REACQUISITION blend duration —
+         * a simple, transparent linear formula (larger predicted drift =
+         * longer blend, spreading the correction out to reduce a visibly
+         * jarring "jump" to the reacquired fix; near-zero predicted drift
+         * snaps back almost immediately, since there is little error to
+         * hide), clamped to [MIN_ADAPTIVE_REACQUISITION_BLEND_MS]..[MAX_ADAPTIVE_REACQUISITION_BLEND_MS].
+         */
+        fun blendDurationForDriftMs(predictedDriftMeters: Float): Long {
+            val rawMs = MIN_ADAPTIVE_REACQUISITION_BLEND_MS + BLEND_MS_PER_METER_OF_PREDICTED_DRIFT * predictedDriftMeters
+            return rawMs.toLong().coerceIn(MIN_ADAPTIVE_REACQUISITION_BLEND_MS, MAX_ADAPTIVE_REACQUISITION_BLEND_MS)
+        }
+    }
+
+    /**
+     * Sets the REACQUISITION blend duration for the NEXT outage this
+     * instance handles — see this class's own doc for the full reasoning
+     * and calling convention (must be called before the first
+     * REACQUISITION-mode [update] call for that outage).
+     */
+    fun setReacquisitionBlendMs(blendMs: Long) {
+        reacquisitionBlendMs = blendMs
     }
 
     private var lastMode: GnssMode? = null
@@ -100,5 +150,6 @@ class PositionFusion(
         modeEnteredAtMs = 0L
         frozenPosition = FusedPosition(0.0, 0.0)
         reacquisitionStartPosition = FusedPosition(0.0, 0.0)
+        reacquisitionBlendMs = DEFAULT_REACQUISITION_BLEND_MS
     }
 }

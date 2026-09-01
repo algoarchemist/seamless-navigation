@@ -5,647 +5,76 @@ added, removed, or has its responsibility/interface changed
 (CLAUDE.md Rule 6/21). This is written to teach the pipeline, not just
 list files — when in doubt, explain *why*, not just *what*.
 
-Status as of last update: **Phase 0 scaffold + Slice 1-6 (Kotlin half
-included) implemented and on-device verified.** The folder/build-system
-skeleton (`## Scaffold Status`) and Slice 1-5 (Android sensor -> live
-sensor display, sensor -> orientation, sensor -> baseline physics
-velocity/position, GNSS outage detection, dead reckoning state-machine
-wiring + ZUPT + non-holonomic constraint) are real, build-verified, and
-confirmed running on a real Samsung Galaxy S24 FE (Android 16 / One UI
-8.5). **Phase 4 (dataset inspection) and Slice 6's full pipeline —
-Python training AND Kotlin on-device wiring — are now also done.**
-Python side: `ml/inspect_dataset.py`, `ml/feature_extraction.py`,
-`ml/train_velocity_model.py`, `ml/export_model.py` — real, tested, run
-against the actual downloaded IO-VNBD dataset. Real measured result:
-the trained velocity model beats the app's own physics+ZUPT baseline by
-~4.2x (MAE 1.244 m/s vs 5.205 m/s on held-out trips — CLAUDE.md Rule 3
-satisfied with a real comparison), exported to `models/velocity_v1.onnx`
-with a clean output-parity check. Kotlin side (2026-08-25): AlignmentEstimator,
-FeatureExtractor, VelocityModel (ONNX Runtime Mobile), and
-MlVelocityRepository are all implemented, tested (29 new unit tests),
-and confirmed RUNNING LIVE on the same S24 FE — the ONNX model produces
-real-time predictions on-device with no crash, displayed side by side
-with the physics-only estimate. Several real bugs were caught and fixed
-along the way, each before it could silently corrupt something
-downstream: a duplicate-trip-tree risk in the raw dataset, a
-forward-axis sign error caught by correlating against real GPS ground
-truth, and a Compose screen-overflow bug (the ML section was rendering
-but genuinely invisible off the bottom of the screen — only caught by
-looking at the real device output, not by compiling) — see `## Phase 4
-— Dataset inspection findings` and the relevant file entries below for
-the full writeups. **UPDATE (2026-08-25, same day)**: ML velocity is
-now ALSO wired into a real position estimate —
-`ml/MlPositionIntegrator.kt` propagates it per PRD.md Section 16,
-running parallel to (not replacing) the physics position. On-device
-testing surfaced a real, honestly-documented finding: this ML position
-path is measurably more sensitive to brief disturbances than the
-physics path (no momentum damping — see MlPositionIntegrator.kt's
-entry), deliberately left unfixed for now as an explicit, discussed
-decision. **UPDATE (2026-08-25, Slice 7 — Fusion / re-alignment on GNSS
-reacquisition)**: true GNSS/DR position blending now exists.
-`fusion/GeoProjection.kt` (lat/lon -> local meters), `fusion/PositionFusion.kt`
-(the per-mode freeze/blend logic — PRD.md Section 18's "freeze/average" in
-TRANSITION and "blend DR toward new GNSS fix" in REACQUISITION), and
-`fusion/StateEstimator.kt` (the Android/coroutine glue tying GNSS mode +
-both DR repositories together into a live fused position) are all
-IMPLEMENTED, tested (29 new unit tests), and confirmed running on the
-same S24 FE with no crash. PRD.md Section 17's online velocity-bias
-calibration was also implemented in the same slice (`fusion/VelocityBiasCalibrator.kt`,
-wired into `ml/MlVelocityRepository.kt`) rather than deferred — see the
-`## Slice 7` build-verification entry below for the scope discussion.
-The fused estimator uses ML position once alignment is established, else
-falls back to the physics position (PRD.md Section 16's literal "or
-physics fallback"), so it inherits the already-documented ML
-burst-sensitivity limitation rather than introducing a new one.
-**UPDATE (2026-08-25, same day)**: a small one-off data-capture tool,
-`capture/SensorRecorder.kt`, was added and wired into `MainActivity.kt`
-(Start/Stop Recording button) — logs live accel/gyro/orientation with
-millisecond timestamps to a hand-written JSON file, no new dependency.
-Used once, live, to confirm the whole sensor pipeline captures real
-motion at millisecond resolution (a genuine hand-moved-phone capture
-showed accel magnitude swinging 5.6-22.5 m/s^2 against a ~9.8 m/s^2
-at-rest baseline) — this is real, usable tooling toward the
-self-captured Pothole/Phone-Moved/Cruising data
-`train_motion_classifier.py` is blocked on, though one capture is nowhere
-near enough labeled data to train on yet. **UPDATE (2026-08-25, same
-day)**: two DETERMINISTIC, partial stand-ins for PRD.md Section 14's
-Motion Classification were added — `motion/MotionStateClassifier.kt`
-(resolves StationaryDetector's own documented "can't tell stationary
-from cruising" ambiguity using the ML model's raw prediction as a
-corroborating signal, wired ML-side only so the physics baseline stays
-untouched) and `motion/PotholeShockDetector.kt` (a vertical-accel
-threshold implementing Section 14's literal "discount the acceleration
-sample(s)" Pothole effect, wired into BOTH the physics and ML paths since
-it only affects the live corrected display, not the frozen baseline
-measurement). Neither is the real trained classifier — that stays
-blocked on labeled data, same as before; these are honest, tested,
-deterministic mechanisms only, explicitly not validated against real
-pothole/cruising ground truth. **Still not done**: the real trained
-`train_motion_classifier.py` (blocked on self-captured Pothole/Phone-Moved
-data — the capture tool now exists, but not nearly enough labeled
-sessions yet); a real outdoor TRANSITION->REACQUISITION blend has only
-been verified by unit test, not a live outdoor GNSS reacquisition
-(indoor testing has no GNSS fix to reacquire — same honest limitation
-Slice 5/6 already documented for GNSS-mode-gated behavior generally); the
-Cruising/Pothole stand-ins have only been confirmed to not misfire at
-rest, not confirmed against real driving. **UPDATE (2026-08-25, Slice 8
-— Figma-derived UI layer)**: PRD.md Section 22's "single main screen"
-now has a real, polished implementation. Design tokens
-(`ui/theme/Color.kt`/`Type.kt`/`Shape.kt`/`IdrTheme.kt`) were extracted
-directly from an external Figma community "Navigation app" template via
-its own Design-tab inspector (exact hex/corner-radius values, not
-eyeballed) — see the `## Slice 8` build-verification entry below for the
-full sourcing writeup, the two real icon exports
-(`res/drawable/ic_recenter.xml`, `ic_car.xml`), and the one honest
-non-Figma icon (`ic_motorcycle.xml`, hand-drawn — no motorcycle icon
-exists in the source file). Five reusable primitives
-(`ui/components/{GlassCard,StatusChip,FloatingIconButton,
-VehicleModeSelector,DriftSummaryCard}.kt`), a Canvas-drawn map layer
-(`ui/map/TrackCanvas.kt` — deliberately NOT a real map SDK, zero new
-dependencies, plots directly in already-existing local-meter state) and
-a new `fusion/DriftSummary.kt` (a REAL measured drift number, not
-fabricated — PRD Section 30 WOW-factor #4) compose into
-`ui/screens/DriveScreen.kt`, now `MainActivity.kt`'s DEFAULT screen. The
-pre-Slice-8 raw-value debug screen (`IdrSensorScreen`) was NOT deleted —
-it's kept reachable via a "Debug" toggle + the system back button, since
-it remains the only way to verify every raw number across Slices 1-7.
-Everything else under `## Planned File Map` is still a target derived
-from PRD.md — `MapConstraint.kt` (real road-snapping) does not exist,
-and the map layer has no real street geometry (by design, this slice's
-decision). Each entry gets flipped from `PLANNED` to `IMPLEMENTED` (with
-the fields below filled in for real) as it is actually built.
+Status as of last update: **Slices 1-8b implemented and on-device
+verified**, plus an explicit user-approved scope expansion into full
+turn-by-turn navigation (routing/geocoding/offline tile caching) beyond
+PRD.md's original Section 7/22 boundaries. The Android app has live
+sensors, orientation, a physics+ZUPT dead-reckoning position, a real
+GNSS-outage state machine with hysteresis, an ONNX velocity model
+running on-device (measured ~4.2x more accurate than the physics
+baseline — see `## Phase 4` findings below), GNSS/DR fusion with
+re-alignment on reacquisition, two deterministic (not yet ML-trained)
+motion-classification stand-ins, a Figma-derived UI with Drive/Map/
+History tabs, real OpenStreetMap street tiles, and full search ->
+route -> turn-by-turn navigation against live Nominatim/OSRM services.
+`train_motion_classifier.py` remains PLANNED (blocked on self-captured
+Pothole/Phone-Moved labels IO-VNBD doesn't provide). A true outdoor
+GNSS_AIDED lock (needed to verify TRANSITION/REACQUISITION blending and
+live turn-by-turn progress against real motion) has not yet happened
+this project — every fix so far has come from indoor/marginal-signal
+on-device testing, which has itself surfaced and fixed several real
+bugs (noisy Doppler speed, REACQUISITION flapping, a missing map
+anchor, tile-loading fights with `animateTo`, and others).
 
-**UPDATE (2026-08-26, Slice 8b — real street map + tab navigation)**: the
-user explicitly asked to bring in a real map dependency ("skip that
-rule [about not adding dependencies], install new dependencies and build
-the street view, maps view, other windows with the same exact ui/ux
-elements from that figma file") — CLAUDE.md Rule 2 discussed and
-overridden for this one decision, same as any explicit user instruction
-overriding a default rule. `org.osmdroid:osmdroid-android:6.1.20` was
-added (real OpenStreetMap street tiles via CartoDB's free dark-tile
-endpoint, `ui/map/StreetMapView.kt`) — chosen over Google Maps
-Compose/Mapbox specifically because it needs no API key/billing account,
-so nothing blocks on a credential this project doesn't have. `INTERNET`/
-`ACCESS_NETWORK_STATE` permissions were added for the tile fetch only —
-no sensor/DR/fusion logic depends on network access; the actual
-positioning pipeline stays fully offline as before (verified: existing
-unit tests all still pass unchanged). `fusion/GeoProjection.kt` gained a
-real algebraic-inverse function, `toLatLon()` (tested in
-`GeoProjectionTest`, round-trips against the existing `toLocalMeters()`),
-so the already-computed fused local-meter position can be placed back
-onto real street tiles. `fusion/StateEstimator.kt`'s `FusedPositionUiState`
-gained `anchorLatDeg`/`anchorLonDeg` (the real-world point local (0,0)
-corresponds to) and `driftHistory` (every REACQUISITION-instant drift
-measurement this run, not just the last one) — both purely additive
-fields with defaults, so nothing that already read this class needed to
-change. Three real screens now exist behind a new `BottomNavBar`
-(Drive/Map/History, `ui/components/BottomNavBar.kt`): `ui/screens/DriveScreen.kt`
-(unchanged behavior, now over the abstract grid as before),
-`ui/screens/MapScreen.kt` (NEW — the real street-map screen, same status
-overlay, different base layer), and `ui/screens/HistoryScreen.kt` (NEW —
-lists the real `driftHistory` log, an HONEST departure from the Figma
-"Timeline" screen's fabricated per-day mileage chart, which has no real
-data source in this codebase — CLAUDE.md Rule 13). The status
-overlay itself (GNSS mode/speed/motion/alignment header + vehicle-mode
-selector/recalibrate/drift-card footer) was extracted out of
-`DriveScreen.kt` into `ui/screens/StatusOverlayContent.kt` so `DriveScreen`
-and `MapScreen` share one implementation instead of two copies drifting
-apart — `DriveScreen.kt`'s own behavior is unchanged by this refactor.
-Real bug caught and fixed during on-device verification: osmdroid's
-`Configuration` needs an explicit `osmdroidBasePath`/`osmdroidTileCache`
-set from the SAME context the app already has — its own default-path
-auto-resolution reaches for a separate internal context reference that's
-null unless `Configuration.getInstance().load(...)` is called, and the
-resulting `NullPointerException` (caught internally by osmdroid, silent
-unless debug logging is enabled) meant tiles never rendered past a
-placeholder checkerboard. Fixed by setting both paths explicitly in
-`configureOsmdroid()`, verified via temporary `isDebugMode`/
-`isDebugTileProviders` logging plus a direct `curl` check against the
-CartoDB tile endpoint (200 OK). Real limitation, same as Slice 7/8's
-already-documented one: fully verifying real street imagery under a real
-position (not just "does it crash / does the pipeline wire up correctly")
-needs an actual outdoor GNSS fix, which has not happened yet this slice —
-indoor testing only confirms the map renders open-ocean tiles near (0,0)
-correctly (no fix = no real center yet), not real street geometry under
-a real marker.
+**The full chronological history — every dated bug fix, scope decision,
+and on-device verification — now lives in `summary.txt` at the repo
+root, not here.** This file stays focused on current-state structure:
+what each file's responsibility, inputs/outputs, and non-obvious
+assumptions are *right now* (CLAUDE.md Rule 21). Read `summary.txt`
+for the story of how it got there.
 
-**UPDATE (2026-08-26, real outdoor walking test — bug fixes)**: the
-user's first real outdoor test (walking, not driving) surfaced several
-real bugs, since honestly documented "unvalidated engineering default"
-thresholds finally had real motion data to be checked against:
-- `motion/PotholeShockDetector.kt`'s vertical-shock threshold (4.0 m/s^2)
-  false-positived constantly on ordinary walking bounce — raised to
-  15.0 m/s^2 (still unvalidated against a real in-vehicle pothole strike,
-  which remains blocked on real driving data).
-- `ui/screens/StatusOverlayContent.kt`'s `estimateMotionLabel()` used to
-  recompute speed from raw physics DR velocity independently of the
-  `estimateSpeedMps()` value the chip right above it already displays —
-  the two could visibly contradict each other ("1.2 m/s" next to
-  "Stationary") since ZUPT could zero the physics velocity on a tick
-  where the authoritative speed source said otherwise. Now both chips
-  read from the SAME `speedMps` value; the stationary epsilon was also
-  loosened from 0.05 to 0.3 m/s.
-- Also user-requested and added: a light/dark theme toggle
-  (`ui/theme/Color.kt`'s `IdrPalette`/`DarkIdrPalette`/`LightIdrPalette`
-  + `LocalIdrPalette` CompositionLocal, `IdrTheme.kt`'s new `darkTheme`
-  param) — the light palette is a REASONED EXTENSION, not a Figma import
-  (the source file is dark-theme only). Chrome-only tokens (text, glass
-  surfaces, panel backgrounds) became theme-aware `@Composable get()`
-  properties; map-marker/status-accent colors (AccentBlue, CtaRed, etc.)
-  deliberately stayed constant across themes, matching how real map apps
-  keep their position-dot/route colors fixed regardless of theme.
+**Round 2 Day 2 update (2026-08-28):** a real live outage test (GPS
+toggled off mid-drive — Round 2's Day 1 validation run) surfaced a
+position-snap + map-orientation-flip bug on GNSS reacquisition. Four
+fixes landed the same day, all cross-referenced from PRD.md's own
+dated amendments: (1) `alignment/AlignmentRepository.kt` (NEW) hoists
+the yaw-alignment estimate out of `MlVelocityRepository` into its own
+shared repository so `dr/BaselineDeadReckoningRepository` can read the
+SAME estimate — Round 1 only applied alignment to the ML path, leaving
+the physics path's heading unaligned; (2) `fusion/HeadingFusion.kt`
+(NEW) blends heading/map-orientation over REACQUISITION the same way
+`fusion/PositionFusion.kt` already blended position — Round 1 only
+blended position, leaving heading a hard cutover; (3) `ml/VelocityGuard.kt`
+(NEW) adds an OOD sanity clamp + EMA damping between the ML velocity
+model's bias-corrected output and the position integrator; (4)
+`gnss/GnssQuality.confidenceWeight()` (NEW function) + a
+`confidenceWeight` parameter on `fusion/VelocityBiasCalibrator.update()`
+make the GNSS bias-calibration trust a continuous function of fix
+accuracy instead of the pre-existing binary `isGood` gate. See each
+file's own entry below for detail, and PRD.md Section 15/17/18's
+2026-08-28 amendments for the requirements these satisfy.
 
-**UPDATE (2026-08-26, full routing — explicit user override of PRD.md
-Section 7/22)**: the user explicitly asked to build a full conventional
-map-app experience (destination search, real routing, a Start/End flow,
-offline trip download) despite PRD.md's "not a consumer nav app, no
-search/turn-by-turn chrome, no full routing engine" scope — confirmed via
-an explicit AskUserQuestion choice ("Build full routing") rather than
-built silently. New `routing/` package:
-- `routing/GeocodingRepository.kt` — real destination search via
-  OpenStreetMap Nominatim's free public API (no API key, same "no new
-  credential" principle as osmdroid/CartoDB).
-- `routing/RoutingRepository.kt` — real turn-by-turn routing via OSRM's
-  free public demo server (also no API key). Parses OSRM's structured
-  maneuver (type + modifier + street name) into a plain-English
-  instruction — a real derivation from OSRM's own classification, not an
-  invented instruction (CLAUDE.md Rule 13 still respected even while
-  overriding Section 7/22).
-- `routing/OfflineRouteCache.kt` — downloads the active route's map tiles
-  via osmdroid's own `CacheManager` (real progress dialog, osmdroid's
-  built-in UI) and saves the route geometry/steps as JSON to
-  app-external storage — both scoped to ONE trip at a time, per the
-  request ("that particular trip alone"), not a general offline-maps
-  feature.
-- `ui/components/DestinationSearchBar.kt` / `ActiveRouteCard.kt` — real
-  search results and real distance/duration/steps, styled with the
-  existing Figma-derived glass-card/pill-button language (red CtaRed
-  Start/End buttons matching Figma's own route-screen accent).
-- `ui/screens/MapScreen.kt` extended with the idle -> destination-selected
-  -> route-active state machine; `ui/map/StreetMapView.kt` gained a
-  `routeGeometry` param (drawn as a red `Polyline` overlay) and
-  `onMapViewReady` (so the offline-download button can reuse the SAME
-  MapView/tile cache, not a second one).
-- HONEST LIMITATION kept even after this override (CLAUDE.md Rule 13):
-  no live "next turn in X m" banner — this project doesn't track live
-  progress along an active route, so `ActiveRouteCard` shows the full
-  real step list instead of fabricating a live single-instruction banner.
-
-Real bugs caught fixing this on-device, each found by actually running
-it against real network services rather than assuming success:
-- osmdroid's `setTileSource()` was being called inside `AndroidView`'s
-  `update` block, which re-executes on every recomposition (i.e. every
-  ~100ms sensor/GNSS tick) — `setTileSource()` rebuilds osmdroid's
-  internal tile-provider modules, so it was interrupting its own in-flight
-  tile fetches continuously, leaving permanently-stuck black tiles.
-  Fixed by moving it into a `LaunchedEffect(isDarkTheme)`, re-running
-  only when the theme toggle actually changes.
-- The routing "Start" button initially refused to route ("No current
-  position yet") even with a real, recent GNSS fix on screen — the
-  marker-display position logic (correctly) only trusts a fix once
-  `GnssQuality` calls it "good," but a real indoor fix (real coordinates,
-  but 8.8s old / 29.7m accuracy, near a window) legitimately failed that
-  bar. Routing doesn't need that same precision guarantee, so
-  `MapScreen.kt` now has a SEPARATE, more lenient `routingOriginLatDeg/
-  LonDeg` fallback that accepts any available raw fix — the stricter
-  marker/anchor logic used for drift-measurement honesty was left
-  untouched.
-- A newly-computed route could be geographically far from wherever the
-  map camera happened to be centered (e.g. still parked near (0,0) with
-  no quality-passing fix yet), making the drawn route invisible off-
-  screen even though it computed correctly — fixed by zoom-to-fitting the
-  route's own bounding box once per new route
-  (`StreetMapView.kt`'s `LaunchedEffect(routeGeometry)`).
-All of the above were confirmed working end-to-end on the real S24 FE
-against LIVE Nominatim/OSRM services with a real GNSS fix in Chennai:
-real search results, a real ~20.4 km / 24 min route with real street-name
-turn-by-turn steps drawn correctly on real map tiles, and a real offline
-tile download reaching 100%.
-
-**UPDATE (2026-08-26, Pause control + Walking mode + a real live-tracking
-bug fix — explicit user override, "dont care about out of scope in PRD")**:
-
-- **Pause/Resume the live pipeline**: `MainActivity.kt` gained
-  `startPipeline()`/`stopPipeline()` (the exact repository start()/stop()
-  sequence `onResume()`/`onPause()` already used, now extracted so a UI
-  button can trigger it too) and `isPipelinePaused` (a `by mutableStateOf`
-  field, since it's read from both Compose and the non-Composable
-  `onResume()`/`onPause()` lifecycle callbacks). `onResume()` now only
-  auto-restarts the pipeline `if (!isPipelinePaused)`, so a manual pause
-  survives a background/foreground cycle instead of silently resuming.
-  `ui/screens/StatusOverlayContent.kt` gained a "Pause"/"Resume" header
-  button and a "PAUSED" status chip (honest signal that every reading
-  below it is frozen, not live — CLAUDE.md Rule 13's in-app-copy
-  convention). Verified each repository's own `stop()` is idempotent
-  (unregistering an already-unregistered listener / cancelling a null job
-  / quitting a null HandlerThread are all no-ops) before relying on
-  `onPause()` calling `stopPipeline()` unconditionally even when already
-  manually paused.
-- **Walking mode**: `ui/components/VehicleModeSelector.kt`'s `VehicleMode`
-  enum gained `WALKING` (PRD.md Section 6 originally scoped Car/Motorcycle
-  only). Unlike CAR/MOTORCYCLE (still local-UI-state-only),
-  `dr/BaselineDeadReckoningRepository.kt` gained a real
-  `walkingModeEnabled: Boolean` field: `NonHolonomicConstraint`'s "can't
-  move sideways relative to heading" suppression is skipped while walking,
-  since that assumption is vehicle-only (a pedestrian can turn/strafe in
-  place in a way a car physically can't) — the exact mechanism the
-  2026-08-26 real outdoor walking test (see the update above this one)
-  already exposed as a real limitation. ZUPT is unchanged for both modes.
-  `MainActivity.kt` wires the Compose selection to the repository via
-  `LaunchedEffect(vehicleMode)`, same pattern `onRecalibrate` already uses
-  for `mlVelocityRepository.resetAlignment()`. The selector in
-  `StatusOverlayContent.kt` is now always visible/switchable (previously
-  it collapsed to a static, unchangeable chip after one pick) since a rider
-  might plausibly park and walk mid-session now that the mode has a real
-  effect. New hand-drawn `res/drawable/ic_walk.xml`, same honest
-  not-from-Figma convention as `ic_motorcycle.xml`.
-- **REAL BUG FOUND + FIXED (user-reported): "no feature to track my
-  position on the map"**. Root cause: `fusion/StateEstimator.kt` only ever
-  set `outageAnchorLatDeg`/`outageAnchorLonDeg` on a strict `GNSS_AIDED`
-  tick (`GnssQuality`-passing: fix age <3000ms, accuracy <25m). Without
-  that anchor, `ui/screens/MapScreen.kt` has no reference point to project
-  the fused East/North position back to a real lat/lon, so it draws NO
-  marker at all — even while the physics/ML DR fusion underneath was
-  working correctly the whole time. This silently reproduces exactly the
-  real indoor case `MapScreen.kt` already documented for the routing-origin
-  fallback (an 8.8s-old/29.7m-accuracy fix that's real but never passes
-  `GnssQuality`), except unlike routing, the marker path had no lenient
-  fallback at all. Fixed by also setting a PROVISIONAL anchor from the
-  very first fix ever seen this run, of any quality, if no anchor exists
-  yet — a small, bounded approximation no worse than one
-  `BaselineDeadReckoningRepository` already makes (its own integrator's
-  zero-point is "wherever the phone was at app launch," not the instant of
-  the first fix either). Once a real `GNSS_AIDED` fix does arrive, the
-  strict branch still overwrites this with the accurate point (a one-time
-  visual snap-to-fix, same as any nav app when GPS lock improves). This
-  fix, combined with `MapScreen.kt`'s existing `currentLatDeg`/
-  `currentLonDeg` preference order (live GNSS fix while `GNSS_AIDED`, else
-  the fused DR position projected through the anchor) and
-  `StreetMapView.kt`'s existing per-tick `controller.animateTo(point)`, is
-  what makes the marker actually appear and follow the live (possibly
-  DR-only, during an outage) position — this was already the intended
-  design (Slice 7/8b), just unreachable in practice whenever the first fix
-  wasn't a strong one. Not yet re-verified on a real device outdoors this
-  session (CLAUDE.md Rule 13 — noted here so it isn't reported as measured
-  until it is).
-
-**UPDATE (2026-08-26, drift card compaction — user-requested)**:
-`ui/components/DriftSummaryCard.kt` used to be a full bottom-sheet-scale
-`GlassCard` showing the exact "X.X m drift over Y.Y m travelled" plus an
-explanatory line — the user found it "annoying" and asked for it reduced
-to just "drift detected." Rewritten as a small dismissible pill using the
-same `StatusChip` visual language as the GNSS mode/speed/motion chips
-above it, instead of a second, larger card style. The real measured
-number isn't discarded (still real data, per CLAUDE.md Rule 13) — it's
-still shown in full on `ui/screens/HistoryScreen.kt`'s drift log, and this
-chip exposes it via `Modifier.semantics { contentDescription = ... }` for
-accessibility even though it's no longer in the visible text. Confirmed
-on-device: renders as a compact "● Drift detected ✕" pill, and the
-dismiss button works (Compose's automatic 48dp minimum touch target made
-it reliably tappable even though the visual icon is only 20dp).
-
-**UPDATE (2026-08-26, on-device verification of the "Go" button — a real bug
-found and fixed that the earlier fix missed)**: tested live on the S24 FE
-via `adb` (search "SRM Ramapuram" -> select -> Start -> Go -> Exit), with
-screenshots checked at each step.
-- Geocoding fix confirmed working live: "SRM Ramapuram" correctly returns
-  "SRM College Bus Stop, Bharathi Salai, ... Chennai ... 600089, India."
-- Route computation confirmed working live: real OSRM route, 14.7km/20min,
-  real street-name turn-by-turn steps.
-- REAL BUG FOUND (missed by the earlier top-padding fix above): the
-  overlap wasn't in the idle-search or navigating states (those two DID
-  use the 300dp `Column` padding fix and render cleanly) — it was
-  `ActiveRouteCard` itself, the route-preview state with the Go/Download/
-  End buttons. That card sits in a bottom-aligned, UNBOUNDED-height `Box`
-  (`Modifier.align(Alignment.BottomCenter)` with no height cap at all), so
-  its natural wrap-content height (destination name + duration/distance +
-  up-to-160dp step list + Go button + Download/End row) simply grew
-  upward from the bottom until it collided with
-  `StatusOverlayContent`'s top GNSS/speed/motion chips — confirmed
-  visually on the real device, and confirmed the 300dp fix above had NO
-  effect on this specific state since it touches a completely different
-  code path. Real fix: `MapScreen.kt`'s `else` branch now wraps the card
-  in `BoxWithConstraints` to read the actual available screen height and
-  computes `maxCardHeight = maxHeight - 340.dp - 170.dp` (340dp reserved
-  for the top chip stack, 170dp for the existing bottom inset), passed to
-  `ActiveRouteCard` as `Modifier.heightIn(max = maxCardHeight)`.
-  `ActiveRouteCard.kt`'s own `GlassCard` call gained
-  `.verticalScroll(rememberScrollState())` so that when a route's card
-  content is taller than that cap (confirmed: it usually is, given the
-  step list), it scrolls internally to reach the Go/Download/End buttons
-  instead of silently overflowing past the height cap — verified by
-  scrolling the card and successfully tapping Go afterward.
-- With that fix, "Go" was confirmed live end-to-end: the top
-  `NavigationInstructionCard` showed a real live "74 m / Start" with no
-  overlap, the bottom `NavigationEtaBar` showed "20 min / 14.8 km
-  remaining" with no overlap, and "Exit" correctly returned to the idle
-  search state — no crash anywhere in Logcat through the whole flow.
-  Still NOT verified outdoors with real motion (this was all indoor/
-  stationary, so `RouteProgress`'s live distance-to-maneuver tracking as
-  the position actually changes, and the heading-up map rotation, remain
-  unconfirmed against a real drive).
-
-**UPDATE (2026-08-26, same day — three more user-reported bugs)**:
-- osmdroid's default on-screen +/- zoom buttons were rendering bottom-center
-  over `StatusOverlayContent.kt`'s own bottom content (vehicle-mode
-  selector / drift card / `ActiveRouteCard`) — there's no osmdroid API to
-  reposition them independently of that fixed placement, so
-  `ui/map/StreetMapView.kt` now calls `setBuiltInZoomControls(false)`.
-  `setMultiTouchControls(true)` (already set) still gives real pinch-to-zoom,
-  so nothing is lost, only the redundant on-screen buttons.
-- `MainActivity.kt` had no `BackHandler` at all on the normal Drive/Map/
-  History tabs, so the system Back button fell straight through to
-  `ComponentActivity`'s default "finish the Activity" from ANY tab,
-  closing the whole app instead of navigating within it. A second
-  `BackHandler`, enabled whenever `selectedTab != AppTab.DRIVE` (and the
-  debug screen isn't showing, which the existing handler already owns),
-  now returns to Drive first — the same "only the true home tab exits on
-  Back" convention most bottom-nav apps use. Back from Drive itself still
-  falls through to the default exit behavior.
-- The "once I enter either of the two [vehicle] modes I can't select the
-  other one or come out of it" report was already fixed by this same
-  day's earlier update above (`StatusOverlayContent.kt`'s selector used to
-  collapse into a permanent, non-interactive chip after the first pick;
-  it's now always visible/switchable) — confirmed still current, no
-  further code change needed for that part.
-
-**UPDATE (2026-08-26, same day — turn-by-turn navigation + a real
-geocoding bug fix)**:
-
-- **Turn-by-turn navigation ("start mode," user-requested Google-Maps-like
-  behavior)**: new `routing/RouteProgress.kt` (pure Kotlin, unit-tested in
-  `RouteProgressTest.kt` — CLAUDE.md Rule 19) projects the live position
-  onto the real OSRM route polyline (nearest-point-on-segment, standard
-  parametric projection) to compute which step is current, remaining
-  distance to the next maneuver, remaining distance to the destination, and
-  perpendicular distance off-route. Critically, the "live position" fed in
-  is `fusedState.fusedEastM/fusedNorthM` — the SAME physics/ML dead-reckoned
-  position the rest of the app already falls back to during a GNSS outage
-  (via `fusion/StateEstimator.kt`), projected into the route's local frame
-  through the SAME anchor. So turn-by-turn progress keeps counting down
-  through an outage using physics/ML, not just live GNSS — directly
-  answering the "GNSS outage must use physics/AIML" requirement in the same
-  feature. New `ui/components/NavigationBanner.kt` (`NavigationInstructionCard`
-  top / `NavigationEtaBar` bottom, same top/bottom placement convention
-  `DestinationSearchBar`/`ActiveRouteCard` already use) replaces the static
-  step list once entered via `ActiveRouteCard`'s new "Go" button.
-  `ui/map/StreetMapView.kt` gained `headingDeg` (rotates the map
-  "heading-up" via `setMapOrientation` while navigating, north-up
-  otherwise) and zooms to 19 on nav start; `ui/screens/MapScreen.kt` derives
-  the heading from a live GNSS bearing when `GNSS_AIDED`, else the physics
-  DR velocity vector's own heading, else holds the last confident value
-  (avoids spinning the map at near-zero speed). HONEST LIMITATION (CLAUDE.md
-  Rule 13): no live rerouting — `NavigationInstructionCard` flags "off
-  route" past 50m instead of silently recomputing a route it has no engine
-  for. UNVERIFIED ON A REAL DEVICE: the heading-up rotation direction/sign
-  and the whole live-progress-during-an-actual-outdoor-drive path have not
-  been confirmed outdoors yet this session.
-- **REAL BUG FOUND + FIXED: "most places in Chennai are not visible, SRM
-  Ramapuram not showing"**. Curl-testing Nominatim directly (outside the
-  app) for "SRM Ramapuram," "Anna Nagar Chennai," "T Nagar Chennai," etc.
-  all returned correct real results — Nominatim itself works. The actual
-  bug: `routing/GeocodingRepository.kt`'s `search()` collapsed EVERY
-  failure (non-200 HTTP, timeout, malformed JSON, no network) into the
-  exact same empty list a genuine "no matches" produces — on a real device,
-  a 403/429 from Nominatim's abuse throttling (plausible on a shared
-  carrier/CGNAT IP, common on Indian mobile networks) would look
-  identical to a typo, with zero signal why. Fixed by introducing
-  `GeocodeSearchOutcome` (`Success`/`Failure` with a real reason string) and
-  logging every failure (`Log.w`/`Log.e`, same pattern
-  `routing/RoutingRepository.kt` already used for OSRM) — `MapScreen.kt` now
-  shows the real failure reason (or "No matches for …") under the search
-  bar instead of a silent empty dropdown. Also added a soft `viewbox`
-  relevance bias toward greater Chennai + `countrycodes=in` (NOT a hard
-  filter — `bounded` stays off, so a genuine non-Indian match still
-  surfaces, just ranked lower) — a real, disclosed bias reasonable for this
-  ISRO/Chennai-scoped hackathon demo, not a fabricated result. NOT YET
-  CONFIRMED against the user's actual original failure — the true root
-  cause on their specific device/network is still unconfirmed (no on-device
-  Logcat access this session); this fix makes that root cause visible next
-  time it happens, which the code could not do before.
-
-**UPDATE (2026-08-26, `velocity_v1.onnx` committed for teammate
-onboarding — explicit user override of the "no binaries in git"
-convention)**: the user asked how a new developer cloning this repo gets
-the ONNX model, since `models/*.onnx` / `android/app/src/main/assets/*.onnx`
-were both gitignored. The honest answer was that a teammate couldn't
-regenerate it themselves either way — the IO-VNBD training data
-(`data/raw/IO-VNBD/`) is also gitignored and not redistributed via git —
-so keeping the one ~21MB artifact that already exists out of version
-control added friction with no real benefit, while leaving `git clone`
-alone insufficient to run the ML half of the app. `.gitignore` now
-explicitly un-ignores `models/velocity_v1.onnx` and
-`android/app/src/main/assets/velocity_v1.onnx` (both files, confirmed
-byte-identical via `cmp`) — 21MB is well under GitHub's 100MB hard limit,
-so no Git LFS needed. `ml/README.md` and `models/README.md` were also
-corrected — both had gone stale, still claiming "nothing implemented/
-exported yet" despite the real training scripts and this real exported
-model already existing (CLAUDE.md's staleness rule technically only names
-`docs/PROJECT_MAP.md`, but the same principle applies: a doc that
-contradicts reality actively misleads the next person who reads it,
-which is exactly what happened here). The general "don't blindly commit
-exported binaries" instinct still stands for any future/larger model
-version — this is a documented, reasoned exception for this one file,
-not a reversal of the convention.
-
-**UPDATE (2026-08-26, real bug found + fixed: CARTO tile source now
-paywalled — "API key required")**: the user reported the Map tab showing
-no street imagery. Root cause confirmed by fetching a tile directly with
-`curl` and inspecting the returned PNG (not assumed from a log message,
-since the response was a normal HTTP 200 — osmdroid had no error to
-detect or log): `ui/map/StreetMapView.kt`'s CARTO tile source
-(`a/b/c.basemaps.cartocdn.com/{dark,light}_all/`) now serves a baked-in
-"API KEY REQUIRED — carto.com/basemaps/apikey" watermark image in place
-of real tiles. This endpoint was free and anonymous when Slice 8b first
-verified it (curl 200 + real device confirmation, see that update above)
-— CARTO has evidently locked it behind an account/key since. Fixed by
-switching `STREET_TILE_SOURCE` to osmdroid's own
-`TileSourceFactory.MAPNIK` (the standard openstreetmap.org tile server —
-free, no account/key, the same principle this file's `StreetMapView.kt`
-doc comment already committed to when osmdroid was chosen over Google
-Maps/Mapbox in Slice 8b). Mapnik ships only one (light) style, so the
-separate CARTO dark tile source was retired entirely; dark mode is now
-osmdroid's built-in `TilesOverlay.INVERT_COLORS` color filter applied
-over the one real tile source instead — this also incidentally resolves
-the Slice 8b "black tiles" bug's underlying fragility, since toggling a
-color filter doesn't rebuild osmdroid's tile-provider modules the way
-`setTileSource` does, so there is no in-flight-fetch interruption risk
-left to guard against. HONEST LIMITATION (CLAUDE.md Rule 13): the
-inverted dark-mode palette is a naive RGB invert, not a purpose-built
-dark map style — functionally correct (real street data, confirmed
-on-device: "Retteri Lake", "Ibengo" and correct road/water geometry
-rendered near a real Chennai GNSS fix) but visually unusual (green
-parks read as magenta) compared to the old CARTO dark style; light mode
-is unaffected and renders normally (confirmed on-device: correct
-country/city labels — Cameroun, Gabon, Congo — at a zoomed-out view).
-Not yet re-verified against a live outdoor drive this session, only a
-real indoor/stationary GNSS-aided fix.
-
-**UPDATE (2026-08-26, real indoor on-device test — noisy GNSS speed
-bug found + fixed)**: user reported the speed/motion chips reading
-"Moving" at 15.1 m/s while the phone sat stationary on a desk. Debug
-screen comparison (`IdrSensorScreen`) at that exact tick showed every
-other sensor agreeing the phone was still — accel ≈ (0, 0, 9.79) m/s²
-(gravity only), gyro ≈ 0 rad/s, and the ZUPT-gated physics DR velocity
-at 0.00/0.00 m/s — while `gnssState.latestFix.speedMps` alone reported
-~15 m/s. Root cause: `ui/screens/StatusOverlayContent.kt`'s
-`estimateSpeedMps()` trusted `Location.speedMps` unconditionally
-whenever `gnssState.mode == GnssMode.GNSS_AIDED`, with no check that
-the reading was plausible. `speedMps` is Doppler-derived and is a
-different, uncorrelated measurement from position accuracy — a fix can
-pass `GnssQuality`'s 25m/3s accuracy+age bar (so mode reads
-GNSS_AIDED) while its speed component is pure indoor-multipath noise.
-Fixed by rejecting `gnssSpeed` specifically when it contradicts a
-ZUPT-confirmed-stationary physics velocity (`physicsSpeedMps <
-STATIONARY_SPEED_EPSILON_MPS` but `gnssSpeed >=` it), falling through
-to the next priority source (ML, then physics) instead — same epsilon
-constant the chip-consistency fix above already introduced. Covered by
-a new `app/src/test/kotlin/.../ui/screens/StatusOverlayContentTest.kt`
-(CLAUDE.md Rule 19): agreement case still trusts GNSS speed, the
-contradiction case falls through, and the ML/physics/no-fix fallback
-branches are locked in too.
-
-Also separately investigated this same session (found, not yet fixed):
-real on-device slow street-tile loading. `logcat` with
-`Configuration.isDebugMode`/`isDebugTileProviders` temporarily enabled
-(removed again after diagnosis — not shipped) showed an initial burst
-of tile downloads completing, then the online tile provider's queue
-stalling completely for the rest of the capture window despite dozens
-of tiles still `pending`. Leading hypothesis, not yet confirmed: in
-`ui/map/StreetMapView.kt`'s `AndroidView` `update` block,
-`view.controller.animateTo(point)` runs unconditionally on EVERY
-recomposition (not gated to only when the position actually changed),
-which — at the ~10 Hz live sensor/GNSS tick rate this file's own
-Slice 8b "black tiles" bug (above) already identified as a recurring
-hazard — may repeatedly disrupt osmdroid's tile-request bookkeeping the
-same way `setTileSource` used to, just via a different call. Needs
-confirming (e.g. gate `animateTo` on an actual position-change check,
-retest, recapture `logcat`) before treating it as fixed.
-
-**UPDATE (2026-08-26, real on-device test — REACQUISITION/DEAD_RECKONING
-flapping constantly, bug found + fixed)**: user reported the GNSS mode
-badge switching between DEAD_RECKONING and REACQUISITION constantly.
-`logcat` (`GnssOutageDetector` tag, which already logs every transition
-per CLAUDE.md Rule 17) captured 6 consecutive full cycles, each
-DEAD_RECKONING -> REACQUISITION -> DEAD_RECKONING taking almost exactly
-`reacquisitionDwellMs` (1000ms) — REACQUISITION never once reached
-GNSS_AIDED. Root cause in `gnss/GnssOutageDetector.kt`: the
-REACQUISITION -> GNSS_AIDED/DEAD_RECKONING decision used to check
-`gnssGoodNow` only ONCE, at the single instant the dwell timer expired
-— a single noisy sample deciding the whole outcome, which is exactly
-what CLAUDE.md Rule 16 requires hysteresis to prevent, just on
-REACQUISITION's exit side rather than an entry side (which already used
-proper continuous-streak tracking, e.g. DEAD_RECKONING -> REACQUISITION
-itself). With marginal/indoor GNSS accuracy hovering near
-`GnssQuality`'s 25m threshold, that one unlucky sample (often landing
-right on a freshly-arrived, still-marginal fix, given ~1Hz location
-updates) failed on essentially every cycle. Fixed by making
-REACQUISITION bail to DEAD_RECKONING immediately on ANY bad sample
-during the window (fail-fast — no reason to keep blending toward a fix
-already known bad) and only advance to GNSS_AIDED once GNSS has been
-good CONTINUOUSLY for the full dwell period. TRANSITION was
-deliberately left as-is (a fixed-duration freeze/average window by
-design, per PRD.md Section 18 and an existing test asserting it does
-NOT skip its dwell early) — this class's doc comment now states that
-asymmetry explicitly. Covered by two new tests in
-`GnssOutageDetectorTest.kt` (CLAUDE.md Rule 19): a bad sample partway
-through REACQUISITION must bail immediately without waiting for the
-dwell, and a good-then-bad sequence must never retroactively reach
-GNSS_AIDED. Directly connects to the two prior updates above (drifted
-fused position, noisy GNSS speed): all three trace back to the same
-root environment — this test session never had a solid outdoor
-GNSS_AIDED lock, so marginal/indoor accuracy readings keep exercising
-every one of these edge cases.
-
-**UPDATE (2026-08-26, real on-device test — map stuck on placeholder
-tiles + can't manually pan, both found + fixed)**: user asked for
-screenshots to check why the map wasn't loading. `logcat` (osmdroid
-debug logging re-enabled briefly, removed after) showed the requested
-tile viewport jumping across 5 unrelated map areas within 34 seconds —
-each jump abandoning whatever tiles were still mid-download for the
-previous one, so almost none ever completed and the screen stayed
-mostly on osmdroid's built-in "tile unavailable" placeholder. Root
-cause in `ui/map/StreetMapView.kt`: the `AndroidView` `update` block
-called `view.controller.animateTo(point)` unconditionally on EVERY
-recomposition (the ~10Hz live sensor/GNSS tick this file's own Slice 8b
-"black tiles" bug already named as a recurring hazard), not just when
-the position actually moved — and a genuine GNSS_AIDED -> TRANSITION ->
-DEAD_RECKONING flip mid-capture (switching which position source
-`MapScreen.kt` feeds in, real vs. drifted-DR) confirmed one concrete
-trigger. Fixed by gating the recenter on a new
-`MIN_RECENTER_DISTANCE_M` (3.0m) threshold against the last centered
-point, so near-zero movement no longer re-triggers a viewport reset —
-this does not fix the underlying position-source jump itself (a
-separate, already-flagged issue), only the redundant/wasteful
-re-centering that was making tile loading far worse than it needed to
-be.
-
-That same unconditional `animateTo` was also why manual panning felt
-broken ("can't scroll through the map, it just resurfaces at the same
-location") — panning itself was never disabled
-(`setMultiTouchControls(true)` already gives real one/two-finger
-drag-to-pan and pinch-to-zoom), the live position update was just
-re-centering the viewport out from under any manual pan on the very
-next tick. Fixed with the standard "follow me" vs. "user is browsing"
-pattern: a `MapListener.onScroll` callback turns off
-`isFollowingLocation` on a real user gesture (distinguished from the
-app's own recentering via an `isProgrammaticMove` flag checked inside
-that same callback), and a new small recenter button (bottom-end of the
-map, `ic_recenter` — reused, not a new drawable) appears only while not
-following, turning it back on and snapping straight back to the live
-position on tap. `animateTo` (animated, async — fires `onScroll` after
-the flag would already be reset) was switched to `setCenter` (instant)
-specifically so `isProgrammaticMove` can be set/cleared synchronously
-around one call and reliably suppress the resulting scroll event.
-HONEST LIMITATION: the new recenter button had to be pushed to 96dp
-bottom padding (not the usual 16dp) — at 16dp it rendered fully hidden
-behind `StatusOverlayContent`'s existing vehicle-mode-selector/
-recalibrate row, which draws on top of this view in `MapScreen.kt`'s
-Box z-order; confirmed on-device both ways (hidden at 16dp, both
-buttons distinguishable at 96dp). Both fixes confirmed on-device via
-screenshot + a simulated pan gesture: tiles now load fully (real road
-names/buildings visible), a pan gesture stays put instead of snapping
-back, and the new button correctly resumes following and re-centers.
+Later the same day: two more Round 2 Day 2-3 items landed, both
+additive/instrumentation-only (neither touches the GNSS/DR/fusion
+pipeline): (5) `motion/FloorChangeDetector.kt` + `FloorChangeRepository.kt`
+(NEW) — barometer-based floor/level-change detection (PRD.md FR12),
+shown on the debug screen; (6) `sensors/SensorRepository.kt` gained
+optional TYPE_LINEAR_ACCELERATION/TYPE_GRAVITY listeners (PRD.md
+Section 11), also shown on the debug screen as a cross-check against
+`dr/WorldFrameAcceleration`'s manual gravity subtraction — not adopted
+into the DR pipeline yet, per Section 11's "only if it measures out
+better, decided empirically." (7) A UI smoothness pass —
+`ui/map/PositionSmoother.kt` (NEW) — fixed the marker/map-rotation
+stepping visibly between GNSS/DR ticks instead of gliding, on both the
+Drive tab (`TrackCanvas.kt`) and Map tab (`StreetMapView.kt`); purely
+cosmetic, no fusion math touched. (8) `fusion/RoadSnap.kt` (NEW) —
+PRD.md Section 19's map-constraint layer, finally implemented: snaps
+the Map tab's displayed marker onto the active route's geometry
+(heading-compatible nearest-segment, not a full map matcher) — the last
+remaining item from the original SIH requirements list that was still
+just PLANNED. Deliberately display-only: `fusion/StateEstimator.kt`'s
+canonical `fusedEastM`/`fusedNorthM` (which feeds the measured drift
+number and route progress) is untouched by this correction.
 
 ---
 
@@ -806,6 +235,13 @@ Important concepts/assumptions: AccelSample/GyroSample are DEVICE frame
   Uses List<Float> rather than FloatArray specifically so this data
   class's generated equals()/hashCode() stay structurally correct
   (Kotlin data classes compare FloatArray fields by reference).
+UPDATE (Round 2, 2026-08-28 — PRD.md FR12): added PressureSample(timestampNs,
+  pressureHpa) — units hPa, per Android's TYPE_PRESSURE convention. Not
+  all devices have a barometer (see SensorRepository.hasBarometer()
+  below); consumers must treat its absence as a normal, honest case.
+  AccelSample is also now reused verbatim (same x/y/z/timestampNs shape)
+  for Android's own TYPE_LINEAR_ACCELERATION/TYPE_GRAVITY readings — see
+  SensorRepository.kt's entry below.
 
 android/app/src/main/kotlin/com/sih26168/idr/sensors/SampleRate.kt
 Status: IMPLEMENTED
@@ -832,14 +268,33 @@ Purpose: Registers accelerometer + gyroscope + rotation-vector listeners
   CLAUDE.md Rule 5's one-responsibility-per-file).
 Inputs: android.content.Context (for SensorManager).
 Outputs: StateFlow<SensorUiState> — {latestAccel, latestGyro,
-  latestOrientation, accelHz, gyroHz, orientationHz}.
+  latestOrientation, accelHz, gyroHz, orientationHz, latestPressure,
+  pressureHz, latestLinearAcceleration, latestGravity (last four, Round 2,
+  2026-08-28)}.
 Connected to: MainActivity -> SensorRepository -> (StateFlow) -> Compose UI
   ; SensorRepository -> OrientationMath (pure function, orientation
-  conversion only, no reverse dependency)
+  conversion only, no reverse dependency);
+  SensorRepository -> motion/FloorChangeRepository (Round 2, 2026-08-28,
+  reads latestPressure)
 Important functions/classes: start()/stop() (lifecycle-tied — called
   from onResume/onPause, not onCreate/onDestroy, so sensors aren't
   active while backgrounded); hasRequiredSensors() (now also requires
-  TYPE_ROTATION_VECTOR).
+  TYPE_ROTATION_VECTOR); hasBarometer() (Round 2, 2026-08-28 — separate
+  from hasRequiredSensors() since the barometer is OPTIONAL, unlike
+  accel/gyro/rotation-vector — see PressureSample's entry above).
+UPDATE (Round 2, 2026-08-28 — PRD.md FR12 + Section 11): registers three
+  new OPTIONAL listeners (all `?.let { registerListener(...) }`, same
+  nullable-safe pattern as the required three): TYPE_PRESSURE (barometer,
+  publishes latestPressure/pressureHz, same Hz-tracking pattern as
+  accel/gyro/orientation), TYPE_LINEAR_ACCELERATION and TYPE_GRAVITY
+  (Android's own fused, already-gravity-removed accelerometer and
+  smoothed gravity vector — publish latestLinearAcceleration/
+  latestGravity with NO Hz tracking, deliberately: these are a one-off
+  instrumentation cross-check against dr/WorldFrameAcceleration.kt's
+  manual gravity subtraction, shown side-by-side on MainActivity's debug
+  screen, NOT wired into the DR pipeline — PRD.md Section 11 explicitly
+  says "adopted only if it measures out better... decided empirically,"
+  which hasn't happened yet, so nothing was swapped, only instrumented).
 Important concepts/assumptions: listener callbacks run on a dedicated
   background HandlerThread ("SensorRepositoryThread"), never the
   main/UI thread, per CLAUDE.md Android Rule 7. StateFlow is the
@@ -852,6 +307,28 @@ Important concepts/assumptions: listener callbacks run on a dedicated
   Rotation-vector's scalar quaternion component (w) is read from
   event.values[3] when present, else derived defensively via
   OrientationMath.scalarFromVectorPart (older devices/edge case).
+REAL BUG FIX (2026-08-29, found via capture/DriveDataLogger.kt's own
+  tick counter during an on-device smoke test): confirmed the requested
+  100ms/10Hz period is a HINT Android does not enforce — the test device
+  (Oppo/ColorOS) delivered accel/gyro/orientation at up to ~200 Hz
+  regardless, 15-20x the PRD.md Section 8/11 target. That reached every
+  downstream consumer unthrottled: BaselineDeadReckoningRepository's
+  integrator+ZUPT and MlVelocityRepository's full ONNX inference both ran
+  15-20x more often than designed, AND features/FeatureExtractor.kt's
+  "~1.0s trailing window" (matched to ml/train_velocity_model.py's own
+  ~10 Hz training rate) was actually only spanning ~50ms of real time per
+  update — a silent train/inference parity break, not just wasted CPU/
+  battery/recomposition. Fixed by independently throttling PUBLISHING
+  each sensor type to real ~10 Hz inside the listener (separate
+  `lastPublished*TimestampNs` trackers, gated on real elapsed time before
+  `_state.value` is updated) — fixed once at this source point (CLAUDE.md
+  Rule 5) rather than patched in every downstream consumer.
+  accelHz/gyroHz/orientationHz are DELIBERATELY left computed from the
+  true RAW arrival rate (unthrottled) so the observed-rate readout stays
+  honest (CLAUDE.md Rule 13) — throttling that too would have hidden this
+  exact bug. Verified on-device: pulled a drive-log CSV before and after
+  the fix — mean inter-tick interval went from ~5-7ms (unthrottled) to a
+  measured 100.2ms (9.98 Hz) after, matching the target almost exactly.
 
 android/app/src/main/kotlin/com/sih26168/idr/sensors/OrientationMath.kt
 Status: IMPLEMENTED
@@ -888,10 +365,14 @@ Purpose: Pure-Kotlin (no android.* import) math to rotate a raw DEVICE-
   motion-caused linear acceleration. Explicitly WORLD frame, NOT vehicle
   frame (CLAUDE.md Rule 9/14) — works regardless of phone mounting,
   which is exactly why it's in-scope before phone-to-vehicle alignment
-  existed. UPDATE (Slice 6): AlignmentEstimator.kt is now IMPLEMENTED,
-  but only feeds MlVelocityRepository's ML feature path — this file
-  (and BaselineDeadReckoningRepository's physics position estimate) are
-  still deliberately alignment-free, per Slice 5's original design.
+  existed. UPDATE (Slice 6): AlignmentEstimator.kt is now IMPLEMENTED —
+  this file itself remains deliberately alignment-free (it only produces
+  WORLD-frame acceleration; the alignment-corrected heading is applied
+  downstream, by whichever caller projects onto a heading — see
+  dr/NonHolonomicConstraint.kt and ml/MlVelocityRepository.kt's own
+  forward/lateral projection). UPDATE (2026-08-30): that downstream
+  correction now reaches BOTH callers, not just the ML feature path — see
+  alignment/AlignmentRepository.kt.
 Inputs: device-frame accel (x, y, z, m/s^2) + rotationMatrixDeviceToWorld
   (List<Float>, 9 elements, from OrientationSample).
 Outputs: WORLD-frame linear acceleration (East, North, Up components,
@@ -963,15 +444,55 @@ Inputs: velocityEastMps, velocityNorthMps, headingRad (device azimuth).
 Outputs: Pair<Double, Double> (forward-only East/North velocity).
 Important concepts/assumptions: PRD.md Section 20 specifies this in
   VEHICLE frame with a Turning exemption from the ML motion classifier.
-  Neither exists yet, so this is a deliberately simplified WORLD-frame
-  stand-in: it uses the device's own WORLD-frame heading as a proxy for
-  vehicle heading, under the explicit assumption the phone's yaw tracks
-  the vehicle's yaw (true if rigidly mounted; false if loose, e.g. a
-  cup holder). No Turning exemption either, so a genuine turn's real
-  lateral velocity gets suppressed too — an accepted, documented
-  over-constraint for this slice, to be relaxed once Slice 6's motion
-  classifier can flag Turning windows.
-Connected to: BaselineDeadReckoningRepository -> NonHolonomicConstraint -> BaselinePhysicsIntegrator.overrideVelocity
+  The VEHICLE-frame half still doesn't exist (phone-to-vehicle yaw
+  alignment, alignment/AlignmentEstimator.kt, is wired into the ML
+  feature path only, not this physics path — Capability #1's own tracked
+  gap), so this remains a deliberately simplified WORLD-frame stand-in:
+  it uses the device's own WORLD-frame heading as a proxy for vehicle
+  heading, under the explicit assumption the phone's yaw tracks the
+  vehicle's yaw (true if rigidly mounted; false if loose, e.g. a cup
+  holder).
+  UPDATE (2026-08-30): the Turning exemption now exists — see
+  motion/TurningDetector.kt below — applied by this function's one
+  caller (BaselineDeadReckoningRepository), which now skips calling
+  suppressLateralVelocity() on any tick TurningDetector flags as turning,
+  the same way it already skips it for walkingModeEnabled. This
+  function's own signature/tests are unchanged; the exemption is pure
+  caller-side gating.
+  UPDATE (2026-08-30): the heading passed to suppressLateralVelocity() is
+  now alignment-corrected (device azimuth minus AlignmentRepository's
+  shared yaw offset), not raw device azimuth unconditionally — see
+  alignment/AlignmentRepository.kt and this file's own doc for the full
+  reasoning. This function's signature is still unchanged; only what its
+  one caller passes in changed.
+Connected to: BaselineDeadReckoningRepository -> NonHolonomicConstraint -> BaselinePhysicsIntegrator.overrideVelocity;
+  BaselineDeadReckoningRepository -> TurningDetector -> (gates whether NonHolonomicConstraint is called at all);
+  AlignmentRepository -> BaselineDeadReckoningRepository -> (corrects the heading NonHolonomicConstraint projects onto)
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/TurningDetector.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: A DETERMINISTIC stand-in for PRD.md Section 14's `Turning` class
+  — same "no labeled classifier data yet" precedent as
+  MotionStateClassifier.kt/PotholeShockDetector.kt — built specifically to
+  close NonHolonomicConstraint.kt's PRD.md Section 20 gap ("except during
+  classifier-flagged Turning windows, where the constraint is relaxed").
+  Reuses alignment/YawRate.kt — the SAME WORLD-frame-azimuth-derived
+  yaw-rate signal AlignmentEstimator already computes to detect "moving
+  straight" — inverted to flag Turning ABOVE a threshold instead of
+  straight-line motion below one, so "is this vehicle turning" is
+  answered consistently by one signal everywhere in the pipeline instead
+  of a second, differently-tuned yaw-rate computation.
+Inputs: nowNs, azimuthRad (device WORLD-frame azimuth, per orientation tick).
+Outputs: Boolean (isTurning) — false on the first call (no previous
+  sample to diff against) and on any sample below the threshold.
+Important functions/classes: evaluate() — stateful (tracks previous
+  azimuth/timestamp); reset() clears that history for a new DR session.
+  minYawRateForTurningRadPerSec defaults to 0.15 rad/s (~8.6 deg/s),
+  deliberately above AlignmentEstimator's own 0.1 rad/s "straight"
+  ceiling so there's a small dead zone between the two rather than them
+  touching exactly — engineering default, unvalidated against a real
+  outdoor test drive (CLAUDE.md Rule 13).
+Connected to: BaselineDeadReckoningRepository -> TurningDetector -> gates NonHolonomicConstraint's call site
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/BaselineDeadReckoningRepository.kt
 Status: IMPLEMENTED
@@ -991,7 +512,8 @@ Inputs: SensorRepository (read-only, via its StateFlow),
 Outputs: StateFlow<DeadReckoningState>.
 Connected to: SensorRepository -> BaselineDeadReckoningRepository -> MainActivity (Compose UI);
   GnssModeRepository -> BaselineDeadReckoningRepository (mode-gated reset);
-  motion/PotholeShockDetector -> BaselineDeadReckoningRepository (2026-08-25)
+  motion/PotholeShockDetector -> BaselineDeadReckoningRepository (2026-08-25);
+  alignment/AlignmentRepository -> BaselineDeadReckoningRepository (Round 2, 2026-08-28, see below)
 Important functions/classes: start()/stop() (lifecycle-tied, same
   pattern as SensorRepository), lastProcessedAccelTimestampNs: Long?
   (guards against reprocessing — SensorRepository's StateFlow re-emits
@@ -1018,6 +540,19 @@ Important concepts/assumptions: orientation and accel come from
   surfaced in the UI here — see MlVelocityRepository's matching entry,
   which applies the identical detector to its own path and IS shown on
   screen; showing the same per-tick event twice would be redundant.
+  UPDATE (Round 2, 2026-08-28): now optionally takes an
+  `alignmentRepository: AlignmentRepository?` constructor param
+  (nullable, defaults to null). When present, the non-holonomic
+  constraint's heading input is `orientation.azimuthRad -
+  alignmentRepository.state.value.yawOffsetRad` (falling back to raw
+  azimuth if the offset isn't available yet) instead of raw device
+  azimuth — the SAME correction ml/MlVelocityRepository already applied
+  in Round 1. REAL FINDING (2026-08-28 live outage test): leaving this
+  path unaligned let the physics-derived heading (used by
+  fusion/StateEstimator.kt for the map's heading-up rotation) drift far
+  enough from true vehicle heading to flip the map ~180 degrees on GNSS
+  reacquisition — see alignment/AlignmentRepository.kt's entry above and
+  PRD.md Section 15's 2026-08-28 amendment.
 Bug found + fixed during Slice 4 on-device verification (2026-08-25):
   lastProcessedAccelTimestampNs was originally a Long defaulting to 0L
   as the "no sample yet" sentinel. On the very first accel sample of a
@@ -1156,7 +691,47 @@ Connected to: SensorRepository -> MainActivity -> IdrSensorScreen (Compose);
   GnssModeRepository -> BaselineDeadReckoningRepository (Slice 5);
   SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity -> IdrSensorScreen (Slice 6);
   GnssModeRepository, BaselineDeadReckoningRepository, MlVelocityRepository -> fusion/StateEstimator -> MainActivity -> IdrSensorScreen (Slice 7);
-  MainActivity -> ui/theme/IdrTheme -> ui/screens/DriveScreen (DEFAULT screen, Slice 8) / IdrSensorScreen (debug toggle)
+  MainActivity -> ui/theme/IdrTheme -> ui/screens/MapScreen (DEFAULT/home tab, since the 2026-08-30 DriveScreen removal) or
+  ui/screens/HistoryScreen (via BottomNavBar) / IdrSensorScreen (debug toggle)
+UPDATE (Round 2, 2026-08-28): now also instantiates a single
+  `alignment/AlignmentRepository`, constructed right after
+  `gnssModeRepository` and BEFORE `deadReckoningRepository` (so the
+  latter's optional constructor param can reference it) — independent
+  of the ONNX try/catch block, so it works even if the velocity model
+  fails to load. `deadReckoningRepository` and (inside the try block)
+  `mlVelocityRepository` both now take it as a constructor param.
+  `startPipeline()`/`stopPipeline()` start/stop it alongside the other
+  repositories (started before, stopped after, the two DR repositories —
+  both read its `.state.value` synchronously each tick, same ordering
+  rationale as `gnssModeRepository`). Both DriveScreen's and MapScreen's
+  `onRecalibrate` callbacks now call `alignmentRepository.reset()`
+  directly instead of `mlVelocityRepository?.resetAlignment()` (removed
+  — see `alignment/AlignmentRepository.kt`'s entry).
+UPDATE (Round 2, 2026-08-28 — PRD.md FR12 + Section 11): also
+  instantiates `motion/FloorChangeRepository` (independent of everything
+  else — only needs `sensorRepository`) and starts/stops it alongside the
+  other repositories. `IdrSensorScreen` (the debug screen) now takes a
+  `floorState: FloorChangeUiState` param and renders: (1) live relative
+  barometric altitude + total floors changed + a "FLOOR CHANGE detected"
+  flash, or an honest "this device has no barometer" message; (2) a
+  gravity-removal CROSS-CHECK line comparing
+  `dr/WorldFrameAcceleration`'s manual gravity subtraction (recomputed
+  inline from `state.latestAccel`/`latestOrientation`, purely for
+  display — does NOT touch the DR pipeline) against Android's own
+  `TYPE_LINEAR_ACCELERATION` reading (`state.latestLinearAcceleration`)
+  side by side. Neither the Drive/Map polished screens nor any DR/fusion
+  logic reads either of these yet — this is instrumentation on the debug
+  screen only, so a future real drive can decide (per PRD.md Section 11's
+  "adopted only if it measures out better") whether either is worth
+  wiring further.
+UPDATE (2026-08-30): the DRIVE tab and `ui/screens/DriveScreen.kt` /
+  `ui/map/TrackCanvas.kt` (its abstract local-East/North-meter grid) were
+  removed — MapScreen's real street map + routing made them redundant,
+  since MapScreen already shows the same `StatusOverlayContent` over real
+  street tiles instead of a fake grid. `AppTab` now has only MAP and
+  HISTORY. See `ui/screens/MapScreen.kt`'s and `ui/map/StreetMapView.kt`'s
+  entries below for what replaced it (real routing/search, road-snap
+  constraint, animated marker).
 Important functions/classes: requestLocationPermission
   (registerForActivityResult(RequestPermission()), registered as a
   property initializer since it must be registered before the activity
@@ -1206,6 +781,17 @@ Important concepts/assumptions: orientation is displayed in degrees but
   `{ mlVelocityRepository?.resetAlignment() }` straight through to
   DriveScreen, the same nullable-safe-call pattern already used for
   `mlVelocityRepository?.start()`/`stop()`.
+  UPDATE (2026-08-30, user-reported "the drive page ... is doing
+  nothing"): `ui/screens/DriveScreen.kt` and its `ui/map/TrackCanvas.kt`
+  base layer were DELETED — see those files' entries above for the
+  reasoning (MapScreen already provided everything DriveScreen did, over
+  a real map instead of an abstract grid). `AppTab.DRIVE` was removed
+  from `ui/components/BottomNavBar.kt`; `selectedTab` now defaults to
+  `AppTab.MAP`, and the "back button returns to the home tab" BackHandler
+  (originally keyed on `AppTab.DRIVE`) now targets `AppTab.MAP`. The
+  `when (selectedTab)` block in `setContent` lost its `AppTab.DRIVE ->
+  DriveScreen(...)` branch entirely; `onRecalibrate`'s nullable-safe-call
+  pattern is now only wired through to `MapScreen`.
 BUG FOUND + FIXED on real-device verification (2026-08-25): the Column
   had no scroll modifier — as the screen accumulated more readout lines
   across Slices 4/5/6, it silently overflowed past the bottom of the
@@ -1252,6 +838,42 @@ Real usage (2026-08-25): used once, live, moving the phone by hand for
   timestamped sensor changes, not synthetic/placeholder data. One
   capture is nowhere near enough labeled data to train a classifier on
   — this only proves the tooling works end-to-end.
+
+android/app/src/main/kotlin/com/sih26168/idr/capture/DriveDataLogger.kt
+Status: IMPLEMENTED (new file, 2026-08-29)
+Purpose: A minimal, one-off data-capture tool (CLAUDE.md Rule 18), same
+  spirit as SensorRecorder.kt above but for validating the three
+  "engineering default, not yet validated" threshold groups against a
+  REAL TEST DRIVE instead of gathering ML training data: gnss/
+  GnssQuality.kt's max-accuracy/max-fix-age, gnss/GnssOutageDetector.kt's
+  four dwell constants, and dr/StationaryDetector.kt's ZUPT accel/gyro/
+  dwell thresholds. Logs one CSV row per DR tick (device's real observed
+  sensor rate, e.g. ~135-200 Hz on the test device — faster than the
+  ~10 Hz nominal design target, which only means a richer log, not a
+  problem) combining dr/BaselineDeadReckoningRepository's DeadReckoningState
+  (now also carrying its raw ZUPT inputs/decision, see that class's own
+  doc for why) with gnss/GnssModeRepository's GnssModeUiState at the same
+  instant. NOT part of the shipped demo's state machine (CLAUDE.md
+  Rule 8) — only reads already-real values, same as SensorRecorder.
+  CSV (not JSON) specifically so scripts/analyze_drive_log.py can load it
+  with `pandas.read_csv` directly.
+Inputs: record() takes one tick's GNSS mode/accuracy/fixAge/speed + DR
+  velocity/accel-magnitude/gyro-magnitude/isStationary.
+Outputs: toCsv() — hand-written CSV (no new dependency, CLAUDE.md Rule 2).
+Connected to: MainActivity (Start/Stop drive log button on the debug
+  screen, own deadReckoningRepository.state collector reading
+  gnssModeRepository.state.value synchronously each tick) -> DriveDataLogger
+  -> CSV file (getExternalFilesDir(null), pulled via `adb pull`) ->
+  scripts/analyze_drive_log.py
+Real usage (2026-08-29): smoke-tested indoors (phone handled, not a real
+  drive) for ~35s — 4742 rows, GNSS mode flapped GNSS_AIDED/TRANSITION/
+  DEAD_RECKONING/REACQUISITION repeatedly (expected indoors, same
+  marginal-GNSS behavior already documented elsewhere in this file) and
+  scripts/analyze_drive_log.py parsed the real pulled CSV without error.
+  This only proves the tooling works end-to-end — a real outdoor test
+  drive with an intentional GNSS-denied stretch (tunnel/underpass/
+  parking structure) is still needed before any of the three threshold
+  groups above can be called validated.
 
 android/app/src/test/kotlin/com/sih26168/idr/sensors/SampleRateTest.kt
 Status: IMPLEMENTED
@@ -1649,6 +1271,14 @@ Connected to: MainActivity (permission) -> LocationRepository ->
   -> StateEstimator is still a PLANNED downstream consumer (Slice 5+,
   once GNSS mode actually gates DR behavior instead of just being
   displayed).
+UPDATE (Round 2, 2026-08-28) — GnssQuality gained a second function,
+  `confidenceWeight(accuracyM, maxAccuracyM)`, returning a continuous
+  [0,1] trust weight (linear falloff from `maxAccuracyM`) rather than
+  `isGood`'s binary accept/reject. `isGood` is UNCHANGED and remains the
+  state machine's own enter/exit trigger (GnssOutageDetector,
+  unaffected); `confidenceWeight` is a separate, additional signal
+  consumed by `fusion/VelocityBiasCalibrator.update()` (PRD.md
+  FR13/Section 17 — see that class's entry).
 
 android/app/src/main/kotlin/com/sih26168/idr/alignment/{YawRate,AlignmentEstimator}.kt
 Status: IMPLEMENTED (Slice 6, 2026-08-25) — see `## Slice 1-6` build
@@ -1681,9 +1311,82 @@ Important concepts/assumptions: engineering-default thresholds
   validated against a real test drive (CLAUDE.md Rule 13). Explicit
   limitations matching PRD.md Section 15's own: assumes at least one
   clean straight-line moving segment with GNSS near trip start; does
-  not re-estimate while GNSS is unavailable; no "Phone Moved"
-  re-trigger yet.
-Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> AlignmentEstimator
+  not re-estimate while GNSS is unavailable.
+  UPDATE (2026-08-30): reset() IS now invoked automatically — see
+  alignment/AlignmentRepository.kt below, which also moved this class's
+  one caller from being MlVelocityRepository-only to a shared repository
+  both DR paths read.
+Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository -> AlignmentEstimator
+
+android/app/src/main/kotlin/com/sih26168/idr/alignment/AlignmentRepository.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: The Android/coroutine glue that turns the pure AlignmentEstimator
+  into a live, SHARED estimate — PRD.md Section 15. PREVIOUSLY this
+  estimation ran privately inside ml/MlVelocityRepository.kt alone, which
+  meant (a) it silently stopped existing whenever the ONNX model failed
+  to load (MainActivity only constructs MlVelocityRepository on a
+  successful model load) even though alignment has nothing to do with ML
+  inference, and (b) dr/BaselineDeadReckoningRepository.kt's physics path
+  had no access to it at all, so dr/NonHolonomicConstraint.kt used raw
+  device azimuth as its vehicle-heading proxy unconditionally. Extracted
+  as its own repository, driven only by SensorRepository (orientation)
+  and GnssModeRepository (GNSS bearing/speed) — no ML dependency — so
+  BOTH BaselineDeadReckoningRepository and MlVelocityRepository now read
+  the SAME AlignmentEstimator instance's estimate.
+  Also wires PRD.md Section 15's "Ongoing validation... Phone Moved...
+  triggers re-initialization": motion/PhoneMovedDetector.kt's
+  deterministic pitch/roll-change stand-in resets AlignmentEstimator
+  automatically on a detected remount, logged (CLAUDE.md Rule 17-style
+  traceability) via Log.i, in addition to the existing manual
+  "recalibrate" button (now calling this class's reset() directly instead
+  of reaching through MlVelocityRepository.resetAlignment(), which no
+  longer exists).
+Inputs: SensorRepository.state (orientation), GnssModeRepository.state
+  (GNSS bearing/speed/latestFix).
+Outputs: AlignmentUiState(yawOffsetRad, sampleCount, isAligned) — same
+  three fields AlignmentEstimate already had, republished as this
+  repository's own StateFlow.
+Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository ->
+  dr/BaselineDeadReckoningRepository (vehicle-heading correction for
+  NonHolonomicConstraint) AND ml/MlVelocityRepository (unchanged feature-
+  path correction); MainActivity's "recalibrate" button ->
+  AlignmentRepository.reset(); motion/PhoneMovedDetector ->
+  AlignmentRepository (automatic reset trigger)
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/PhoneMovedDetector.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: A DETERMINISTIC stand-in for PRD.md Section 14's `Phone Moved`
+  class — same "no labeled classifier data yet" precedent as
+  MotionStateClassifier.kt/PotholeShockDetector.kt/TurningDetector.kt.
+  PRD.md Section 15's own basis for alignment is the phone's fixed
+  mounting orientation — this detects a SUSTAINED change in the device's
+  own WORLD-frame pitch/roll (from OrientationSample, already gravity-
+  referenced) relative to a remembered reference orientation, i.e. "the
+  mount itself changed," not just road vibration.
+Inputs: nowMs, pitchRad, rollRad (per orientation tick).
+Outputs: Boolean (moved) — a one-shot edge on the tick a sustained
+  deviation first crosses the dwell threshold; false on the first-ever
+  call (establishes the initial reference) and on any tick below
+  threshold or not yet sustained long enough.
+Important functions/classes: evaluate() — pitch compared with a plain
+  difference (bounded to [-pi/2, pi/2], never wraps); roll compared via a
+  circular difference (atan2(sin(delta), cos(delta))), same wrap-safety
+  technique alignment/YawRate.kt already uses for azimuth deltas.
+  Thresholds: pitchRollChangeThresholdRad defaults to 0.26 rad (~15
+  degrees), minSustainedDeviationMs defaults to 1000ms — both engineering
+  defaults, unvalidated against real "phone picked up mid-drive" data
+  (CLAUDE.md Rule 13). reset() clears the remembered reference.
+Connected to: AlignmentRepository -> PhoneMovedDetector -> (gates AlignmentEstimator.reset())
+
+android/app/src/test/kotlin/com/sih26168/idr/motion/PhoneMovedDetectorTest.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: JUnit4 unit tests for PhoneMovedDetector.evaluate() — first
+  sample only establishes reference; small deviation within threshold;
+  large deviation not yet sustained; large deviation sustained past
+  dwell fires; reference updates after firing so it doesn't immediately
+  refire; a deviation that clears before the dwell elapses resets the
+  streak; roll deviation near the +-pi wrap boundary isn't a false
+  positive; reset() discards the reference.
 
 android/app/src/main/kotlin/com/sih26168/idr/features/{RollingWindow,FeatureExtractor}.kt
 Status: IMPLEMENTED (Slice 6, 2026-08-25)
@@ -1805,11 +1508,25 @@ android/app/src/main/kotlin/com/sih26168/idr/ml/MlVelocityRepository.kt
 Status: IMPLEMENTED (Slice 6, 2026-08-25; position integration added
   2026-08-25 in a follow-up change)
 Purpose: The Android/coroutine glue wiring SensorRepository +
-  GnssModeRepository's streams through AlignmentEstimator,
-  WorldFrameAcceleration (reused from Slice 3/5), FeatureExtractor,
-  VelocityModel, and (follow-up) MlPositionIntegrator, republishing the
-  live ML-predicted velocity AND an ML-driven WORLD-frame position as
-  its own StateFlow. Deliberately a SEPARATE, PARALLEL repository to
+  GnssModeRepository's streams through WorldFrameAcceleration (reused
+  from Slice 3/5), FeatureExtractor, VelocityModel, and (follow-up)
+  MlPositionIntegrator, republishing the live ML-predicted velocity AND
+  an ML-driven WORLD-frame position as its own StateFlow.
+  UPDATE (2026-08-30): alignment estimation moved OUT of this class into
+  alignment/AlignmentRepository.kt (a required constructor param now,
+  not an owned AlignmentEstimator) — this class reads
+  alignmentRepository.state.value each tick instead of driving its own
+  estimator; resetAlignment() was removed (callers now use
+  AlignmentRepository.reset() directly). See AlignmentRepository's own
+  entry for why (ML-load-failure coupling, physics path having no access
+  at all).
+  UPDATE (2026-08-30): motion/LongitudinalMotionClassifier.kt added,
+  classifying PRD Section 14's Accelerating/Braking from the SAME
+  accelForwardMps2 already computed for the ONNX feature vector —
+  published as MlVelocityUiState.isAccelerating/isBraking. See that
+  class's own entry.
+  at all).
+  Deliberately a SEPARATE, PARALLEL repository to
   BaselineDeadReckoningRepository (CLAUDE.md Rule 5) — does NOT modify
   or replace the physics position integrator; Slice 5's tested physics
   pipeline is completely untouched. Both run and display side by side,
@@ -1891,14 +1608,86 @@ REAL FINDING from on-device testing (2026-08-25) — position drift
   UPDATE (Slice 8, 2026-08-25): added a public `resetAlignment()`
   wrapping the already-private `alignmentEstimator.reset()` call — PRD.md
   Section 15's "Phone Moved... flag for recalibration" / Section 31/32's
-  manual "hold phone flat, tap to calibrate" fallback. `DriveScreen`'s
-  recalibrate `FloatingIconButton` calls this through `MainActivity`, a
-  second (manual) caller of the same reset the automatic Phone-Moved
-  re-trigger was already built for.
+  manual "hold phone flat, tap to calibrate" fallback.
+  UPDATE (Round 2, 2026-08-28) — REMOVED `resetAlignment()`, REMOVED the
+  owned `AlignmentEstimator` field: this class now takes an
+  `alignmentRepository: AlignmentRepository` constructor param and reads
+  `alignmentRepository.state.value` each tick instead of evaluating its
+  own estimator — see `alignment/AlignmentRepository.kt`'s entry for why
+  (the physics path needed the SAME estimate, not a second independent
+  one). The recalibrate `FloatingIconButton`
+  (`StatusOverlayContent.kt`, used by `MapScreen.kt` since 2026-08-30's
+  DriveScreen removal) now calls `AlignmentRepository.reset()` directly
+  through `MainActivity` instead of reaching through this class.
+  UPDATE (Round 2, 2026-08-28) — PRD.md FR3/Section 13's damping/OOD
+  guard: after `biasCalibrator.correctedVelocity()`, the result now
+  passes through a new `velocityGuard: VelocityGuard` (see that class's
+  entry below) BEFORE reaching `positionIntegrator.update()`. The
+  bias-corrected-but-undamped value is still published as
+  `predictedVelocityCorrectedMps` (renamed meaning: "before Round 2
+  damping," not "what feeds the integrator" anymore); the guard's output
+  is the NEW `predictedVelocityDampedMps` field, which is what actually
+  feeds the integrator now. `isVelocityOutOfDistribution` surfaces
+  whether the guard rejected this tick's raw prediction. REAL FINDING
+  (2026-08-28 live outage test): a single anomalous ML prediction (e.g. a
+  desk-bump during bench testing) previously reached the position
+  integrator with no smoothing at all — unlike the physics path's
+  double-integration, which has "memory" that absorbs one bad accel
+  sample — producing a visible position jump.
+  UPDATE (Round 2, 2026-08-28) — PRD.md FR13/Section 17's continuous GNSS
+  confidence weighting: the `biasCalibrator.update()` call now passes
+  `confidenceWeight = GnssQuality.confidenceWeight(fix.accuracyM)`
+  instead of relying on `GnssQuality.isGood`'s binary gate alone — see
+  `fusion/VelocityBiasCalibrator.kt`'s entry for the effective-alpha math.
 Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity (Compose UI);
   MlVelocityRepository -> fusion/StateEstimator (Slice 7, reads its position + isAligned);
-  motion/MotionStateClassifier, motion/PotholeShockDetector -> MlVelocityRepository (2026-08-25);
-  DriveScreen's recalibrate button -> MainActivity -> MlVelocityRepository.resetAlignment() (Slice 8)
+  motion/MotionStateClassifier, motion/PotholeShockDetector, motion/LongitudinalMotionClassifier
+  (2026-08-30) -> MlVelocityRepository;
+  alignment/AlignmentRepository -> MlVelocityRepository (shared alignment estimate, replaces the
+  owned AlignmentEstimator); ml/VelocityGuard -> MlVelocityRepository (Round 2, 2026-08-28);
+  StatusOverlayContent's recalibrate button (via MapScreen) -> MainActivity ->
+  AlignmentRepository.reset() (moved off this class)
+
+android/app/src/main/kotlin/com/sih26168/idr/ml/VelocityGuard.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: PRD.md Section 13/FR3's damping + out-of-distribution guard on
+  the ML velocity path, sitting between VelocityBiasCalibrator's
+  bias-corrected output and ml/MlPositionIntegrator. REAL FINDING
+  (2026-08-28 live outage test): dr/BaselinePhysicsIntegrator
+  double-integrates from acceleration, so it has "memory" that absorbs
+  one bad accel sample; MlPositionIntegrator instead applies the model's
+  FULL predicted speed each tick with no such memory (see that class's
+  own documented burst-sensitivity finding from 2026-08-25), so a single
+  anomalous prediction previously reached the position integrator
+  completely unguarded.
+Inputs: rawVelocityMps (here: the bias-corrected, pre-damping
+  prediction) per call to apply().
+Outputs: Result(velocityMps, wasOutOfDistribution) — a data class, not a
+  bare Float, so the caller can surface BOTH the usable value and
+  whether this tick's raw input was rejected.
+Important functions/classes: apply() — two independent corrections in
+  order: (1) OOD rejection — a NaN/infinite prediction, or one exceeding
+  `maxPlausibleSpeedMps` (default 55 m/s, ~200 km/h, deliberately
+  generous) in magnitude, is discarded outright and the last
+  accepted+smoothed value is held instead; (2) damping — an accepted
+  prediction is exponentially smoothed against the previous
+  accepted+smoothed value (`emaAlpha` default 0.3, deliberately more
+  responsive than VelocityBiasCalibrator's 0.05 — this smooths
+  tick-to-tick noise over ~1s at ~10 Hz, not a slowly-varying systematic
+  offset over tens of seconds); reset().
+Important concepts/assumptions: HONEST LIMITATION (CLAUDE.md Rule 13) —
+  this is a coarse sanity clamp, NOT full training-distribution
+  out-of-distribution detection; no per-feature training bounds are
+  exported from the Python training pipeline yet, so a prediction that's
+  merely "unlikely" (not wildly implausible) passes through undetected.
+Connected to: ml/MlVelocityRepository -> VelocityGuard -> ml/MlPositionIntegrator
+Unit tests: tests/.../ml/VelocityGuardTest.kt — first sample accepted
+  as-is; subsequent samples smoothed by a hand-derived EMA value; values
+  beyond the plausible bound (both directions) and NaN/infinite are
+  rejected and the last accepted value is held; a value exactly at the
+  bound is accepted; a rejection before any accepted sample holds zero;
+  reset() clears state so the next accepted sample isn't blended against
+  pre-reset history.
 
 fusion/GeoProjection.kt
 Status: IMPLEMENTED (Slice 7, 2026-08-25)
@@ -1924,10 +1713,22 @@ Purpose: PRD.md Section 17's online velocity-bias calibration — a simple
   speed); the learned bias is held constant (still applied) once GNSS is
   lost, since there's no ground truth left to recalibrate against during
   DEAD_RECKONING.
-Important functions/classes: update(gnssSpeedMps, rawPredictedVelocityMps)
-  (no-ops below the speed gate); correctedVelocity(raw) (adds the learned
-  bias); reset().
-Connected to: ml/MlVelocityRepository -> VelocityBiasCalibrator -> ml/MlPositionIntegrator
+Important functions/classes: update(gnssSpeedMps, rawPredictedVelocityMps,
+  confidenceWeight = 1f) (no-ops below the speed gate); correctedVelocity(raw)
+  (adds the learned bias); reset().
+UPDATE (Round 2, 2026-08-28 — PRD.md FR13/Section 17): `update()` gained
+  the `confidenceWeight` parameter above (defaults to 1, so pre-existing
+  callers/tests are unaffected). The EFFECTIVE alpha for a given sample
+  is `emaAlpha * confidenceWeight.coerceIn(0f, 1f)` — a marginal fix
+  (e.g. right at GnssQuality's 25m threshold, weight near 0) barely
+  moves the bias; a very accurate fix (weight near 1) moves it at the
+  full configured rate. The FIRST-EVER sample still initializes the bias
+  directly regardless of weight (no prior estimate to blend a
+  low-confidence correction against). `ml/MlVelocityRepository` now
+  passes `GnssQuality.confidenceWeight(fix.accuracyM)` here instead of
+  relying on `GnssQuality.isGood`'s binary gate alone.
+Connected to: ml/MlVelocityRepository -> VelocityBiasCalibrator -> ml/MlPositionIntegrator;
+  gnss/GnssQuality.confidenceWeight -> VelocityBiasCalibrator.update (Round 2, 2026-08-28)
 
 fusion/PositionFusion.kt
 Status: IMPLEMENTED (Slice 7, 2026-08-25)
@@ -1956,7 +1757,175 @@ Important functions/classes: update(nowMs, mode, drEastM, drNorthM,
   internals; matching by default is intentional but not structurally
   enforced), falling back to raw DR passthrough if no fix is available
   yet that tick.
-Connected to: fusion/StateEstimator -> PositionFusion -> FusedPositionUiState
+Connected to: fusion/StateEstimator -> PositionFusion -> FusedPositionUiState;
+  ml/ReacquisitionDriftModel -> PositionFusion.setReacquisitionBlendMs() (2026-08-30)
+UPDATE (Round 2, 2026-08-28): gained a heading-level sibling,
+  `fusion/HeadingFusion.kt` (see its own entry below) — REACQUISITION
+  used to blend position via this class but leave heading a hard
+  cutover; both are now blended the same way.
+UPDATE (2026-08-30, PRD.md Section 17's "AI-based" GNSS+INS fusion —
+  previously entirely classical, per STATUS_AND_ROADMAP.md's own flagged
+  decision point): `reacquisitionBlendMs` is now a `var`, settable via
+  `setReacquisitionBlendMs()` — StateEstimator.kt calls it with
+  `blendDurationForDriftMs()`'s output right before the tick that first
+  enters REACQUISITION, fed by ml/ReacquisitionDriftModel.kt's predicted
+  along-track drift for that specific outage.
+  `blendDurationForDriftMs(predictedDriftMeters)` (companion function):
+  MIN_ADAPTIVE_REACQUISITION_BLEND_MS=500ms +
+  BLEND_MS_PER_METER_OF_PREDICTED_DRIFT=30.0 * predictedDriftMeters,
+  clamped to [500, 3000]ms — engineering defaults, unvalidated against a
+  real outdoor test drive (CLAUDE.md Rule 13). Deliberately NOT a
+  Kalman/EKF state update (CLAUDE.md's "What Not To Build"/PRD.md
+  Section 7) — still the same simple linear-interpolation blend as
+  before, just with a data-informed duration. If
+  ReacquisitionDriftModel failed to load, `reacquisitionBlendMs` simply
+  stays at DEFAULT_REACQUISITION_BLEND_MS (1000ms) — the exact previous
+  classical behavior, same resilience pattern as the ML velocity path.
+
+fusion/HeadingFusion.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: PRD.md Section 18's REACQUISITION heading/map-orientation
+  blend — the heading-level counterpart to PositionFusion above, same
+  per-mode structure (GNSS_AIDED/TRANSITION/DEAD_RECKONING/REACQUISITION),
+  same `reacquisitionBlendMs` default (read from
+  `PositionFusion.DEFAULT_REACQUISITION_BLEND_MS`, not duplicated).
+  REAL FINDING (2026-08-28 live outage test): Round 1's
+  `ui/screens/MapScreen.kt` computed the map's heading-up rotation ad
+  hoc, with a hard cutover between GNSS bearing and a DR-derived bearing
+  at the GNSS_AIDED/DEAD_RECKONING boundary — no interpolation, which
+  produced a visible ~180 degree map flip on reacquisition whenever the
+  two disagreed (compounded by the physics-heading-alignment gap fixed
+  in dr/BaselineDeadReckoningRepository the same day).
+Inputs: nowMs, mode (GnssMode), drHeadingDeg (live DR-derived compass
+  bearing), newFixHeadingDeg (nullable — the newly reacquired GNSS fix's
+  bearing).
+Outputs: Float (fused compass heading, degrees, 0-360).
+Important functions/classes: update() (per-mode logic, mirrors
+  PositionFusion.update() exactly); lerpDegreesCircular (private) —
+  treats each bearing as a unit vector via sin/cos, linearly blends the
+  VECTORS, then recovers the angle via atan2. This is the standard
+  technique for interpolating angles without a wraparound discontinuity
+  at +-180/0-360 degrees — a plain linear lerp between e.g. 350 deg and
+  10 deg would produce a -340-degree spin the LONG way around instead of
+  the correct +20-degree short way; directly unit-tested for this exact
+  case (HeadingFusionTest's wrap-boundary test).
+Connected to: fusion/StateEstimator -> HeadingFusion -> FusedPositionUiState.fusedHeadingDeg
+  -> ui/screens/MapScreen.kt (StreetMapView's headingDeg param)
+Unit tests: tests/.../fusion/HeadingFusionTest.kt — per-mode behavior
+  mirrors PositionFusionTest's coverage (freeze/passthrough/blend/
+  reset), plus a dedicated 350deg->10deg wrap-boundary case verifying
+  the short-way interpolation.
+
+fusion/RunningStats.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: A running (online, Welford's algorithm) mean/population-
+  standard-deviation accumulator over a stream of scalar samples — built
+  to feed ml/ReacquisitionDriftModel.kt's avgPredictedSpeedMps/
+  predictedSpeedStdMps features with "the mean/std of DR speed samples
+  seen so far during the CURRENT GNSS outage," without storing the full
+  sample history. Welford's algorithm computes the SAME population
+  variance numpy.std()'s default (ddof=0) computes in
+  ml/train_reacquisition_model.py — this class exists specifically so
+  StateEstimator's live accumulation matches that training-time
+  statistic, not a different one.
+Inputs: accumulate(value: Double) per sample.
+Outputs: mean(), populationStdDev(), sampleCount.
+Pure Kotlin, no Android dependency, unit-testable (CLAUDE.md Rule 19) —
+  see RunningStatsTest.kt (5 cases, including an exact match against a
+  textbook numpy mean=5.0/std=2.0 dataset).
+Connected to: fusion/StateEstimator -> RunningStats -> ml/ReacquisitionDriftModel.predict()
+
+ml/ReacquisitionDriftModel.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: ONNX Runtime Mobile wrapper for the trained reacquisition-drift
+  LinearRegression model (ml/train_reacquisition_model.py/
+  ml/export_reacquisition_model.py) — PRD.md Section 17's "AI-based" half
+  of the GNSS+INS Fusion Engine. Predicts EXPECTED along-track DR
+  position drift (meters) at the moment GNSS reacquires. LinearRegression,
+  not RandomForestRegressor, was the MEASURED choice (CLAUDE.md
+  Rule 3/11) — see ml/train_reacquisition_model.py's own printed
+  comparison: with only 3 features and ~1,200 simulated training
+  samples, the linear model's held-out MAE (14.224m)/RMSE (17.895m) beat
+  both RandomForestRegressor (MAE 15.060m/RMSE 18.813m) and the best
+  1-parameter physics-formula baseline (MAE 14.887m/RMSE 18.663m) — a
+  real but modest improvement, honestly reported, not oversold.
+Inputs: outageDurationS, avgPredictedSpeedMps, predictedSpeedStdMps
+  (Float each).
+Outputs: Float — predicted along-track drift, meters, clamped to >= 0
+  (the fitted LinearRegression has no non-negativity constraint; a
+  short/slow outage can produce a small negative raw prediction from the
+  fitted intercept, confirmed during training).
+Important functions/classes: predict() — loads
+  models/reacquisition_drift_v1.onnx (bundled asset, ~0.25KB, committed
+  like velocity_v1.onnx — see models/README.md) once at construction via
+  loadFromAssets(context), then single-row inference per REACQUISITION
+  event (NOT per tick). Input/output tensor names ("input"/"variable")
+  verified via onnxruntime's Python API before hardcoding, same skl2onnx
+  defaults VelocityModel.kt already uses regardless of regressor type.
+Connected to: MainActivity (loads it, separate try/catch from the
+  velocity model — an independent failure mode) -> StateEstimator ->
+  PositionFusion.setReacquisitionBlendMs()
+
+ml/train_reacquisition_model.py
+Status: IMPLEMENTED (2026-08-30)
+Purpose: Trains + evaluates the reacquisition-drift regressor. IO-VNBD
+  has no real GNSS outages (continuously GNSS-aided recording), so
+  outages are SIMULATED — a random start row + random duration (5-60s,
+  an engineering range unvalidated against real outdoor outage lengths,
+  CLAUDE.md Rule 13) within one trip, using the ALREADY-TRAINED velocity
+  model's predictions over that window as the "live on-device
+  prediction" signal. Target is ALONG-TRACK drift
+  (cumsum(|predicted_speed - true_speed| * dt) over the window) — NOT
+  full 2D position drift, deliberately: this dataset has no reliable
+  WORLD-frame heading to reconstruct a synthetic 2D trajectory from (only
+  vehicle-frame forward/lateral, and GNSS course only changes every ~9s
+  — far too coarse), and along-track integration error is the dominant
+  real-world DR drift component anyway once the non-holonomic constraint
+  already suppresses lateral drift.
+  Split discipline (same as train_velocity_model.py): outage samples
+  drawn ONLY from the 14 trips already held out from velocity-model
+  TRAINING (so drift labels reflect genuinely unseen-trip prediction
+  quality), then those 14 trips split AGAIN (10 drift-train/4 drift-val)
+  so this model's own reported accuracy is ALSO on held-out trips.
+Inputs: data/processed/io_vnbd_features.parquet (same file
+  feature_extraction.py produces for the velocity model).
+Outputs: printed MAE/RMSE comparison — constant-mean baseline, two
+  1-parameter physics-formula baselines (std*duration and
+  avgspeed*duration), LinearRegression, RandomForestRegressor. Explicitly
+  measures ML against simple deterministic baselines before choosing one
+  (CLAUDE.md Rule 3) — see ml/ReacquisitionDriftModel.kt's entry for the
+  real numbers and which one won.
+Important functions/classes: simulate_outage_samples() (one trip's
+  random outage windows -> 3 features + drift label),
+  build_drift_dataset() (runs that over a list of trips and concatenates).
+Unit tests: tests/ml/test_train_reacquisition_model.py (6 cases,
+  synthetic trips only — perfect-prediction gives exactly zero drift;
+  constant-offset prediction gives the analytically expected
+  `error * duration`; minimum window-size enforcement; a too-short trip
+  yields zero samples; deterministic with a fixed rng seed; output
+  column set matches the declared feature/label columns).
+Connected to: data/processed/io_vnbd_features.parquet -> train_reacquisition_model.py
+  -> (printed comparison only — export_reacquisition_model.py produces the shipped artifact)
+
+ml/export_reacquisition_model.py
+Status: IMPLEMENTED (2026-08-30)
+Purpose: Exports the FINAL LinearRegression drift model to ONNX +
+  output-parity check (CLAUDE.md Rule 20), mirroring export_model.py's
+  own "retrain on ALL data once train/val has validated the approach"
+  pattern — retrains the velocity model on all 72 trips, simulates
+  outages across all 72 using ITS predictions, trains LinearRegression on
+  the full simulated set (5,600 samples), exports, and verifies parity.
+Outputs: models/reacquisition_drift_v1.onnx (~0.25KB). Measured parity:
+  max abs diff 0.000011m, mean abs diff 0.000002m, 500/500 samples within
+  the 1e-3m tolerance.
+Unit tests: tests/ml/test_export_reacquisition_model.py (2 cases,
+  mirroring test_export_model.py's pattern exactly — exported ONNX
+  matches sklearn predictions; the parity check itself correctly detects
+  a real, deliberately-introduced mismatch).
+Connected to: train_reacquisition_model.py's helpers (reused directly,
+  not duplicated) -> export_reacquisition_model.py -> models/reacquisition_drift_v1.onnx
+  -> android/app/src/main/assets/reacquisition_drift_v1.onnx (manually
+  copied, same convention as velocity_v1.onnx) -> ml/ReacquisitionDriftModel.kt
 
 fusion/StateEstimator.kt
 Status: IMPLEMENTED (Slice 7, 2026-08-25)
@@ -2008,9 +1977,65 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   computed that tick for PositionFusion's own blend — no new sensor
   data or geodesy needed, this is a small reduction over data already
   flowing through this class.
+  UPDATE (Round 2, 2026-08-28): now also owns a `fusion/HeadingFusion`
+  instance and a `lastConfidentHeadingDeg` field (moved here, unchanged
+  in value, from `ui/screens/MapScreen.kt` — same 0.5 m/s
+  confident-bearing threshold, same "hold the last value below that"
+  behavior). Each tick computes `drHeadingDeg` from the PHYSICS velocity
+  vector's bearing (`atan2(physicsState.velocityEastMps,
+  physicsState.velocityNorthMps)`), then blends it against
+  `fix.bearingDeg` via `headingFusion.update()`, publishing the result as
+  the NEW `FusedPositionUiState.fusedHeadingDeg` field. This is now the
+  SINGLE source of truth for the map's heading-up rotation — see
+  `fusion/HeadingFusion.kt`'s entry and `ui/screens/MapScreen.kt`'s
+  UPDATE note for why Round 1's per-screen ad hoc computation was wrong.
+  UPDATE (2026-08-30): PRD.md Section 19's MVP map constraint
+  (map/MapConstraint.kt) is now applied to `fused` here, AFTER
+  PositionFusion.update() but before publishing — a per-tick correction
+  to this class's OUTPUT position only, same architectural boundary
+  PositionFusion's own freeze/interpolate corrections already use; it
+  never writes back into BaselineDeadReckoningRepository/
+  MlVelocityRepository's own accumulated state. `setActiveRouteGeometry`
+  is a plain mutable field (lat/lon pairs, not osmdroid's GeoPoint, to
+  keep this fusion-layer class free of a map-library dependency) set
+  once from ui/screens/MapScreen.kt whenever its active route changes,
+  and read every tick on this same collecting coroutine — the SAME
+  "settable field read on the collecting coroutine" pattern
+  BaselineDeadReckoningRepository.walkingModeEnabled already establishes.
+  The road-geometry-to-local-meters projection is cached against the
+  anchor it was computed with, and only re-projected when the route or
+  the anchor changes, not every ~10Hz tick. Only attempted while
+  gnssState.mode != GNSS_AIDED (a real GPS fix needs no road-snap
+  "correction"), an anchor + active route exist, and DR speed is above
+  0.5 m/s (below that, the physics-velocity-vector heading used for the
+  compatibility check is noise, not signal — same floor
+  ui/screens/MapScreen.kt's own heading-up map rotation fallback
+  already uses). `FusedPositionUiState.roadSnapped`/`distanceToRoadM`
+  expose whether/how far this tick's snap moved the estimate, surfaced
+  in MainActivity's debug screen for demo honesty (CLAUDE.md Rule 13) —
+  not shown as a separate map overlay, to avoid growing MapScreen's UI
+  surface for what is fundamentally a debug/verification signal.
+  UPDATE (2026-08-30, PRD.md Section 17's "AI-based" fusion): a new
+  `outageSpeedStats` (fusion/RunningStats.kt) accumulates whichever DR
+  source is active each tick (same selection as drEastM/drNorthM),
+  reset the instant GNSS is good again. At the SAME "entering
+  REACQUISITION" instant DriftSummary is already snapshotted, this class
+  now ALSO computes the real elapsed outage duration and calls
+  `reacquisitionDriftModel?.predict(...)`, then
+  `positionFusion.setReacquisitionBlendMs(PositionFusion.blendDurationForDriftMs(...))`
+  — BEFORE `positionFusion.update()` sees REACQUISITION mode for the
+  first time this outage, so the very first blend tick already uses the
+  adaptive duration. `reacquisitionDriftModel` is a new nullable
+  constructor param, same resilience pattern as `mlVelocityRepository` —
+  null (ONNX load failure) means `positionFusion` simply keeps its fixed
+  1-second default, the exact previous classical behavior. Logged
+  (`Log.i`) alongside the existing drift-summary log line.
 Connected to: GnssModeRepository, BaselineDeadReckoningRepository,
   MlVelocityRepository -> StateEstimator -> MainActivity (Compose UI);
-  fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8)
+  fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8);
+  fusion/HeadingFusion -> StateEstimator.fusedHeadingDeg -> ui/screens/MapScreen.kt (Round 2, 2026-08-28);
+  ui/screens/MapScreen.kt -> StateEstimator.setActiveRouteGeometry() -> map/MapConstraint.snapToRoad() -> FusedPositionUiState.fusedEastM/fusedNorthM;
+  fusion/RunningStats, ml/ReacquisitionDriftModel -> StateEstimator -> fusion/PositionFusion.setReacquisitionBlendMs() (2026-08-30)
 
 fusion/DriftSummary.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -2090,19 +2115,279 @@ Connected to: dr/BaselineDeadReckoningRepository AND
   corrections at all) — it only affects the LIVE corrected display,
   exactly like ZUPT/non-holonomic already do for the physics path.
 
-MapConstraint.kt
-Status: PLANNED
-Purpose: Snap the estimated position to the nearest plausible road
-  segment (PRD.md Section 19 — MVP-level, not a full map matcher).
+android/app/src/main/kotlin/com/sih26168/idr/motion/FloorChangeDetector.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: PRD.md FR12 — barometer-based floor/level-change detection,
+  directly supporting the multi-level-parking scenario named in the SIH
+  problem statement (Section 2/3). Pure Kotlin, no Android dependency,
+  unit-testable on the plain JVM (CLAUDE.md Rule 19). Deterministic
+  threshold detector — same "physics-only stand-in" precedent as
+  StationaryDetector/PotholeShockDetector, but satisfies its OWN FR
+  directly (there's no PRD Section 14 motion class for this).
+Inputs: nowMs (boot-time ms, relative durations only), pressureHpa.
+Outputs: Result(relativeAltitudeM, floorChangeDetected, floorDelta).
+Important functions/classes: relativeAltitudeMeters(baselineHpa,
+  currentHpa) (companion, pure) — the international barometric formula
+  `h = 44330*(1-(P/P0)^(1/5.255))`, a standard atmospheric-physics
+  approximation (not an invented/measured figure — CLAUDE.md Rule 13's
+  "no invented numbers" concerns claimed benchmarks, not textbook
+  constants), only accurate for modest altitude changes near the
+  baseline (ICAO standard-atmosphere assumption) — adequate for a few
+  parking-structure floors, not claimed accurate at km scale; evaluate()
+  — tracks a baseline pressure (established on the first-ever reading),
+  computes relative altitude against it, and signals a floor change only
+  once a threshold crossing has been SUSTAINED for minDwellMs (same
+  hysteresis principle as StationaryDetector/GnssOutageDetector,
+  CLAUDE.md Rule 16's spirit — a brief pressure blip, e.g. a car door
+  slamming, must not flip this); on a confirmed change, the baseline
+  RE-ANCHORS to the current pressure so a SUBSEQUENT floor change (e.g.
+  descending multiple levels) can also be detected, not just the first;
+  reset().
+Important concepts/assumptions: engineering defaults
+  (floorHeightThresholdM=2.5m, minDwellMs=2000ms), not yet validated
+  against a real multi-level-parking test drive (CLAUDE.md Rule 13).
+Connected to: motion/FloorChangeRepository -> FloorChangeDetector -> FloorChangeUiState
+Unit tests: tests/.../motion/FloorChangeDetectorTest.kt — the formula
+  itself hand-verified against a known pressure-ratio case (0.5 ratio ~=
+  5478m, derived via the formula's own Taylor expansion, not just
+  round-tripped through the code); sustained crossings up/down signal the
+  correct floorDelta; a crossing that doesn't last the full dwell, or is
+  interrupted mid-streak, does NOT signal a change; staying within the
+  threshold band never signals a change; re-anchoring after a confirmed
+  change allows a second change to also be detected; reset() clears state.
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/FloorChangeRepository.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: Android/coroutine glue driving FloorChangeDetector off
+  SensorRepository's barometer stream. A SEPARATE repository (CLAUDE.md
+  Rule 5) rather than folded into BaselineDeadReckoningRepository/
+  MlVelocityRepository — floor detection is entirely independent of
+  GNSS/DR position estimation; nothing about it gates or is gated by
+  either DR path, so it only depends on SensorRepository.
+Inputs: SensorRepository (read-only, via its StateFlow), a CoroutineScope.
+Outputs: StateFlow<FloorChangeUiState> — {relativeAltitudeM,
+  floorChangeDetected, floorDelta, totalFloorsChanged, hasBarometer}.
+Important functions/classes: start()/stop() (lifecycle-tied, same
+  pattern as every other repository here); totalFloorsChanged — a
+  running signed count this class accumulates across confirmed floor
+  changes (the pure detector only reports ONE change at a time, this
+  repository is what turns that into a running trip total, same
+  "pure math + stateful glue" split as everywhere else in this codebase).
+Important concepts/assumptions: not all devices have a barometer —
+  `hasBarometer` reflects `SensorRepository.hasBarometer()` honestly
+  (CLAUDE.md Rule 13) rather than silently showing "no floor change,
+  ever" on a device that structurally can't detect one.
+Connected to: SensorRepository -> FloorChangeRepository -> MainActivity
+  (debug screen only so far — see MainActivity.kt's entry)
+
+android/app/src/main/kotlin/com/sih26168/idr/fusion/RoadSnap.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+NOTE (2026-08-30 merge): `map/MapConstraint.kt` (see its own entry
+  below) is a SEPARATE, independently-built implementation of the same
+  PRD.md Section 19 map-constraint feature, added on the other Round 2
+  branch and merged in alongside this one rather than replacing it — the
+  two now serve genuinely different consumers (this class only corrects
+  `ui/screens/MapScreen.kt`'s marker DISPLAY position via
+  `fusion/StateEstimator.kt`'s already-fused position; `MapConstraint.kt`
+  corrects `fusion/StateEstimator.kt`'s own `fusedEastM`/`fusedNorthM`
+  OUTPUT before either DriftSummary or MapScreen ever see it), so both
+  were kept rather than one being deleted as redundant — flagged here as
+  a real duplication worth a deliberate follow-up decision (CLAUDE.md
+  Rule 4), not a silent accident.
+Purpose: PRD.md Section 19's MVP map-constraint layer — nearest-road
+  snapping, explicitly NOT a full HMM-based map matcher (ruled out by
+  Section 19/34 as Future Work). Pure Kotlin, no Android dependency,
+  unit-testable (CLAUDE.md Rule 19).
+Scope decision (PRD.md Section 19's 2026-08-28 amendment): rather than
+  fetching a general road-network graph (which would need a NEW service,
+  e.g. Overpass API — CLAUDE.md Rule 2's "no new dependency without
+  discussing it first"), this snaps onto the geometry of the user's OWN
+  already-computed active route (`routing/RoutingRepository.kt`, OSRM) —
+  the road the demo is actually driving. Reuses Slice 8b's existing
+  infrastructure, needs no new network call. No active route = nothing
+  to snap to = an honest "no correction," not a crash or a guess.
+Inputs: positionEastM/positionNorthM (local meters, same frame as the
+  route geometry below), headingDeg (nullable — null skips the heading
+  check entirely rather than assuming straight-ahead travel),
+  routeGeometryLocalMeters (the active route's geometry, pre-projected
+  by the CALLER via fusion/GeoProjection.toLocalMeters against the same
+  reference point as the position).
+Outputs: SnapResult(eastM, northM, correctionDistanceM)?, null if no
+  route, no heading-compatible segment nearby, or nothing within range.
+Important functions/classes: snap() — for each route segment, finds the
+  nearest point via standard point-to-segment projection (clamped to the
+  segment, not the infinite line), REJECTS any segment whose own bearing
+  disagrees with the estimated heading by more than
+  DEFAULT_MAX_HEADING_DELTA_DEG (45 deg — "simple nearest-segment +
+  heading-compatibility check, not an HMM," PRD.md Section 19's own
+  wording verbatim), then returns the closest surviving candidate within
+  DEFAULT_MAX_SNAP_DISTANCE_M (25m, comparable to GnssQuality's own
+  max-accuracy threshold). Heading comparison is CIRCULAR-safe (same
+  0/360-wrap technique fusion/HeadingFusion.kt and
+  ui/map/PositionSmoother.kt already use) — a naive linear subtraction
+  would wrongly reject e.g. 359 deg vs. a 0-deg segment as a 359-degree
+  mismatch instead of the true 1-degree one.
+Important concepts/assumptions: engineering defaults (25m/45deg), not
+  yet validated against a real test drive (CLAUDE.md Rule 13).
+  Zero-length segments (duplicate consecutive geometry points) are
+  skipped rather than dividing by zero.
+Connected to: ui/screens/MapScreen.kt -> RoadSnap -> StreetMapView.kt's
+  marker position ONLY — deliberately does NOT correct
+  fusion/StateEstimator.kt's `fusedEastM`/`fusedNorthM` itself, since
+  that value also feeds fusion/DriftSummary.kt's measured drift number
+  and MapScreen's own routeProgress, both of which must stay an HONEST,
+  uncorrected measurement of the DR system's real error (CLAUDE.md
+  Rule 13) rather than an artifact of the snapping algorithm's own
+  assumptions — matches PRD.md Section 16's framing of map-constraint
+  snapping as "a correction... rather than the primary estimator."
+Unit tests: tests/.../fusion/RoadSnapTest.kt — fewer than 2 geometry
+  points returns null; an on-segment position snaps to itself with zero
+  correction; an off-to-the-side position snaps perpendicular onto the
+  segment (hand-derived); a position beyond the segment's endpoint
+  clamps to the endpoint rather than the infinite line; a
+  heading-incompatible segment is rejected even when geometrically
+  closer than a compatible one; a null heading skips the compatibility
+  check; a position beyond the max snap distance returns null even if
+  heading-compatible; among multiple segments the heading-INcompatible
+  closer one is correctly rejected in favor of the farther compatible
+  one; the 0/360 wrap boundary is handled correctly (359 deg vs. a 0-deg
+  segment is a 1-degree delta, not 359); a duplicate consecutive point is
+  skipped without a divide-by-zero.
+
+android/app/src/main/kotlin/com/sih26168/idr/dr/LowPassFilter.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: PRD.md Section 11's "low-pass filtering... to remove high-
+  frequency vibration noise before feature extraction" — capability "AI
+  Speed & Vibration Filter"'s previously entirely-missing filter half. A
+  single-pole (exponential moving average) low-pass filter, standard RC
+  discretization (`alpha = dt / (rc + dt)`, `rc = 1/(2*pi*cutoffHz)`),
+  computed per-sample so it stays correct at this project's real,
+  non-constant ~10Hz sample rate.
+  SCOPE DECISION (narrows PRD.md Section 11's literal "before feature
+  extraction" wording, CLAUDE.md Rule 4/20): wired into
+  dr/BaselineDeadReckoningRepository.kt (physics baseline) ONLY, NOT into
+  ml/FeatureExtractor.kt's input. The already-trained, exported, and
+  MEASURED ONNX velocity model (MAE 1.244 m/s) was trained on
+  ml/feature_extraction.py's windowed statistics over RAW, unfiltered
+  accel/gyro. Filtering that signal now, on-device only, without
+  retraining + re-validating against a matched Python-side filter, would
+  silently shift the live feature distribution away from the training
+  distribution and could quietly regress the already-measured accuracy
+  with no new measurement to catch it. Retraining on filtered features is
+  legitimate future work, not done here. The physics baseline has no such
+  constraint (no trained parameters to keep in sync with), so it's safe
+  and self-contained there. The already-published physics+ZUPT baseline
+  MAE/RMSE in ml/train_velocity_model.py comes from an independent PYTHON
+  re-implementation over IO-VNBD, not this Kotlin class, so this addition
+  doesn't retroactively change that number — it does mean this on-device
+  path no longer matches that Python mirror exactly, which is now the
+  honest, disclosed state.
+Inputs: value (Double), dtSeconds (elapsed time since the previous sample).
+Outputs: Double (the filtered value) — `<= 0.0` dtSeconds returns the raw
+  value unfiltered and resets internal state (first sample / clock reset,
+  same guard convention as BaselinePhysicsIntegrator.update()).
+Important functions/classes: filter(), reset(). Pure Kotlin, no Android
+  dependency, unit-testable (CLAUDE.md Rule 19) — see LowPassFilterTest.kt
+  (7 cases: passthrough on first sample, dt<=0 reset behavior, DC/constant
+  input stays constant, step response moves gradually not instantly,
+  higher cutoff tracks a step faster, oscillating noise is attenuated,
+  reset() clears state).
+Connected to: dr/BaselineDeadReckoningRepository.kt instantiates SIX
+  instances (accelEast/accelNorth/accelUp/gyroX/gyroY/gyroZ, one shared
+  DEFAULT_VIBRATION_FILTER_CUTOFF_HZ=2.0Hz, engineering default
+  unvalidated per CLAUDE.md Rule 13) -> filters WORLD-frame linear accel
+  + raw gyro components AFTER the pothole discount (PotholeShockDetector
+  needs the RAW vertical-accel spike to detect it at all — filtering
+  first would blunt it) and BEFORE BaselinePhysicsIntegrator.update() /
+  the ZUPT magnitude calculation. DeadReckoningState's published
+  linearAccelMagnitudeMps2/gyroMagnitudeRadPerSec are now the FILTERED
+  magnitude, not raw — a real, disclosed change (see that class's own
+  doc and capture/DriveDataLogger.kt's updated field docs, since these
+  feed scripts/analyze_drive_log.py's offline threshold validation).
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/LongitudinalMotionClassifier.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: A DETERMINISTIC stand-in for PRD.md Section 14's `Accelerating`/
+  `Braking` classes — same "no labeled classifier data yet" precedent as
+  MotionStateClassifier.kt/PotholeShockDetector.kt/TurningDetector.kt/
+  PhoneMovedDetector.kt. A simple sign/magnitude threshold on vehicle-
+  frame FORWARD acceleration.
+  ML-path only, same precedent MotionStateClassifier already establishes
+  (CLAUDE.md Rule 3: physics-only baseline stays untouched by any
+  ML-derived signal) — reads ml/MlVelocityRepository.kt's already-
+  computed, alignment-corrected accelForwardMps2 (the SAME vehicle-frame
+  forward-acceleration feature that also feeds the ONNX model), rather
+  than reimplementing a separate vehicle-frame projection for the
+  physics path (which has no alignment-corrected forward/lateral split
+  at all).
+Inputs: accelForwardMps2 (Float).
+Outputs: LongitudinalMotionClassification(isAccelerating, isBraking) —
+  mutually exclusive (opposite-sign thresholds), both false in between.
+Important functions/classes: classify() — minLongitudinalAccelMps2
+  defaults to 1.0 m/s^2 (~0.1g), engineering default, unvalidated against
+  real labeled data (CLAUDE.md Rule 13). Stateless — no dwell/hysteresis,
+  unlike TurningDetector/PhoneMovedDetector, since this only drives a
+  display label (PRD.md Section 14: "context for the state machine...
+  and non-holonomic constraint"), not a correction that would misfire
+  badly on one noisy sample.
+Pure Kotlin, no Android dependency, unit-testable (CLAUDE.md Rule 19) —
+  see LongitudinalMotionClassifierTest.kt (6 cases).
+Connected to: ml/MlVelocityRepository -> LongitudinalMotionClassifier ->
+  MlVelocityUiState.isAccelerating/isBraking ->
+  ui/screens/StatusOverlayContent.kt's motion label AND MainActivity's
+  debug screen.
+
+android/app/src/main/kotlin/com/sih26168/idr/map/MapConstraint.kt
+Status: IMPLEMENTED (2026-08-30)
+Purpose: PRD.md Section 19's MVP-level map constraint — nearest-road-snap
+  plus a heading-compatibility check, explicitly NOT a Hidden Markov
+  Model or general map-matching engine (PRD.md Section 19/CLAUDE.md's
+  "What Not To Build"). Scope reduction from PRD.md Section 19's two
+  listed options: reuses the real OSM/OSRM route geometry this project
+  already fetches for the active route's turn-by-turn directions
+  (routing/RouteModels.kt's RouteResult.geometry) instead of separately
+  fetching a general OSM road dataset for the whole demo area — no new
+  network call, library, or offline dataset (CLAUDE.md Rule 2). Honest
+  tradeoff: only does anything while a route is active.
+Inputs: eastM/northM (WORLD-frame local meters, the pre-snap estimate),
+  headingRad, a List<Segment> (road-geometry edges in the SAME local
+  frame), maxSnapDistanceM (default 30.0 m) and maxHeadingDeltaRad
+  (default 45 deg) — both engineering defaults, unvalidated against a
+  real outdoor test drive (CLAUDE.md Rule 13).
+Outputs: SnapResult(eastM, northM, snapped, distanceToRoadM) — returns
+  the ORIGINAL point unsnapped if no segment is both close enough and
+  heading-compatible.
+Important functions/classes: snapToRoad() — for each segment, projects
+  the point onto it (clamped to the segment, not its infinite line),
+  keeps the nearest segment that also passes the heading check (checked
+  MODULO PI/180 degrees, since a route polyline's point order says
+  nothing about which way traffic flows — a vehicle heading along OR
+  exactly against a segment's stored direction both count as
+  compatible).
+Pure Kotlin, no Android dependency, unit-testable (CLAUDE.md Rule 19) —
+  see MapConstraintTest.kt (8 cases: basic snap, too-far rejection,
+  perpendicular-heading rejection, opposite-heading acceptance,
+  endpoint-clamping, nearest-of-multiple-segments regardless of list
+  order, degenerate-segment skip, no-segments no-op).
+Connected to: fusion/StateEstimator.kt -> MapConstraint.snapToRoad() ->
+  FusedPositionUiState.fusedEastM/fusedNorthM (only while GNSS isn't
+  already trusted, an active route + GNSS anchor exist, and DR speed is
+  above a reliable-heading floor) — see StateEstimator.kt's own entry.
 
 UI (Compose screens)
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
 Purpose: Live map + status header (GNSS state, speed, motion class,
   alignment confidence), vehicle-mode selector (PRD.md Section 22). See
   the new `ui/theme/`, `ui/components/`, `ui/map/`, `ui/screens/` entries
-  immediately below for the full per-file writeup — `MapConstraint.kt`
-  above is still the only PLANNED piece of PRD.md Section 22's screen
-  (no real road-snapping exists).
+  immediately below for the full per-file writeup.
+UPDATE (Round 2, 2026-08-28): `ui/screens/MapScreen.kt`'s
+  `currentLatDeg`/`currentLonDeg` computation now applies `fusion/RoadSnap`
+  (see its entry above) when an active route exists and the position
+  isn't a live GNSS_AIDED fix — the last remaining PLANNED piece of
+  PRD.md Section 22's screen (real road-snapping) is now real. `activeRoute`'s
+  `remember` declaration was moved earlier in the composable (was
+  previously declared with the rest of the search/routing state, further
+  down) so this computation can read it.
 
 ui/theme/Color.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -2148,7 +2433,7 @@ Purpose: `LargeGlassCardRadius` = 40dp is a real, directly-inspected
 ui/theme/IdrTheme.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
 Purpose: Wraps Color.kt/Type.kt into a `MaterialTheme` (`darkColorScheme`).
-Connected to: MainActivity.kt -> IdrTheme -> DriveScreen (IdrSensorScreen,
+Connected to: MainActivity.kt -> IdrTheme -> MapScreen/HistoryScreen (IdrSensorScreen,
   the pre-Slice-8 debug screen, deliberately keeps its OWN internal
   `MaterialTheme` call untouched — nesting is harmless, the inner one wins).
 
@@ -2160,7 +2445,8 @@ Purpose: A REAL exported Figma asset — the "Current Location" icon
   crosshair glyph paths are kept; the Figma export's own background
   circle/blur was dropped since FloatingIconButton.kt supplies its own
   button chrome.
-Connected to: Figma node 16-1601 (exported 2026-08-25) -> ic_recenter.xml -> DriveScreen's recalibrate FloatingIconButton
+Connected to: Figma node 16-1601 (exported 2026-08-25) -> ic_recenter.xml ->
+  StatusOverlayContent's recalibrate FloatingIconButton (via MapScreen)
 
 res/drawable/ic_car.xml
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -2195,13 +2481,15 @@ Important concepts/assumptions: no real backdrop blur is applied —
   floor, so the translucent fill alone approximates Figma's frosted
   look; documented as a simplification, not silently dropped.
 Connected to: ui/theme/Color.kt (GlassSurface/GlassBorder), Shape.kt (GlassCardRadius) -> GlassCard -> DriftSummaryCard, StatusChip (background)
+  (used via StatusOverlayContent.kt -> MapScreen.kt, since 2026-08-30's DriveScreen removal)
 
 ui/components/StatusChip.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
 Purpose: Pill/chip primitive (Figma's pill-button convention,
   generalized into a colored-dot + label status indicator). Used for
   GNSS mode and the motion-state readout (FR10).
-Connected to: DriveScreen.kt -> StatusChip (GNSS mode, speed, motion state)
+Connected to: StatusOverlayContent.kt (used by MapScreen.kt, since 2026-08-30's
+  DriveScreen removal) -> StatusChip (GNSS mode, speed, motion state)
 
 ui/components/FloatingIconButton.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -2209,7 +2497,10 @@ Purpose: Circular floating icon button — Figma's "Navigation Button"
   component (Simple Components frame's search/recenter/settings cluster
   on the map screen), inspected directly: solid `#383E42` circle, 44dp.
   Used once, for the manual recalibrate action (PRD Section 15/31/32).
-Connected to: DriveScreen.kt -> FloatingIconButton(ic_recenter) -> MainActivity's onRecalibrate -> MlVelocityRepository.resetAlignment()
+Connected to: StatusOverlayContent.kt (used by MapScreen.kt, since 2026-08-30's
+  DriveScreen removal) -> FloatingIconButton(ic_recenter) -> MainActivity's
+  onRecalibrate -> alignment/AlignmentRepository.reset() (2026-08-30; previously
+  MlVelocityRepository.resetAlignment(), removed)
 
 ui/components/VehicleModeSelector.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -2221,67 +2512,382 @@ Important concepts/assumptions: LOCAL UI STATE ONLY (CLAUDE.md Rule 8)
   — nothing in the pipeline currently branches on vehicle type; this is
   a real, working control that stores a selection without yet changing
   any physics/ML behavior, and is not pretending to.
-Connected to: DriveScreen.kt -> VehicleModeSelector -> (local state only, no downstream consumer yet)
+Connected to: StatusOverlayContent.kt (used by MapScreen.kt, since 2026-08-30's
+  DriveScreen removal) -> VehicleModeSelector -> (local state only, no downstream consumer yet)
 
 ui/components/DriftSummaryCard.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
 Purpose: PRD.md Section 30 WOW-factor #4 — shows the REAL measured
   drift number fusion/DriftSummary.kt computed, on a GlassCard at the
   large (40dp, directly-inspected) radius. Dismissible — the caller
-  (DriveScreen) owns the dismissed/shown state, this component has no
-  internal visibility logic.
-Connected to: fusion/StateEstimator.kt (FusedPositionUiState.driftSummary) -> DriveScreen.kt -> DriftSummaryCard
+  (StatusOverlayContent) owns the dismissed/shown state, this component
+  has no internal visibility logic.
+Connected to: fusion/StateEstimator.kt (FusedPositionUiState.driftSummary) ->
+  StatusOverlayContent.kt (used by MapScreen.kt, since 2026-08-30's
+  DriveScreen removal) -> DriftSummaryCard
+
+ui/components/GnssModeChangeBanner.kt
+Status: IMPLEMENTED (new file, 2026-08-29)
+Purpose: User-requested "popup when switching from gnss aided to dead
+  reckoning mode". A transient, non-blocking banner (solid
+  DeadReckoningColor background, white text, auto-dismisses after 4s or
+  on manual X tap) shown inline at the top of ui/screens/
+  StatusOverlayContent.kt — deliberately NOT a blocking AlertDialog,
+  since this app's whole point is honest, UNINTERRUPTED navigation
+  through a GNSS outage (CLAUDE.md Mission); a modal the driver has to
+  dismiss the instant GNSS drops would work against that.
+Important concepts/assumptions: StatusOverlayContent triggers this off
+  gnss/GnssModeRepository's own `lastTransition` (already logged per
+  CLAUDE.md Rule 17), narrowed to `fromMode == TRANSITION && toMode ==
+  DEAD_RECKONING` — the one path into DEAD_RECKONING that genuinely
+  started from GNSS_AIDED (see gnss/GnssOutageDetector.kt's state
+  diagram). A REACQUISITION bail-back also lands in DEAD_RECKONING but
+  is excluded on purpose — it was never GNSS_AIDED to begin with, and
+  showing this on every failed reacquisition attempt during a marginal-
+  GNSS stretch would be noisy, not honest signal. `dismissedTransitionAtMs`
+  (StatusOverlayContent-local state, keyed by the transition's own
+  timestamp) lets the banner re-show on a SECOND real outage later in the
+  same session instead of staying permanently dismissed after the first.
+UPDATE (2026-08-31, STATUS_AND_ROADMAP.md Tier-1 item #2): the symmetric
+  "GNSS reacquired" direction is now built too —
+  `GnssReacquiredBanner`, a second public composable in this same file,
+  sharing layout/dismiss behavior with `GnssModeChangeBanner` via a new
+  private `ModeChangeBanner(title, message, backgroundColor, onDismiss,
+  ...)` both now call (extracted once a second real caller existed).
+  Solid `GnssAidedColor` background (the same color already used for the
+  GNSS_AIDED status chip) marks it as the "good news" counterpart to
+  `GnssModeChangeBanner`'s `DeadReckoningColor` alert. Triggered by
+  StatusOverlayContent's new `showReacquiredBanner`, narrowed the same
+  way as `showModeChangeBanner`: `fromMode == REACQUISITION && toMode ==
+  GNSS_AIDED` (a GENUINE outage actually ending), excluding a
+  `TRANSITION -> GNSS_AIDED` recovery blip that was never long enough to
+  have shown the "lost" banner in the first place. Own
+  `dismissedReacquisitionAtMs` state, same per-timestamp-dismiss pattern.
+Connected to: gnss/GnssModeRepository.kt (GnssModeUiState.lastTransition) ->
+  StatusOverlayContent.kt -> GnssModeChangeBanner / GnssReacquiredBanner
+
+ui/map/StreetMapView.kt
+Status: IMPLEMENTED (Slice 8b) — marker/heading smoothing +
+  directional heading arrow, both merged 2026-08-30 from two
+  independently-built implementations (see MERGE NOTE below)
+Purpose: Real osmdroid/OpenStreetMap tile base layer plus the
+  current-position halo/ring marker, outage-anchor dashed line, and
+  active-route polyline — see this file's own extensive header doc
+  comment for the CARTO->MAPNIK tile-source history and the
+  setCenter-vs-animateTo camera-follow bug fix.
+UPDATE (Round 2 UI smoothness pass, 2026-08-28): the marker position and
+  map rotation (`setMapOrientation`) used to be set directly inside the
+  `AndroidView` `update` block, which only re-runs on a real GNSS/DR tick
+  (~5-10Hz) — visibly stepping/teleporting rather than gliding, since the
+  display itself refreshes at ~60Hz. `update` now only writes
+  `targetPosition`/`targetHeadingDeg` (MutableState); a separate
+  `LaunchedEffect(mapView) { while(true) { withFrameNanos {} ... } }` loop
+  polls them every display frame and chases them via
+  `ui/map/PositionSmoother` (see its own entry below), setting
+  `overlay.position`/`mapView.setMapOrientation()` from the SMOOTHED
+  value. The recenter-button's `onClick` snaps to `targetPosition` (the
+  TRUE position) rather than `overlay.position` (now a lagged cosmetic
+  value). The follow/pan recenter logic (`isFollowingLocation`,
+  `MIN_RECENTER_DISTANCE_M`, `lastCenteredPoint`) is UNCHANGED and still
+  keys off the raw currentLatDeg/currentLonDeg, not the smoothed display
+  value — camera recentering decisions stay based on real movement.
+UPDATE (STATUS_AND_ROADMAP.md Tier-1 item #1): a `markerHeadingDeg:
+  Float?` param (fed from MapScreen's already-computed `headingDeg`, not
+  gated to `isNavigating` the way the map-rotation `headingDeg` param is)
+  rotates the marker into a directional chevron/arrow
+  (`CurrentPositionOverlay.iconRotationDeg`, drawn in place of the plain
+  dot) instead of a non-directional dot. A `targetMarkerHeadingDeg`
+  MutableState feeds this into the SAME per-frame smoothing loop above
+  (a `stepPosition`/`stepHeading` sibling, not a THIRD independent
+  animation path) — the rotation subtraction (`markerHeadingDeg -
+  mapOrientationDeg`, so the arrow always points at the REAL device
+  heading regardless of whether the map itself is currently north-up or
+  heading-up-rotated) has to use the SMOOTHED `mapOrientationDeg` that
+  loop just applied, not a value computed synchronously in `update`,
+  since the map's actual on-screen rotation lags the raw target by
+  design. UNVERIFIED ON A REAL DEVICE (CLAUDE.md Rule 13), same caveat
+  the pre-existing map-rotation `headingDeg` param already carried.
+UPDATE (Round 2, 2026-08-28, user report: "glitchy buffer... large pixel
+  tiles of some random places" after pressing Go, needing a manual
+  recenter tap to fix): REAL BUG — the `LaunchedEffect(routeGeometry)`
+  block's `zoomToBoundingBox()` call (route-preview zoom-to-fit) fired
+  WITHOUT the `isProgrammaticMove` guard the marker-recenter logic
+  already used, so osmdroid's own onScroll/onZoom callbacks (fired BY
+  that call itself) were misclassified by the `MapListener` as a REAL
+  user gesture, permanently flipping `isFollowingLocation` off the
+  moment a route was computed. Fixed by wrapping the call in the SAME
+  `isProgrammaticMove` guard, AND switching `zoomToBoundingBox`'s
+  `animated` argument from true to false — an ANIMATED call fires its
+  scroll/zoom callbacks asynchronously over several frames, after a
+  synchronously-reset flag would already be back to false, so only an
+  instant jump lets the guard actually cover every callback it causes.
+UPDATE (Round 2, 2026-08-28, user report: "line terminating vaguely" —
+  no destination marker): `CurrentPositionOverlay` gained a `destination:
+  GeoPoint?` field (set from `routeGeometry?.lastOrNull()` in `update` —
+  the route's own last geometry point IS the destination, no separate
+  geocode lookup needed) and a `drawPin()` private method — a classic
+  map-pin silhouette (circular head + triangular tail) drawn with Canvas
+  primitives. The tail's POINT (not the head's center) lands exactly on
+  the destination coordinate, matching how every real map app anchors a
+  pin at its tip.
+MERGE NOTE (2026-08-30): the two Round 2 branches independently built
+  DIFFERENT marker-smoothing mechanisms — this file's own
+  `ui/map/PositionSmoother`-based continuous 60fps chase loop (above),
+  vs. a separate `LaunchedEffect(currentLatDeg, currentLonDeg)` one-shot
+  300ms tween (`MARKER_ANIMATION_DURATION_MS`) that also wrote directly
+  to `overlay.position`. Kept only the PositionSmoother version — it
+  also smooths map rotation (the tween didn't) and already covered the
+  directional-arrow rotation math once `targetMarkerHeadingDeg` was
+  folded in; running both would have left two writers fighting over
+  `overlay.position` every frame. The tween's `LaunchedEffect` and the
+  now-unused `MARKER_ANIMATION_DURATION_MS` constant were deleted.
+Connected to: ui/screens/MapScreen.kt (currentLatDeg/currentLonDeg,
+  headingDeg, markerHeadingDeg) -> StreetMapView -> CurrentPositionOverlay;
+  ui/map/PositionSmoother -> StreetMapView.kt
 
 ui/map/TrackCanvas.kt
-Status: IMPLEMENTED (Slice 8, 2026-08-25)
-Purpose: The map layer — a Compose `Canvas`, NOT a real map SDK
-  (decision made with the user during planning: zero new dependencies,
-  works fully offline for a demo about GNSS-DENIED navigation, plots
-  directly in the local East/North meters fusion/StateEstimator already
-  produces — no new geodesy needed). Styling borrows Google Maps'
-  LAYOUT pattern (dot-with-ring current position, accuracy halo,
-  polyline route) but renders entirely in the Figma-extracted dark
-  palette — NOT a separate light "Google palette" (an earlier planning
-  draft proposed one; the user explicitly corrected this before
-  implementation — see this file's own doc comment for the full note).
-Important concepts/assumptions: the current-position dot is always
-  drawn at canvas CENTER (a "follow-me" navigation view) — the outage
-  anchor is what moves in screen space as the fused position grows.
-  HONEST SIMPLIFICATION (CLAUDE.md Rule 13): draws a single STRAIGHT
-  line from the outage anchor to the current fused position during
-  DEAD_RECKONING/REACQUISITION, NOT a true curved path — nothing in
-  this codebase accumulates a full position-history polyline
-  (StateEstimator only ever publishes the CURRENT position per tick).
-  This shows the NET divergence since the outage began, not the literal
-  path shape; the real GNSS-vs-DR comparison at reacquisition is exact
-  (see DriftSummaryCard/DriftSummary). `METERS_TO_PIXELS = 8f` is an
-  engineering default, unvalidated (Rule 13).
-Connected to: fusion/StateEstimator.kt (FusedPositionUiState) -> DriveScreen.kt -> TrackCanvas
+Status: REMOVED (2026-08-30) — was IMPLEMENTED (Slice 8, 2026-08-25)
+Purpose (historical): The map layer for the DRIVE tab — a Compose
+  `Canvas`, NOT a real map SDK (decision made with the user during
+  planning: zero new dependencies, works fully offline for a demo about
+  GNSS-DENIED navigation, plots directly in the local East/North meters
+  fusion/StateEstimator already produces — no new geodesy needed).
+  Styling borrowed Google Maps' LAYOUT pattern (dot-with-ring current
+  position, accuracy halo, polyline route) but rendered entirely in the
+  Figma-extracted dark palette. Deleted along with ui/screens/
+  DriveScreen.kt (its only caller) once ui/screens/MapScreen.kt's real
+  street map + routing made the abstract grid redundant — MapScreen
+  already showed the same StatusOverlayContent, so the DRIVE tab added
+  no capability MapScreen didn't already have (user-reported: "the drive
+  page ... is doing nothing").
+
+android/app/src/main/kotlin/com/sih26168/idr/ui/map/PositionSmoother.kt
+Status: IMPLEMENTED (Round 2, 2026-08-28)
+Purpose: Frame-rate marker/heading smoothing for `ui/map/StreetMapView.kt`
+  (originally also shared by `ui/map/TrackCanvas.kt`'s Drive-tab abstract
+  grid — see that file's REMOVED entry above; that consumer is gone, this
+  class isn't). GNSS/DR position updates
+  arrive at ~5-10Hz, but the display refreshes at ~60Hz, so drawing
+  directly from the latest tick made the marker/anchor/map-rotation
+  visibly step in small discrete jumps instead of gliding. Pure Kotlin,
+  no Android/Compose dependency, unit-testable (CLAUDE.md Rule 19 — a
+  filter, even a cosmetic one, gets a test).
+Inputs: stepPosition(targetLatOrEastM, targetLonOrNorthM) — units-
+  agnostic (lat/lon degrees for StreetMapView, local meters for
+  TrackCanvas, same exponential-smoothing math either way);
+  stepHeading(targetHeadingDeg) — degrees, 0-360.
+Outputs: the smoothed position/heading, one step closer to the target
+  each call.
+Important functions/classes: stepPosition() — exponential ("chase")
+  smoothing: `new = prev + (target - prev) * smoothingFactor`
+  (default 0.25/frame, tuned by feel per CLAUDE.md Rule 13, not measured
+  — ~94% of any gap closed within ~10 frames/~166ms at 60fps); the
+  FIRST-EVER target snaps directly (nothing to glide from yet).
+  stepHeading() — same idea, but interpolates CIRCULARLY via sin/cos
+  (duplicates the technique fusion/HeadingFusion.kt already uses for its
+  own, UNRELATED, REACQUISITION-blend concern — accepted small
+  duplication rather than coupling the ui/map package to fusion/'s
+  private internals for two ~10-line functions, CLAUDE.md Rule 2's
+  "smallest practical stack" cuts both ways); reset().
+Important concepts/assumptions: deliberately NOT a Kalman filter or
+  predictive smoothing — a cosmetic display concern, not a position-
+  estimation one (the real fusion math is untouched, lives entirely in
+  fusion/PositionFusion.kt/HeadingFusion.kt). HONEST LIMITATION: after a
+  long gap with no target updates (e.g. the Pause button), the next real
+  target can be far from the last displayed one, producing a brief fast
+  slide rather than an instant snap — not specially handled, an accepted
+  minor cosmetic edge case.
+Connected to: ui/map/StreetMapView.kt -> PositionSmoother
+Unit tests: tests/.../ui/map/PositionSmootherTest.kt — null target
+  returns null; first-ever target snaps; a second step closes the gap by
+  exactly the configured smoothingFactor (hand-derived); repeated
+  identical-target steps converge; heading interpolates the SHORT way
+  across the 0/360 wrap boundary (same wrap case HeadingFusionTest
+  covers for its own class); reset() clears both position and heading
+  state so the next step snaps again.
 
 ui/screens/DriveScreen.kt
-Status: IMPLEMENTED (Slice 8, 2026-08-25)
-Purpose: Slice 8's primary screen (PRD.md Section 22's "single main
-  screen") — composes TrackCanvas as the base layer, a status overlay
-  (StatusChip for GNSS mode/speed/motion state, an alignment readout —
-  FR10), VehicleModeSelector (pre-drive, PRD Section 6), the recalibrate
-  FloatingIconButton, and DriftSummaryCard (shown once real drift data
-  exists). A pure function of already-real state (CLAUDE.md Rule 8) —
-  every value traces back to the same repositories IdrSensorScreen
-  already reads.
-Important functions: `estimateSpeedMps()` — real GNSS speed while
-  GNSS_AIDED, else the ML velocity if that's fusion/StateEstimator's
-  active DR source, else the physics velocity's magnitude (already
-  ZUPT-corrected). `estimateMotionLabel()` — PRD.md FR10's "current
-  motion class," but ONLY the real, implemented subset: Pothole ->
-  Cruising -> Stationary (near-zero ZUPT-corrected physics velocity) ->
-  a generic "Moving" fallback. No Turning/Accelerating/Braking/
-  Phone-Moved label is ever shown, since those detectors don't exist
-  (CLAUDE.md Rule 13) — this project only implements a partial subset
-  of PRD.md Section 14's 8-class taxonomy (see motion/ entries above).
-Connected to: BaselineDeadReckoningRepository, GnssModeRepository,
-  MlVelocityRepository, StateEstimator (all read-only, via MainActivity) ->
-  DriveScreen -> TrackCanvas/StatusChip/VehicleModeSelector/
-  FloatingIconButton/DriftSummaryCard
+Status: REMOVED (2026-08-30) — was IMPLEMENTED (Slice 8, 2026-08-25)
+Purpose (historical): Slice 8's primary screen (PRD.md Section 22's
+  "single main screen") — composed TrackCanvas as the base layer, plus
+  StatusOverlayContent (StatusChip for GNSS mode/speed/motion state, an
+  alignment readout — FR10), VehicleModeSelector, the recalibrate
+  FloatingIconButton, and DriftSummaryCard. Superseded by ui/screens/
+  MapScreen.kt (Slice 8b, real street tiles + routing) which reuses the
+  same StatusOverlayContent — see TrackCanvas.kt's entry above for the
+  removal reason. AppTab.DRIVE was removed from ui/components/
+  BottomNavBar.kt at the same time; MainActivity now defaults to
+  AppTab.MAP and treats MAP as the back-button "home" tab.
+```
+
+```
+ui/screens/MapScreen.kt
+Status: IMPLEMENTED
+Purpose: The MAP tab (now the app's default/home tab — see
+  MainActivity.kt entry) — real OpenStreetMap tiles
+  (ui/map/StreetMapView), destination search + routing
+  (routing/GeocodingRepository Nominatim + routing/RoutingRepository
+  OSRM), and turn-by-turn navigation, using StatusOverlayContent for the
+  GNSS/DR status readout; search/routing is layered on top as its own
+  state machine (idle -> destination selected -> route active ->
+  navigating).
+Search UI: (changed 2026-08-28, user-requested "search destination like
+  Google Maps, redirects to map page when searched") the idle state no
+  longer shows a live, typeable dropdown floating over the map tiles.
+  It now shows a collapsed, tappable bar (search icon + placeholder or
+  the selected destination's name); tapping it sets `showSearchScreen =
+  true`, which renders ui/screens/SearchScreen.kt as a full-page overlay
+  covering this entire screen — same manual boolean-state screen-swap
+  pattern MainActivity already uses for its debug screen / tab
+  switching, one level down. SearchScreen owns the live query/results/
+  debounced-Nominatim-search state itself now (moved out of MapScreen);
+  MapScreen only receives the FINAL picked GeocodeResult via
+  `onResultSelected`, which sets `selectedDestination` and closes the
+  overlay — landing back on the map with the "Start" routing button, the
+  same as before. A `BackHandler(enabled = showSearchScreen)` closes the
+  search page on system Back (added after, so it wins over
+  MainActivity's own tab-level BackHandler while the page is open).
+Automatic tile prefetch (added 2026-08-29, user-requested "smoother
+  working"): the instant `RoutingRepository.computeRoute` succeeds
+  (Start button's onClick), silently calls
+  `routing/OfflineRouteCache.prefetchLiveZoomTiles` on `route.geometry`
+  before the routing UI even updates — separate from, and lighter than,
+  ActiveRouteCard's existing explicit "Download offline" button (see
+  OfflineRouteCache.kt's own doc for the single-zoom-level-vs-full-range
+  tradeoff this was deliberately scoped against, a user decision). Best-
+  effort: a null `mapViewRef` (shouldn't happen — the user is looking at
+  the map to reach this button — but not asserted) just skips the
+  prefetch silently, same "optimization, not a promise" spirit as that
+  function's own silent-failure behavior. Verified on-device by clearing
+  the app's osmdroid tile cache, computing one route, and confirming via
+  a pulled+inspected cache.db that tile rows went from 0 to 24 with the
+  explicit download button never touched.
+REAL CRASH FOUND + FIXED (2026-08-29, user report: "if i start the
+  destination the app is closing"): the automatic prefetch above turned
+  out to crash the whole app on EVERY route computation.
+  `CacheManager.downloadAreaAsync()` runs on an AsyncTask and throws
+  `TileSourcePolicyException` from INSIDE that background task's
+  `doInBackground()` when the tile source's policy rejects bulk
+  downloads — the only try/catch `OfflineRouteCache.downloadTiles` had
+  (around the `CacheManager(mapView)` constructor call) can never catch
+  that, since the exception happens later, asynchronously, on the
+  AsyncTask's own thread. Root cause confirmed via `adb logcat -b crash`
+  + decompiling the bundled osmdroid-android-6.1.20 runtime jar with
+  `javap`: `TileSourceFactory.MAPNIK` is built with
+  `new TileSourcePolicy(2, 15)` — flags=15 sets `FLAG_NO_BULK`, so
+  osmdroid PERMANENTLY refuses bulk/CacheManager downloads against
+  MAPNIK, honoring OpenStreetMap's own real tile usage policy
+  (operations.osmfoundation.org/policies/tiles — "no bulk downloading"
+  against the free tile.openstreetmap.org server). This was silently
+  broken since `ui/map/StreetMapView.kt`'s 2026-08-26 CARTO->MAPNIK
+  switch — ActiveRouteCard's pre-existing explicit "Download offline"
+  button has carried this EXACT SAME crash ever since, just apparently
+  never tapped/tested against MAPNIK until the automatic prefetch above
+  started exercising this code path again on every route. Fixed in
+  `routing/OfflineRouteCache.kt`'s `downloadTiles` by checking
+  `OnlineTileSourceBase.getTileSourcePolicy().acceptsBulkDownload()`
+  BEFORE calling `downloadAreaAsync` (mirroring CacheManager's own
+  internal `preCheck()`), failing synchronously via `onFailed()` instead
+  of crashing asynchronously. HONEST CONSEQUENCE (CLAUDE.md Rule 13):
+  since this restriction is PERMANENT for MAPNIK, both
+  `downloadRouteTiles` and `prefetchLiveZoomTiles` now always/only call
+  `onFailed()` and never actually cache anything — bulk tile pre-fetch
+  cannot work AT ALL against the current tile source. MapScreen.kt's
+  explicit-button failure message was also corrected from "check
+  network" (implies a retriable transient cause) to "isn't available
+  for this map source right now" (the real, permanent cause). NOT YET
+  DECIDED: whether to keep this as a permanently-safe no-op, remove the
+  offline-download feature entirely, or switch to a tile source whose
+  policy allows bulk download — flagged to the user, not decided here.
+  Verified on-device: reproduced the crash pre-fix (`ps` showed the
+  process gone; the crash buffer had the full
+  `TileSourcePolicyException` stack trace), then confirmed post-fix that
+  computing the same route succeeds end-to-end (ActiveRouteCard renders
+  a real distance/duration/steps) with the process still alive and the
+  crash buffer empty.
+Connected to: routing/GeocodingRepository, routing/RoutingRepository,
+  routing/OfflineRouteCache, fusion/GeoProjection, ui/screens/SearchScreen
+  (new, opened on demand) -> ui/components/ActiveRouteCard/
+  NavigationInstructionCard/NavigationEtaBar
+```
+
+```
+ui/screens/SearchScreen.kt
+Status: IMPLEMENTED (new file, 2026-08-28; restyled 2026-08-29)
+Purpose: Full-page destination search, Google Maps' own pattern — opened
+  by MapScreen when its collapsed search bar is tapped, covers the whole
+  screen rather than drawing a dropdown over the live map. Owns the
+  debounced (~500ms, Nominatim's ~1 req/sec usage-policy cap) live
+  query/results/error state that used to live inline in MapScreen.
+Restyled 2026-08-29 (user-supplied Google Maps search-screen screenshot,
+  "implement the same in my app"): rounded search pill (back arrow + text
+  field + mic/clear button), a Home/Work quick-access row, and a "Recent"
+  list shown while the query is empty — matching the reference layout.
+  Two pieces needed real data behind them rather than static copies of
+  the screenshot (CLAUDE.md Rule 13):
+   - Home/Work read/write through the new routing/SavedPlacesRepository
+     (SharedPreferences) — a slot is genuinely unset ("Set location") until
+     the user picks a place for it. Tapping an unset slot puts the screen
+     into a `settingSlot` mode: the next result tapped is SAVED to that
+     slot (and also handed back via onResultSelected) instead of just
+     being searched.
+   - "Recent" reads/writes through the new routing/RecentSearchRepository
+     (SharedPreferences + org.json), most-recent-first, capped at 8,
+     recorded whenever a result is picked outside `settingSlot` mode.
+  Two things visible in the reference were deliberately NOT built:
+   - Per-row business-hours status ("Open · Closes 22:00") — Nominatim
+     (this app's only geocoding source) has no opening-hours data to show
+     there, so it's left out rather than invented.
+   - The third "… More" shortcut (opens additional saved lists in real
+     Google Maps) — this app has no additional saved-place concept, so
+     there's nothing for it to open; a non-functional button would be a
+     fake affordance.
+  The mic button uses Android's own `android.speech.RecognizerIntent`
+  (platform API, no new dependency) to launch the system speech-
+  recognition UI and read back its real transcribed text; a device with
+  no speech-recognition app shows a real error (Toast), not a silent
+  no-op. New icons (no material-icons-extended dependency, CLAUDE.md
+  Rule 2 — same reasoning as ic_car.xml/ic_motorcycle.xml/ic_walk.xml):
+  res/drawable/ic_home.xml, ic_work.xml, ic_mic.xml, ic_recent.xml (hand-
+  drawn), ic_place.xml (standard AOSP Material "place" glyph, reused
+  directly rather than pulled in via the extended icon pack).
+Inputs: `initialQuery` (prefills the field, e.g. re-opening on an
+  already-picked destination), `onBack`, `onResultSelected`.
+Outputs: calls `onResultSelected(GeocodeResult)` when a result is
+  tapped — does not navigate itself; the caller (MapScreen) closes the
+  overlay and acts on the result.
+Connected to: routing/GeocodingRepository.search, routing/
+  SavedPlacesRepository, routing/RecentSearchRepository -> SearchScreen ->
+  MapScreen (onResultSelected/onBack callbacks only, no shared state)
+Important concepts: no navigation library added (CLAUDE.md Rule 2) —
+  this is a plain Composable shown/hidden by a boolean in the caller,
+  consistent with every other screen swap in this app.
+```
+
+```
+routing/SavedPlacesRepository.kt
+Status: IMPLEMENTED (new file, 2026-08-29)
+Purpose: Persists the user's own Home/Work locations (SharedPreferences,
+  full-precision lat/lon stored as strings, not Float, to avoid a silent
+  precision loss). A slot (`SavedPlaceSlot.HOME`/`WORK`) reads back null
+  until the user has actually picked a location for it via SearchScreen —
+  never a placeholder or guessed address (CLAUDE.md Rule 13).
+Inputs: `get(context, slot)`, `save(context, slot, GeocodeResult)`.
+Outputs: `GeocodeResult?` per slot.
+Connected to: ui/screens/SearchScreen.kt (only caller)
+```
+
+```
+routing/RecentSearchRepository.kt
+Status: IMPLEMENTED (new file, 2026-08-29)
+Purpose: Persists the user's own past destination picks (SharedPreferences
+  + org.json, most-recent-first, deduped by display name, capped at 8) so
+  SearchScreen's "Recent" section shows real history, not sample data. A
+  corrupt local cache recovers to an empty list (logged) rather than
+  crashing the search screen.
+Inputs: `getRecent(context)`, `add(context, GeocodeResult)`.
+Outputs: `List<GeocodeResult>`, most-recent-first.
+Connected to: ui/screens/SearchScreen.kt (only caller)
 ```
 
 ### ml/
@@ -2726,492 +3332,6 @@ properties of the trip data itself, not of which tree it's read from):
 
 ## Change log
 
-- Initial skeleton created alongside PRD.md and CLAUDE.md, before any
-  implementation. No code exists yet.
-- Phase 0 scaffold: created `android/`, `ml/`, `data/`, `models/`,
-  `docs/`, `scripts/`, `tests/` per CLAUDE.md File Organization; moved
-  `PROJECT_MAP.md` from repo root into `docs/` to match it; added a
-  minimal buildable-once-synced Android Gradle+Compose skeleton
-  (placeholder `MainActivity`, no sensor/location code), `ml/`
-  dependency pins with no training scripts yet, directory-purpose docs
-  for `data/`, `models/`, `scripts/`, `tests/`, and a root `.gitignore`.
-  See `## Scaffold Status` above for the itemized list. Next: Slice 1
-  (Android sensor -> live sensor display).
-- Slice 1 implemented: `sensors/{SensorSample,SampleRate,SensorRepository}.kt`
-  read live accelerometer + gyroscope at ~10 Hz on a background thread
-  and publish via StateFlow; `MainActivity.kt` displays the latest
-  sample and observed Hz. Added a JUnit4 unit test for the Hz
-  calculation (CLAUDE.md Rule 19). Also installed a headless Gradle 8.7
-  toolchain (`android/gradlew(.bat)` + committed wrapper jar) since none
-  existed in this environment, and pointed `local.properties` at the
-  pre-existing Android SDK. `./gradlew test` and `./gradlew assembleDebug`
-  both pass.
-- On-device verification (2026-08-25): installed and ran Slice 1 on a
-  real Samsung Galaxy S24 FE (Android 16 / One UI 8.5) over USB ADB.
-  Live accel/gyro readout confirmed working, observed rate ~12.5 Hz.
-  Phase 1 (Slice 1) is now complete and hardware-verified. Next: Slice 2
-  (sensor -> orientation).
-- Slice 2 implemented (2026-08-25): added `OrientationSample` (device-
-  vs-world frame, rad) to `SensorSample.kt` and `OrientationMath.kt` — a
-  pure-Kotlin quaternion -> azimuth/pitch/roll conversion mirroring
-  AOSP's own SensorManager algorithm, unit-tested on the plain JVM
-  (`OrientationMathTest.kt`, 5 cases; CLAUDE.md Rule 19). Registered the
-  TYPE_ROTATION_VECTOR listener in `SensorRepository.kt` alongside
-  accel/gyro; `MainActivity.kt` now displays live azimuth/pitch/roll in
-  degrees (rad->deg conversion only at that display boundary, CLAUDE.md
-  Rule 15). Deliberately did NOT build vehicle-frame alignment
-  (PRD.md Section 15) in this slice — that needs a GNSS-aided
-  initialization window and GNSS isn't read until a later slice.
-  `./gradlew test` — all 9 tests pass. Installed on the same S24 FE via
-  `./gradlew installDebug`; live orientation readout confirmed updating
-  on screen, user-verified. Slice 1+2 complete and hardware-verified.
-  Next: Slice 3 (sensor -> baseline physics velocity/position).
-- Slice 3 implemented (2026-08-25): added a `dr/` package (deliberately
-  separate from `sensors/` — CLAUDE.md Rule 5) with `WorldFrameAcceleration.kt`
-  (pure: rotate device-frame accel into WORLD frame via Slice 2's
-  rotation matrix, then remove gravity) and `BaselinePhysicsIntegrator.kt`
-  (pure: semi-implicit-Euler double integration to a 2D East/North
-  position + velocity — PRD.md Section 32's physics-baseline fallback
-  path, deliberately naive with no ZUPT/bias correction so it drifts
-  fast, by design). `BaselineDeadReckoningRepository.kt` is the Android/
-  coroutine glue that collects SensorRepository's StateFlow, dedupes
-  by accel timestamp, and feeds the two pure classes. Extended
-  `OrientationSample` with `rotationMatrixDeviceToWorld` (List<Float>,
-  not FloatArray — avoids Kotlin's data-class array-equality footgun)
-  since Slice 3 needs the raw matrix, not just azimuth/pitch/roll;
-  `SensorRepository.kt` now keeps that matrix instead of discarding it.
-  Added `SampleRate.secondsFromDeltaNs` alongside the existing Hz
-  function. `MainActivity.kt` displays the live position/velocity with
-  an explicit on-screen caption that it's a naive baseline expected to
-  drift (CLAUDE.md Rule 13's honesty requirement applied to in-app copy,
-  not just final reported numbers). Added `WorldFrameAccelerationTest.kt`
-  and `BaselinePhysicsIntegratorTest.kt` (CLAUDE.md Rule 19) — the
-  integrator test checks against a hand-derived closed-form result, not
-  just "looks plausible." `./gradlew test` — all 19 tests pass. Installed
-  on the same S24 FE via `./gradlew installDebug`; live position/velocity
-  readout confirmed updating on screen, user-verified. Slice 1+2+3
-  complete and hardware-verified, no ML anywhere yet. Next: Slice 4
-  (GNSS outage detection) — needed before phone-to-vehicle alignment
-  (PRD.md Section 15) can be attempted, since that needs a GNSS-aided
-  initialization window.
-- Slice 4 implemented (2026-08-25): new `gnss/` package. `GnssFix.kt`
-  (wall-clock-timestamped fix data, explicitly NOT reconciled against
-  boot-time sensor timestamps yet, CLAUDE.md Rule 9/14).
-  `GnssQuality.kt` (pure: is a fix good enough right now, by age +
-  accuracy). `GnssOutageDetector.kt` (pure: the GNSS_AIDED/TRANSITION/
-  DEAD_RECKONING/REACQUISITION hysteresis state machine, PRD.md
-  Section 18 — separate enter/exit dwell times per CLAUDE.md Rule 16,
-  every transition logged with trigger condition per Rule 17).
-  `LocationRepository.kt` (Android glue: FusedLocationProviderClient at
-  ~1 Hz, requires runtime ACCESS_FINE_LOCATION). `GnssModeRepository.kt`
-  (Android/coroutine glue: evaluates the detector on its own 5 Hz timer,
-  independent of the sensor pipeline so GNSS detection works even if
-  IMU sensors are unavailable — CLAUDE.md Rule 5). `MainActivity.kt`
-  now requests location permission at runtime
-  (ActivityResultContracts.RequestPermission) and displays live GNSS
-  mode/fix/last-transition. Added `GnssQualityTest.kt` and
-  `GnssOutageDetectorTest.kt` (13 cases, CLAUDE.md Rule 19) — including
-  explicit "one ms before the dwell threshold" boundary checks, not just
-  "eventually transitions." `./gradlew test` — all 32 tests pass.
-  TRANSITION/REACQUISITION are state-only in this slice; actual
-  GNSS/DR position blending is deferred to Slice 7 (Fusion /
-  re-alignment on GNSS reacquisition), matching CLAUDE.md's slice order.
-  On-device: hit and fixed a real bug in `BaselineDeadReckoningRepository`
-  (Slice 3 code) — the first accel sample of each run computed a
-  multi-thousand-second dt against a `0L` sentinel instead of treating
-  it as "no prior sample," sending the DR position to ~1e11 m
-  immediately on launch. Fixed with a nullable-Long sentinel (see that
-  file's entry above); re-verified via screenshot after the fix —
-  position/velocity now stay small at rest as expected. GNSS mode
-  readout confirmed via screenshot too: `DEAD_RECKONING` with the
-  correct trigger description, matching unit-tested behavior. Also hit
-  (and resolved) an unrelated ADB connectivity issue mid-session — the
-  Windows ADB USB interface got stuck in a stale `CM_PROB_PHANTOM`
-  driver state; restarting the ADB server and re-toggling USB debugging
-  on the phone fixed it, not a code or cable problem. Slice 1+2+3+4
-  complete and hardware-verified, no ML, no GNSS/DR fusion yet. Next:
-  Slice 5 (dead reckoning: state machine + ZUPT + non-holonomic
-  constraint).
-- Slice 5 implemented (2026-08-25): added `dr/StationaryDetector.kt`
-  (pure: sustained low accel+gyro magnitude, with the same dwell/
-  hysteresis principle as GnssOutageDetector, gates ZUPT — honestly
-  documented as unable to distinguish "at rest" from "coasting at
-  constant velocity," an inherent limit of accel/gyro-only ZUPT) and
-  `dr/NonHolonomicConstraint.kt` (pure: vector-projects velocity onto
-  device heading, suppressing the lateral component — a simplified
-  WORLD-frame stand-in for PRD.md Section 20's VEHICLE-frame constraint,
-  since phone-to-vehicle alignment doesn't exist yet; no Turning
-  exemption either, since the ML motion classifier is Slice 6).
-  Added `BaselinePhysicsIntegrator.overrideVelocity()` (sets velocity
-  only, leaves position untouched — distinct from `reset()`) as the
-  mechanism both corrections use. `BaselineDeadReckoningRepository.kt`
-  now depends on `GnssModeRepository` too: applies ZUPT/NHC every tick,
-  and resets the integrator every tick GNSS mode is GNSS_AIDED, so the
-  DR readout represents "distance traveled since GNSS was last good"
-  (PRD.md Section 28's actual drift-measurement target) rather than
-  drift since app launch — this is Slice 5's "state machine" wiring:
-  connecting Slice 4's previously-cosmetic mode to actually affect the
-  DR estimate, without yet blending GNSS and DR positions together
-  (that's Slice 7). `MainActivity.kt` construction order changed —
-  `GnssModeRepository` must now exist before `BaselineDeadReckoningRepository`.
-  Added `StationaryDetectorTest.kt` and `NonHolonomicConstraintTest.kt`
-  (12 cases total, CLAUDE.md Rule 19) plus 2 new BaselinePhysicsIntegratorTest
-  cases for `overrideVelocity()`. `./gradlew test` — all 46 tests pass.
-  Installed on the same S24 FE; two screenshots ~15 seconds apart at
-  rest confirmed position stays near-zero throughout (not just at
-  launch) — direct, visible proof ZUPT is working, versus Slice 4's
-  -0.85/-1.56 m drift over a similar period. The GNSS-mode-gated reset
-  couldn't be visually confirmed indoors (no real GPS lock available to
-  reach GNSS_AIDED) — verified by code inspection + existing
-  GnssOutageDetector tests instead; flagged for a direct outdoor check
-  later. Slice 1+2+3+4+5 complete and hardware-verified, no ML, no
-  GNSS/DR position fusion yet. Next: Slice 6 (ML inference: velocity +
-  motion classifier wired in) — requires Phase 4 dataset inspection
-  (PRD.md Section 24) first, since no training data has been looked at
-  yet.
-- Phase 4 (dataset inspection) done (2026-08-25): downloaded IO-VNBD's
-  Synchronised V+S dataset (~194 MB, Git LFS — see `data/README.md` for
-  the exact re-download command and checksum) into `data/raw/IO-VNBD/`
-  (gitignored, verified via `git check-ignore`), extracted it, and read
-  360 files on disk plus the dataset's own descriptor PDF in full. See
-  `## Phase 4 — Dataset inspection findings` above for the complete
-  writeup. Headline results: (1) confirmed real 10 Hz smartphone / 1 Hz
-  GPS sampling matching our target; (2) found a real, concrete
-  axis-convention mismatch between IO-VNBD's smartphone accelerometer/
-  gyroscope columns and Android's raw SensorEvent device frame (verified
-  by extracting and viewing the dataset's own axis diagram from the
-  PDF, not assumed) — this must be reconciled before Slice 6's
-  FeatureExtractor.kt exists; (3) confirmed IO-VNBD has no per-timestamp
-  motion-event labels, only trip-level free-text scenario tags — good
-  enough for the velocity model and Stationary-class weak labeling
-  (including 20+ minutes of dedicated stationary/bias-estimation
-  recordings, useful for tuning StationaryDetector's thresholds against
-  real data), not enough for Pothole/Phone-Moved without self-captured
-  supplementary data, which is now planned before Slice 6 classifier
-  training rather than assumed unnecessary. `data/README.md` updated
-  with the re-download procedure. Next: Slice 6 (ML inference), now
-  unblocked, starting with `ml/inspect_dataset.py` (turning this manual
-  inspection into a reproducible script) and `ml/feature_extraction.py`
-  (which must apply the axis-convention fix found here).
-- `ml/inspect_dataset.py` implemented (2026-08-25), and in writing it,
-  corrected the Phase 4 entry above: the 360 files on disk are NOT 72
-  unique trips — the download contains the same 72 trips duplicated
-  across "Categorised IOVNB Dataset" and "Uncategorised IOVNB Dataset"
-  (confirmed by diffing a sample pair: identical data modulo float64
-  repr noise and cosmetic header-name differences). A naive recursive
-  scan would have silently duplicated every trip across a future train/
-  val split — caught before any training happened, not after. Script
-  now scans only "Categorised..." by default and documents why.
-  Installed the rest of `ml/requirements.txt` (pandas/numpy/sklearn
-  were already present in this environment; onnx/onnxruntime/skl2onnx/
-  matplotlib/jupyter/pytest were not). Real run against the actual
-  downloaded dataset: 72 unique trips, 1,070,745 rows, 25.1 hours, all
-  24-column schema (Driver F's documented 20-column variant turns out
-  to not be present in this archive at all — it only exists in the
-  separate, not-downloaded "Unsynchronised" archive, corrected in the
-  Phase 4 findings above), all within Hz tolerance, all correctly
-  paired with a vehicle file. Also found (not previously known): ~800
-  rows in one trip have their satellite-count field corrupted into
-  date-like strings ("Dec-14") by what looks like an Excel auto-date-
-  conversion artifact somewhere in the dataset's prep — harmless for us
-  since satellite count isn't a feature either model uses. Also
-  corrected the Phase 4 findings' driver-count claim from 8 to 4 (only
-  Drivers A/B/D/E are present in the archive we have; the dataset PDF's
-  Table 1 describes all 8 drivers across BOTH archives). Added
-  `tests/ml/test_inspect_dataset.py` (5 cases, synthetic data, no
-  dependency on the real download) for the pure helper functions.
-  `python -m pytest tests/ml/test_inspect_dataset.py` — 5/5 pass.
-  Manifest written to `data/processed/io_vnbd_smartphone_manifest.csv`
-  (gitignored, reproducible). Next: `ml/feature_extraction.py`.
-- Second correction, same day (2026-08-25): while sanity-checking label
-  design ahead of `feature_extraction.py`, spot-checked whether GPS
-  speed genuinely updates every 10 Hz row and found it doesn't — the
-  `gps_latitude_deg`/`gps_speed_kmh` columns are held constant for ~90
-  consecutive rows (~9s) between real fix updates, not 1 Hz as
-  README_1.pdf documents. Verified across 4 different trips/drivers
-  before trusting it as systemic rather than a one-off. Added
-  `_observed_gps_fix_interval_s` to `inspect_dataset.py` (measures from
-  actual value-change timestamps) plus 2 new unit tests, reran against
-  the full dataset: 68/72 trips confirm ~9.0s, matching the earlier
-  spot-check. Corrected the Phase 4 findings and `inspect_dataset.py`'s
-  file entry above accordingly. This directly changes how
-  `feature_extraction.py` must compute PRD.md Section 13's "elapsed
-  time since last GNSS fix" feature (from measured ~9s intervals, not
-  assumed ~1s) and how training labels should be constructed (many
-  consecutive rows share one ground-truth value, not 90 independent
-  readings) — caught before writing that script, not after.
-  `python -m pytest tests/ml/test_inspect_dataset.py` — 7/7 pass. Next:
-  `ml/feature_extraction.py`, now designed with the correct GPS-timing
-  assumption from the start.
-- `ml/feature_extraction.py` implemented (2026-08-25) — vehicle-frame
-  windowed features via per-timestamp Gram-Schmidt against the recorded
-  gravity vector (see that file's entry above for the full design and
-  math). Before writing `train_velocity_model.py` against this output,
-  sanity-checked it by correlating windowed forward-acceleration against
-  real GPS speed changes across all 72 trips (13,902 segments) — found
-  it NEGATIVE (-0.136), backwards from physics. Root cause: the
-  dataset's own figure (trusted in the Phase 4 findings above) had the
-  forward-axis sign wrong relative to the actual data — the figure was
-  a claim, checking it against real ground truth is what caught it
-  (CLAUDE.md Rule 13). Fixed by flipping the forward axis to -device-Y;
-  re-verified correlation flips to +0.137 across the same 13,905
-  segments. Updated the Phase 4 findings above and this file's
-  `feature_extraction.py` entry with the correction. All 6 unit tests
-  updated to match the corrected sign and still pass; note the unit
-  tests alone (self-consistency checks) could never have caught this —
-  it required checking against real, independent ground truth. This is
-  exactly why CLAUDE.md Rule 18 says prototype small and verify before
-  building a large abstraction on an unverified assumption: a wrong
-  sign here would have silently produced a velocity model trained
-  backwards, likely undetected until real-world testing much later.
-  Next: `train_velocity_model.py`, now building on a vehicle-frame
-  feature set actually validated against real ground truth, not just
-  assumed correct from a diagram.
-- `train_velocity_model.py` implemented (2026-08-25) — RandomForest
-  velocity regressor, trip-level train/val split, evaluated against a
-  Python re-implementation of the app's own physics+ZUPT baseline on
-  the same held-out trips (CLAUDE.md Rule 3). Deliberately excluded
-  previous_gps_speed_mps as a feature despite PRD.md Section 13 listing
-  it — it's near-identical to the label itself given this dataset's
-  ~90-row GPS hold pattern, which would have let the model cheat by
-  copying it rather than learning from the IMU (caught before training,
-  not after seeing suspiciously perfect numbers). **Real result: ML
-  MAE=1.244 m/s vs Physics+ZUPT MAE=5.205 m/s — ~4.2x more accurate**,
-  winning on 13/14 held-out trips. See that file's entry above for the
-  full writeup including the one trip where physics won, the dominant
-  `accel_up_std_mps2` feature-importance finding (plausibly a real
-  vibration-based speed proxy, not necessarily a bug, but a
-  generalization risk worth flagging honestly), and the evaluation-scope
-  caveat (this measures per-tick accuracy, not simulated multi-minute
-  outage drift — that's Slice 9). This is the project's first real,
-  measured ML-vs-baseline comparison — CLAUDE.md Rule 3 is satisfied:
-  ML is justified for the velocity model, not assumed. Next:
-  `export_model.py` (ONNX export + parity check) now that there's a
-  result worth exporting.
-- `export_model.py` implemented (2026-08-25) — retrains on all 72
-  trips, exports to `models/velocity_v1.onnx` (20.7 MB, gitignored),
-  runs a real output-parity check (sklearn vs onnxruntime on 5,000 held-
-  out rows, not just "did it export"): max diff 0.000001 m/s, passed.
-  CLAUDE.md Rule 20 satisfied for the velocity model. On-device
-  latency/size are still unmeasured (desktop-only so far, CLAUDE.md
-  Rule 12) — that needs Slice 6's Kotlin VelocityModel.kt to exist
-  first. Slice 6's ml/ half (dataset inspection, feature extraction,
-  velocity model training + export) is now complete and real —
-  `train_motion_classifier.py` remains PLANNED (blocked on self-
-  captured Pothole/Phone-Moved data per the Phase 4 findings), and the
-  Kotlin half (FeatureExtractor.kt, AlignmentEstimator.kt,
-  VelocityModel.kt, wiring into BaselineDeadReckoningRepository) is
-  entirely still PLANNED — Slice 6 is not finished, only its Python
-  training pipeline is.
-- Test coverage hardening pass (2026-08-25), requested before starting
-  the Kotlin half of Slice 6: `train_velocity_model.py` and
-  `export_model.py` had shipped with zero unit tests, only validated by
-  one real run each — a real gap against CLAUDE.md Rule 19 ("gets a
-  unit test before it is relied upon"). Added
-  `tests/ml/test_train_velocity_model.py` (14 cases, including a real
-  training-reproducibility test per PRD.md Section 27 — two models
-  trained on identical data with the same seed produce byte-identical
-  predictions) and `tests/ml/test_export_model.py` (2 cases, a real
-  sklearn->ONNX->onnxruntime round-trip on a tiny synthetic model,
-  including a negative test proving the parity check can actually
-  detect a real mismatch, not just that it never fires). One test's
-  hand-derived expectation was initially wrong (mental model of which
-  row's acceleration produces which row's velocity was off by one) —
-  caught by the test failing against the real function, fixed the test
-  not the function. Also re-ran `python ml/train_velocity_model.py`
-  against the real dataset a second time and got byte-identical MAE/
-  RMSE to the first run, and re-ran the full Kotlin `./gradlew test`
-  suite to confirm nothing on the Android side had regressed. Combined
-  suite: 29 Python ML tests + 46 Kotlin tests, all passing. This is the
-  testing checkpoint before starting the Kotlin half of Slice 6
-  (FeatureExtractor.kt, AlignmentEstimator.kt, VelocityModel.kt, and
-  wiring `models/velocity_v1.onnx` into the actual app).
-- Slice 6 Kotlin wiring implemented (2026-08-25): built the on-device
-  half of Slice 6. Key design decision made up front: since Android's
-  rotation-vector sensor already fuses gravity into azimuth/pitch/roll,
-  PRD.md Section 15's only genuinely missing piece is the YAW offset
-  between device compass heading and true vehicle direction of travel —
-  `alignment/AlignmentEstimator.kt` estimates exactly that (circular-
-  mean of device-azimuth-minus-GNSS-course during straight, fast
-  driving), backed by `alignment/YawRate.kt`'s angle-unwrap-aware
-  turning-rate math. `features/{RollingWindow,FeatureExtractor}.kt`
-  mirrors `ml/feature_extraction.py`'s windowed statistics, including
-  two genuinely easy-to-miss parity details replicated on purpose:
-  pandas' rolling `.std()` is SAMPLE std (ddof=1, not population std),
-  and the zero-crossing-rate calculation inherits a pandas NaN-
-  comparison quirk that counts the very first sample as a "change."
-  `ml/VelocityModel.kt` wraps ONNX Runtime Mobile — its input/output
-  tensor names ("input"/"variable") were verified against the actual
-  exported file via onnxruntime's Python API before hardcoding, not
-  guessed. `ml/MlVelocityRepository.kt` wires it all together as a
-  repository PARALLEL to (not replacing) BaselineDeadReckoningRepository,
-  so the ML-vs-physics comparison is directly visible on-device, not
-  just a desktop claim — this also means the physics position estimate
-  and Slice 5's test coverage were completely untouched by this change.
-  Copied `models/velocity_v1.onnx` into `android/app/src/main/assets/`
-  (gitignored, like the rest of the model artifacts — documented
-  re-copy step added to `.gitignore`).
-  3 test bugs caught and fixed during development, each by the test
-  failing against otherwise-correct code: a sign error in
-  `AlignmentEstimatorTest`'s hand-derived wrap-around expectation
-  (179 vs -179 degrees) — caught by cross-checking with Python's
-  `math.atan2` before trusting it; two `FeatureExtractorTest` cases
-  that forgot the rolling window mixes in earlier ticks' values rather
-  than reflecting only the latest instantaneous one. `./gradlew test` —
-  all 76 tests pass (46 + 29 new, net of the fixes).
-  On-device (2026-08-25, same S24 FE): `./gradlew installDebug`, no
-  crash, ONNX Runtime loaded the bundled model and produced live
-  predictions (0.11-0.74 m/s observed while stationary — plausible
-  small noise floor). Found a real Compose bug while verifying: the
-  screen's Column had no scroll modifier, so as content had grown
-  across Slices 4-6 it silently overflowed past the bottom edge with
-  NO way to reach it — confirmed by swiping, which did nothing (proof
-  it wasn't scrollable, not that a different gesture was needed). This
-  meant Slice 6's entire ML section was in the composition but
-  genuinely invisible. Fixed with `.verticalScroll(rememberScrollState())`;
-  re-verified by scrolling to and screenshotting the previously-hidden
-  section, which showed the live ML velocity prediction and an honest
-  "alignment not yet established" status (correct, given stationary +
-  no GNSS fix indoors). A real lesson recorded here deliberately: a
-  successful build and a non-crashing app are not the same as "the
-  content is actually visible" — only looking at the real device caught
-  this. Also swept the rest of `docs/PROJECT_MAP.md` for now-stale
-  "still PLANNED" references to files this change just implemented
-  (found and fixed 5 of them) — a build.gradle.kts scaffold note, a
-  WorldFrameAcceleration.kt note, a Phase-4-findings note, and a
-  train_velocity_model.py note, per CLAUDE.md's "never leave it
-  describing something that no longer exists."
-  Slice 1-6 (Kotlin half included) now fully verified end-to-end on
-  real hardware. Explicitly not done: ML velocity is comparison-only,
-  not fed into the position integrator; the motion classifier; a true
-  cross-language feature-parity test (a known, documented gap — see
-  FeatureExtractor.kt's and MlVelocityRepository's entries). Next:
-  either wire ML velocity into the actual position integrator, or
-  Slice 7 (GNSS/DR fusion) — not yet decided.
-- ML velocity wired into an actual position integrator (2026-08-25,
-  follow-up — user chose to wire ML velocity into position tracking
-  over starting Slice 7). Added `ml/MlPositionIntegrator.kt`
-  (PRD.md Section 16's `v[t]=VelocityModel(...)` propagation, no
-  momentum/acceleration state — position depends only on each tick's
-  predicted speed + heading; non-holonomic constraint satisfied by
-  construction since no lateral component is ever predicted) and wired
-  it into `MlVelocityRepository.kt` alongside a reused
-  `dr/StationaryDetector.kt` instance for ZUPT — same GNSS-mode-gated
-  reset as the physics path, for a directly comparable readout. Added
-  `MlVelocityUiState.positionEastM/positionNorthM` and a new UI section
-  in `MainActivity.kt`. `./gradlew test` — all 83 tests pass (76 + 7
-  new `MlPositionIntegratorTest` cases). Installed on the same S24 FE:
-  no crash, both position readouts visible and updating.
-  REAL FINDING from on-device testing, not from the unit tests: the
-  physics position stayed flat at rest (matching Slice 5's earlier
-  result) but the ML-based position jumped ~1.6m over ~45s in a burst,
-  then flattened again — traced to a genuine design asymmetry (ZUPT
-  zeroes a bounded, carried momentum for physics, but only gates an
-  unbounded per-tick prediction for the ML path, since that path has
-  no momentum concept at all) rather than a coding bug. Discussed with
-  the user; explicit decision made to document this now and defer a
-  fix (deadband, smoothing, or stricter dwell time were all considered
-  candidates) rather than reflexively patch it without more thought.
-  See `ml/MlPositionIntegrator.kt` and `ml/MlVelocityRepository.kt`'s
-  entries above for the full technical writeup. This is exactly the
-  kind of gap that only shows up from real sensor noise on real
-  hardware, not from synthetic unit tests — all 7 new unit tests pass
-  cleanly despite the integrator having this real sensitivity, because
-  the tests (correctly) verify the design does what it was built to
-  do; they can't by themselves reveal that the design choice itself
-  has this consequence under real-world noise.
-- Slice 7 — Fusion / re-alignment on GNSS reacquisition (2026-08-25).
-  Two scope decisions confirmed with the user before implementation:
-  (1) include PRD.md Section 17's online velocity-bias calibration in
-  this slice rather than deferring it, and (2) the fused estimator's DR
-  input is ML position (bias-corrected) once alignment is established,
-  physics position as fallback otherwise — matching Section 16's literal
-  "v[t] = VelocityModel(...) (or physics fallback)", and knowingly
-  inheriting the ML position path's already-documented burst-sensitivity
-  limitation into the fused number rather than treating it as a new
-  problem.
-  Added `fusion/GeoProjection.kt`, `fusion/VelocityBiasCalibrator.kt`,
-  `fusion/PositionFusion.kt` (all pure Kotlin, unit-tested) and
-  `fusion/StateEstimator.kt` (Android/coroutine glue — the file
-  `docs/PROJECT_MAP.md` had listed as `PLANNED` since the original
-  Planned File Map draft, now built for real). Edited
-  `ml/MlVelocityRepository.kt` to own a `VelocityBiasCalibrator`
-  instance and feed its bias-corrected velocity (not the raw model
-  output) into `MlPositionIntegrator`; renamed
-  `MlVelocityUiState.predictedVelocityMps` into
-  `predictedVelocityRawMps` + `predictedVelocityCorrectedMps` +
-  `velocityBiasMps` so raw/corrected/learned-bias stay honestly
-  distinguishable in the UI rather than one silently replacing the
-  other. Edited `MainActivity.kt` to construct `StateEstimator` after
-  the ML try/catch block (so it sees the final, possibly-null
-  `mlVelocityRepository`), start/stop it alongside the other
-  repositories, and add a new Compose section for the fused position +
-  DR source + staleness indicator. See each file's own entry above for
-  the full per-file writeup.
-  `./gradlew.bat test` — BUILD SUCCESSFUL, all 104 tests pass (83 from
-  Slices 1-6 + 21 new: 5 GeoProjectionTest + 7 VelocityBiasCalibratorTest
-  + 9 PositionFusionTest). `./gradlew.bat installDebug` onto the same
-  S24 FE: no crash (confirmed via `adb logcat` — no FATAL/AndroidRuntime
-  entries around launch). Screenshotted both the top and (after
-  scrolling, given the Slice 6 scroll-overflow history) bottom of the
-  screen: `ML predicted forward speed: 0.03 m/s corrected (raw=0.03,
-  learned bias=0.00)` — bias correctly stayed exactly 0.00, since this
-  run never had a GNSS_AIDED fix (indoors, no GPS lock) to calibrate
-  against; `Fused position ... east=0.00 north=0.00, DR source=PHYSICS`
-  — correct, since ML alignment was never established this run either,
-  so the documented physics-fallback path was the one actually
-  exercised; and the honest `^ no GNSS_AIDED fix yet this run — fusion
-  has no anchor to reference` message, rather than a fabricated number.
-  GNSS mode showed `DEAD_RECKONING` with the same `TRANSITION ->
-  DEAD_RECKONING` transition log line already verified in Slice 4/5.
-  HONEST LIMITATION (same shape as Slice 5/6's own documented indoor
-  gaps): TRANSITION's freeze behavior and REACQUISITION's blend-toward-
-  new-fix behavior could not be visually confirmed on-device this run,
-  since indoor testing never reaches GNSS_AIDED in the first place (no
-  fix to lose or reacquire) — that specific behavior is verified by
-  `PositionFusionTest`'s synthetic (nowMs, mode) sequences plus code
-  inspection, and remains a documented follow-up outdoor check, not a
-  claimed-but-unverified capability.
-  Slice 1-7 now implemented; PRD.md Section 17 and Section 18's
-  TRANSITION/REACQUISITION blending are both real, not just state-
-  machine bookkeeping, for the first time. Next: `train_motion_classifier.py`
-  (blocked on self-captured Pothole/Phone-Moved data) or Slice 8 (map
-  constraint / UI) — not yet decided.
-- Live sensor-capture tool + two deterministic motion-classification
-  stand-ins (2026-08-25, same day — user has not decided the UI design
-  concept yet, so Slice 8 stays parked; these came from a direct request
-  to prove out data capture, then to close two documented gaps from
-  earlier honesty answers about cruising/pothole detection). Added
-  `capture/SensorRecorder.kt` + a Start/Stop Recording button in
-  `MainActivity.kt`; used once, live, moving the phone by hand — real
-  capture confirmed (128 samples, ~12.6 Hz, accel magnitude 9.7 -> 22.49
-  m/s^2 during motion). Then, after confirming with the user that
-  building the map UI would NOT unlock cruising/pothole detection (both
-  are sensor-classification gaps, unrelated to any UI), added
-  `motion/MotionStateClassifier.kt` and `motion/PotholeShockDetector.kt`
-  — DETERMINISTIC, PARTIAL stand-ins for 2 of PRD.md Section 14's 8
-  Motion Classification classes, same "stand-in before the real trained
-  classifier" precedent as `dr/StationaryDetector.kt`. Wired
-  MotionStateClassifier into `ml/MlVelocityRepository.kt` ONLY (keeps the
-  physics baseline ML-free, CLAUDE.md Rule 3); wired PotholeShockDetector
-  into BOTH `dr/BaselineDeadReckoningRepository.kt` and
-  `ml/MlVelocityRepository.kt` (safe since it only discounts a live
-  display sample, not the frozen Slice 3 baseline measurement). Added 2
-  new UI lines in `MainActivity.kt`'s ML section for both.
-  `./gradlew.bat test` — all 121 tests pass (104 from Slices 1-7 + 11
-  new + 6 SensorRecorderTest, counted separately from the 5+6 motion
-  tests above). `./gradlew.bat installDebug` onto the same S24 FE: no
-  crash (confirmed via `adb logcat`), screenshotted the new UI section —
-  "Motion state: not overridden to cruising this tick" and "Pothole/
-  shock: none detected this tick" both showed correctly at rest (neither
-  false-fired with the phone sitting still, which is what indoor testing
-  CAN confirm).
-  HONEST LIMITATION, stated up front per CLAUDE.md Rule 13: neither
-  mechanism has been validated against real cruising or real pothole
-  data — none exists yet. This proves the DISCOUNTING/OVERRIDE
-  MECHANISMS work and don't misfire at rest; it does NOT prove the
-  chosen thresholds (1.0 m/s cruising gate, 4.0 m/s^2 shock gate, both
-  engineering defaults) are correct for real driving. That validation is
-  the same self-captured-data gap `train_motion_classifier.py` has always
-  been blocked on — the capture tool built this same session is a step
-  toward closing it, not a substitute for it.
+Moved to `summary.txt` at the repo root — see that file for the full
+chronological history (every slice, bug fix, scope decision, and
+on-device verification, in the order it actually happened).

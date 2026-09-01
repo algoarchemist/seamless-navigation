@@ -15,6 +15,17 @@ Implemented and real (Phase 4 done for the velocity model):
   inference. Its output, `models/velocity_v1.onnx`, is committed to this
   repo (see `models/README.md` for why) — you do not need to re-run this
   pipeline just to build and run the Android app.
+- `train_reacquisition_model.py` / `export_reacquisition_model.py` — PRD
+  Section 17's "AI-based" GNSS+INS fusion half: a small LinearRegression
+  predicting expected along-track DR drift (meters) at GNSS
+  reacquisition, from outage duration + the velocity model's own
+  predicted-speed statistics. Simulates outages on IO-VNBD (no real
+  outages exist in this dataset) using the already-trained velocity
+  model's predictions. The real, measured result (LinearRegression beats
+  both RandomForestRegressor and the best 1-parameter physics-formula
+  baseline on held-out trips) is documented in `docs/PROJECT_MAP.md`. Its
+  output, `models/reacquisition_drift_v1.onnx` (~0.25KB), is committed
+  for the same reason `velocity_v1.onnx` is.
 
 Still planned, blocked on more self-captured labeled data:
 

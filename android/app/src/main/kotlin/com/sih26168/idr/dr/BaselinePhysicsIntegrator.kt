@@ -5,12 +5,40 @@ package com.sih26168.idr.dr
  * estimate, in meters and m/s respectively, relative to wherever
  * integration started (there is no GNSS fix tying this to a real
  * lat/lon yet — that fusion is a later slice).
+ *
+ * [linearAccelMagnitudeMps2]/[gyroMagnitudeRadPerSec]/[isStationary]
+ * (added 2026-08-29, for capture/DriveDataLogger.kt — see that file's
+ * doc) are NOT produced by [BaselinePhysicsIntegrator] itself (it stays
+ * a pure position/velocity integrator, unaware of ZUPT); they default to
+ * 0.0/false here and are filled in by BaselineDeadReckoningRepository's
+ * tick loop via `.copy(...)`, which already computes these exact values
+ * each tick to drive its own ZUPT decision — this just also publishes
+ * them instead of discarding them, so a real drive's raw ZUPT inputs and
+ * decision are visible outside the repository for offline threshold
+ * validation (CLAUDE.md Rule 13: don't leave the current thresholds as
+ * unvalidated guesses when the real inputs were already being computed).
+ * UPDATE (2026-08-30, PRD.md Section 11 vibration filter): the published
+ * [linearAccelMagnitudeMps2]/[gyroMagnitudeRadPerSec] are now the
+ * LOW-PASS FILTERED magnitude (see `dr/LowPassFilter.kt`), not the raw
+ * per-tick magnitude — a real, disclosed change from before, since these
+ * feed `scripts/analyze_drive_log.py`'s offline threshold validation and
+ * a re-tuned threshold against this data is now implicitly a
+ * post-filter threshold.
+ *
+ * [isTurning] (added 2026-08-30) is `motion/TurningDetector.kt`'s own
+ * output, published here for the same "make the real detector inputs/
+ * decisions externally visible" reason as the ZUPT fields above — not
+ * produced by this integrator either.
  */
 data class DeadReckoningState(
     val positionEastM: Double = 0.0,
     val positionNorthM: Double = 0.0,
     val velocityEastMps: Double = 0.0,
     val velocityNorthMps: Double = 0.0,
+    val linearAccelMagnitudeMps2: Double = 0.0,
+    val gyroMagnitudeRadPerSec: Double = 0.0,
+    val isStationary: Boolean = false,
+    val isTurning: Boolean = false,
 )
 
 /**

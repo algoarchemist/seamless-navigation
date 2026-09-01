@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NOT a Figma asset — no microphone glyph in the source Figma file,
+     hand-drawn instead of adding material-icons-extended for the search
+     screen's voice-search button (CLAUDE.md Rule 2). Same 1.6dp round-cap
+     stroke weight as the other hand-drawn icons here, except the mic
+     capsule body which is filled solid (matches how a real mic icon
+     reads at 24dp — an outlined capsule that small loses its shape). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M12,2A3,3 0 0,0 9,5L9,11A3,3 0 0,0 15,11L15,5A3,3 0 0,0 12,2Z"
+        android:fillColor="#FFFFFF" />
+    <path
+        android:pathData="M6,11A6,6 0 0,0 18,11"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M12,17L12,21"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M8,21L16,21"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

@@ -9,19 +9,32 @@ import kotlin.math.sin
  * velocity perpendicular to heading is suppressed toward zero.
  *
  * PRD.md Section 20 specifies this in VEHICLE frame with a `Turning`
- * exemption from the ML motion classifier. Neither exists yet — phone-
- * to-vehicle alignment (PRD.md Section 15) needs a GNSS-aided
- * initialization window (not built), and the motion classifier is
- * Slice 6. This is a deliberately simplified WORLD-frame stand-in for
- * Slice 5: it uses the device's own WORLD-frame heading (azimuth, from
- * OrientationMath/OrientationSample) as a proxy for vehicle heading,
- * under the explicit assumption that the phone's yaw tracks the
- * vehicle's yaw (true for a phone mounted rigidly to the vehicle body;
- * false if it's loose, e.g. free-sliding in a cup holder). It also has
- * no `Turning` exemption, so a genuine turn's real lateral velocity gets
- * suppressed too — an accepted, honestly-documented over-constraint for
- * this slice, to be relaxed once Slice 6's motion classifier can flag
- * `Turning` windows.
+ * exemption from the ML motion classifier. This function itself still
+ * only ever projects onto whatever `headingRad` its caller hands it — it
+ * has no opinion on WHICH heading that is. Its one caller
+ * (`dr/BaselineDeadReckoningRepository.kt`) now passes the
+ * `alignment/AlignmentRepository.kt`-corrected vehicle heading (device
+ * azimuth minus the shared PRD.md Section 15 yaw offset) once alignment
+ * has converged, falling back to raw device azimuth (yaw offset 0) before
+ * that — the SAME accepted approximation `ml/MlVelocityRepository.kt`
+ * already uses for its own feature path. Even once corrected, this
+ * remains a WORLD-frame stand-in, not a true 3-axis device-to-vehicle
+ * rotation: it assumes the phone's yaw tracks the vehicle's yaw (true for
+ * a phone mounted rigidly to the vehicle body; false if it's loose, e.g.
+ * free-sliding in a cup holder) — alignment only ever corrects a
+ * constant YAW offset, not that underlying "rigid mount" assumption
+ * itself.
+ *
+ * The `Turning` exemption DOES now exist —
+ * `motion/TurningDetector.kt`'s deterministic yaw-rate stand-in (same
+ * "no labeled classifier data yet" precedent as
+ * `motion/MotionStateClassifier.kt`) — but is applied by this class's one
+ * caller (`dr/BaselineDeadReckoningRepository.kt`), which simply skips
+ * calling [suppressLateralVelocity] on a tick flagged as turning, rather
+ * than being threaded through this function's own signature. Keeps this
+ * object a pure "always project onto heading" function, matching the
+ * gating style already used for ZUPT/`walkingModeEnabled`-style
+ * exemptions at that same call site.
  *
  * Pure Kotlin, no Android dependency, unit-testable on the plain JVM
  * (CLAUDE.md Rule 19).

@@ -17,9 +17,14 @@ import com.sih26168.idr.ui.theme.AccentBlue
 import com.sih26168.idr.ui.theme.PanelBackground
 import com.sih26168.idr.ui.theme.TextSecondary
 
-/** The three real screens this app has (Slice 8b) — one tab each. */
+/**
+ * The two real screens this app has (Slice 8b added MAP; DRIVE — the
+ * abstract local-East/North-meter grid tab — was removed once MAP's real
+ * street map + routing made it redundant, since MAP already shows the
+ * same [com.sih26168.idr.ui.screens.StatusOverlayContent] plus real
+ * navigation) — one tab each.
+ */
 enum class AppTab(val label: String) {
-    DRIVE("Drive"),
     MAP("Map"),
     HISTORY("History"),
 }

@@ -1,12 +1,14 @@
 package com.sih26168.idr.ml
 
-import com.sih26168.idr.alignment.AlignmentEstimator
+import com.sih26168.idr.alignment.AlignmentRepository
 import com.sih26168.idr.dr.StationaryDetector
 import com.sih26168.idr.dr.WorldFrameAcceleration
 import com.sih26168.idr.features.FeatureExtractor
 import com.sih26168.idr.fusion.VelocityBiasCalibrator
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
+import com.sih26168.idr.gnss.GnssQuality
+import com.sih26168.idr.motion.LongitudinalMotionClassifier
 import com.sih26168.idr.motion.MotionStateClassifier
 import com.sih26168.idr.motion.PotholeShockDetector
 import com.sih26168.idr.sensors.SampleRate
@@ -24,8 +26,19 @@ import kotlinx.coroutines.launch
 data class MlVelocityUiState(
     /** The ONNX model's raw output, before Slice 7's bias correction. */
     val predictedVelocityRawMps: Float? = null,
-    /** [predictedVelocityRawMps] + [velocityBiasMps] — what actually feeds the position integrator. */
+    /** [predictedVelocityRawMps] + [velocityBiasMps] — bias-corrected, but BEFORE Round 2's damping/OOD guard (see [predictedVelocityDampedMps]). */
     val predictedVelocityCorrectedMps: Float? = null,
+    /**
+     * (Round 2 addition, 2026-08-28) [predictedVelocityCorrectedMps] after
+     * [VelocityGuard]'s OOD rejection + exponential smoothing — this is
+     * what actually feeds the position integrator now, not
+     * [predictedVelocityCorrectedMps] directly (Round 1's behavior, which
+     * let a single anomalous sample jump the position — see
+     * [VelocityGuard]'s doc).
+     */
+    val predictedVelocityDampedMps: Float? = null,
+    /** (Round 2 addition, 2026-08-28) [VelocityGuard] rejected this tick's prediction as implausible and held the last accepted value instead. */
+    val isVelocityOutOfDistribution: Boolean = false,
     /** Currently learned bias (see VelocityBiasCalibrator) — 0 until at least one GNSS_AIDED sample above the speed gate. */
     val velocityBiasMps: Float = 0f,
     val isAligned: Boolean = false,
@@ -37,6 +50,10 @@ data class MlVelocityUiState(
     val isCruising: Boolean = false,
     /** PotholeShockDetector fired this tick — forward/lateral accel was discounted before feature extraction. */
     val potholeShockDetectedThisTick: Boolean = false,
+    /** LongitudinalMotionClassifier: vehicle-frame forward acceleration is above the Accelerating threshold this tick. */
+    val isAccelerating: Boolean = false,
+    /** LongitudinalMotionClassifier: vehicle-frame forward acceleration is below the (negative) Braking threshold this tick. */
+    val isBraking: Boolean = false,
 )
 
 // If no GNSS fix has ever been received, fixAgeMs is Long.MAX_VALUE —
@@ -51,9 +68,17 @@ private const val MAX_ELAPSED_SINCE_FIX_S = 999f
 /**
  * Slice 6 (ML inference wired in, per CLAUDE.md's slice order): the
  * Android/coroutine glue connecting SensorRepository + GnssModeRepository's
- * streams to AlignmentEstimator, FeatureExtractor, and VelocityModel,
- * republishing the live ML-predicted velocity AND (as of this change)
- * an ML-driven WORLD-frame position estimate as its own StateFlow.
+ * streams to FeatureExtractor and VelocityModel, republishing the live
+ * ML-predicted velocity AND (as of this change) an ML-driven WORLD-frame
+ * position estimate as its own StateFlow.
+ *
+ * UPDATE: phone-to-vehicle yaw alignment is no longer owned here — it now
+ * lives in [com.sih26168.idr.alignment.AlignmentRepository], a SHARED
+ * estimate also read by dr/BaselineDeadReckoningRepository.kt (see that
+ * repository's own doc and AlignmentRepository's for why: this class used
+ * to be alignment tracking's only home, which meant it silently stopped
+ * existing whenever the ONNX model failed to load, and the physics path
+ * had no access to it at all).
  *
  * Deliberately a SEPARATE, PARALLEL repository to
  * BaselineDeadReckoningRepository (CLAUDE.md Rule 5) — it does NOT
@@ -91,22 +116,26 @@ private const val MAX_ELAPSED_SINCE_FIX_S = 999f
  * [com.sih26168.idr.dr.BaselineDeadReckoningRepository] baseline stays
  * untouched by any ML signal, per CLAUDE.md Rule 3); [potholeShockDetector]
  * discounts forward/lateral accel on a detected vertical shock before it
- * reaches [featureExtractor], per PRD.md Section 14's `Pothole` effect.
- * Both are deterministic stand-ins, not the trained PRD Section 14
- * classifier — see their own class docs for why.
+ * reaches [featureExtractor], per PRD.md Section 14's `Pothole` effect;
+ * [longitudinalMotionClassifier] (2026-08-30) flags Accelerating/Braking
+ * from the SAME alignment-corrected `accelForwardMps2` the model
+ * consumes. All three are deterministic stand-ins, not the trained PRD
+ * Section 14 classifier — see their own class docs for why.
  */
 class MlVelocityRepository(
     private val sensorRepository: SensorRepository,
     private val gnssModeRepository: GnssModeRepository,
     private val velocityModel: VelocityModel,
     private val scope: CoroutineScope,
-    private val alignmentEstimator: AlignmentEstimator = AlignmentEstimator(),
+    private val alignmentRepository: AlignmentRepository,
     private val featureExtractor: FeatureExtractor = FeatureExtractor(),
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
     private val positionIntegrator: MlPositionIntegrator = MlPositionIntegrator(),
     private val biasCalibrator: VelocityBiasCalibrator = VelocityBiasCalibrator(),
     private val motionStateClassifier: MotionStateClassifier = MotionStateClassifier(),
     private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
+    private val velocityGuard: VelocityGuard = VelocityGuard(),
+    private val longitudinalMotionClassifier: LongitudinalMotionClassifier = LongitudinalMotionClassifier(),
 ) {
     private val _state = MutableStateFlow(MlVelocityUiState())
     val state: StateFlow<MlVelocityUiState> = _state.asStateFlow()
@@ -117,6 +146,7 @@ class MlVelocityRepository(
     fun start() {
         positionIntegrator.reset()
         biasCalibrator.reset()
+        velocityGuard.reset()
         lastProcessedAccelTimestampNs = null
 
         collectJob = scope.launch {
@@ -144,12 +174,13 @@ class MlVelocityRepository(
                     positionIntegrator.reset()
                 }
 
-                val alignment = alignmentEstimator.evaluate(
-                    nowNs = accel.timestampNs,
-                    azimuthRad = orientation.azimuthRad,
-                    gnssBearingDeg = fix?.bearingDeg,
-                    gnssSpeedMps = fix?.speedMps,
-                )
+                // Round 2 (2026-08-28): reads the ONE shared alignment
+                // estimate from AlignmentRepository instead of owning/
+                // evaluating an AlignmentEstimator directly — the SAME
+                // shared value dr/BaselineDeadReckoningRepository.kt also
+                // reads, so both DR paths agree on one real yaw offset
+                // instead of each maintaining its own independent estimate.
+                val alignment = alignmentRepository.state.value
 
                 // WORLD-frame linear acceleration — reuses Slice 3's
                 // already-tested rotation + gravity-removal.
@@ -197,6 +228,13 @@ class MlVelocityRepository(
                     (discountedLinearAccelEast * lateralEast + discountedLinearAccelNorth * lateralNorth).toFloat()
                 val accelUpMps2 = linearAccel[2]
 
+                // PRD.md Section 14's Accelerating/Braking classes — a
+                // deterministic sign/magnitude stand-in over the SAME
+                // vehicle-frame forward-acceleration feature the ONNX
+                // model itself consumes (see LongitudinalMotionClassifier's
+                // own doc for why this is ML-path-only).
+                val longitudinalClassification = longitudinalMotionClassifier.classify(accelForwardMps2)
+
                 // Yaw rate: rotate the RAW gyro vector into world frame the
                 // same way as accel (angular velocity transforms as a
                 // vector under a pure rotation) and take its Up component —
@@ -234,9 +272,26 @@ class MlVelocityRepository(
                 // (GNSS_AIDED) — that's exactly when there's real ground
                 // truth to calibrate against.
                 if (gnssState.mode == GnssMode.GNSS_AIDED && fix?.speedMps != null) {
-                    biasCalibrator.update(gnssSpeedMps = fix.speedMps, rawPredictedVelocityMps = rawPredictedVelocityMps)
+                    // Round 2 (2026-08-28 — PRD.md FR13/Section 17): weight
+                    // this sample's pull on the learned bias by how accurate
+                    // THIS fix actually is, instead of trusting every fix
+                    // that merely clears GnssQuality.isGood's binary gate
+                    // identically (a 24m fix vs. a 2m fix).
+                    val confidenceWeight = GnssQuality.confidenceWeight(fix.accuracyM)
+                    biasCalibrator.update(
+                        gnssSpeedMps = fix.speedMps,
+                        rawPredictedVelocityMps = rawPredictedVelocityMps,
+                        confidenceWeight = confidenceWeight,
+                    )
                 }
                 val correctedVelocityMps = biasCalibrator.correctedVelocity(rawPredictedVelocityMps)
+
+                // Round 2 (2026-08-28 — PRD.md FR3/Section 13): OOD guard +
+                // damping BEFORE this reaches the position integrator — see
+                // VelocityGuard's doc for why the ML path needed this and
+                // the physics path didn't.
+                val guardedVelocity = velocityGuard.apply(correctedVelocityMps)
+                val dampedVelocityMps = guardedVelocity.velocityMps
 
                 // ZUPT for the ML position path — see MlPositionIntegrator.kt's
                 // doc for why this is still needed even though the model was
@@ -269,7 +324,7 @@ class MlVelocityRepository(
 
                 val positionState = positionIntegrator.update(
                     dtSeconds = dtSeconds,
-                    velocityMps = correctedVelocityMps,
+                    velocityMps = dampedVelocityMps,
                     headingRad = vehicleHeadingRad,
                     isStationary = motionClassification.isStationary,
                 )
@@ -277,6 +332,8 @@ class MlVelocityRepository(
                 _state.value = MlVelocityUiState(
                     predictedVelocityRawMps = rawPredictedVelocityMps,
                     predictedVelocityCorrectedMps = correctedVelocityMps,
+                    predictedVelocityDampedMps = dampedVelocityMps,
+                    isVelocityOutOfDistribution = guardedVelocity.wasOutOfDistribution,
                     velocityBiasMps = biasCalibrator.currentBiasMps,
                     isAligned = alignment.isAligned,
                     yawOffsetDeg = alignment.yawOffsetRad?.let { Math.toDegrees(it.toDouble()).toFloat() },
@@ -285,6 +342,8 @@ class MlVelocityRepository(
                     positionNorthM = positionState.positionNorthM,
                     isCruising = motionClassification.isCruising,
                     potholeShockDetectedThisTick = potholeShockDetectedThisTick,
+                    isAccelerating = longitudinalClassification.isAccelerating,
+                    isBraking = longitudinalClassification.isBraking,
                 )
             }
         }
@@ -293,20 +352,5 @@ class MlVelocityRepository(
     fun stop() {
         collectJob?.cancel()
         collectJob = null
-    }
-
-    /**
-     * PRD.md Section 15's "Ongoing validation... Phone Moved... flag for
-     * recalibration" / Section 31/32's manual "hold phone flat, tap to
-     * calibrate" fallback — Slice 8's recalibrate button calls this
-     * through MainActivity. Discards the accumulated yaw-alignment
-     * estimate so [alignmentEstimator] re-converges from scratch on the
-     * next sustained straight-line GNSS-aided segment, exactly like the
-     * automatic "Phone Moved" re-trigger AlignmentEstimator.reset() was
-     * already built for (see that class's doc) — this is just a second,
-     * manual caller of the same reset.
-     */
-    fun resetAlignment() {
-        alignmentEstimator.reset()
     }
 }
