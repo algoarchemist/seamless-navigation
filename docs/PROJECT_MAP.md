@@ -635,19 +635,42 @@ Outputs: current GnssMode; a running List<GnssModeTransition> log
   pure-math layer (GnssModeRepository additionally Logcats each one).
 Important functions/classes: evaluate() (the state machine step);
   outageEnterDwellMs / reacquisitionEnterDwellMs / transitionDwellMs /
-  reacquisitionDwellMs (constructor params, defaults 2000/2000/1000/
-  1000ms — engineering defaults, not yet empirically validated).
+  reacquisitionDwellMs / reacquisitionExitDwellMs (constructor params,
+  defaults 2000/2000/1000/1000/2000ms — engineering defaults, not yet
+  empirically validated).
 Important concepts/assumptions: hysteresis (CLAUDE.md Rule 16) — a
   single bad/good sample cannot flip the mode; leaving GNSS_AIDED
   requires GNSS bad continuously for outageEnterDwellMs, leaving
   DEAD_RECKONING requires GNSS good continuously for
-  reacquisitionEnterDwellMs, and TRANSITION/REACQUISITION each have
-  their own minimum dwell before the next transition is even
-  considered. TRANSITION/REACQUISITION are state-machine bookkeeping
-  ONLY in this slice — they do NOT yet blend GNSS and DR position
-  estimates together (PRD.md Section 18's "freeze/average"/"blend"
-  behavior is Slice 7, Fusion / re-alignment on GNSS reacquisition).
-Connected to: GnssModeRepository -> GnssOutageDetector -> GnssModeUiState
+  reacquisitionEnterDwellMs, REACQUISITION advances to GNSS_AIDED only
+  with GNSS good continuously for reacquisitionDwellMs, and bails back
+  to DEAD_RECKONING only with GNSS bad continuously for
+  reacquisitionExitDwellMs — all four transitions use the same
+  streak-tracked dwell pattern. TRANSITION/REACQUISITION are
+  state-machine bookkeeping ONLY in this slice — they do NOT yet blend
+  GNSS and DR position estimates together (PRD.md Section 18's
+  "freeze/average"/"blend" behavior is Slice 7, Fusion / re-alignment
+  on GNSS reacquisition).
+  REAL BUG FIX (2026-09-02, on-device test via ADB screenshots + logcat
+  during a live session — phone stationary indoors, mode visibly
+  flapping DEAD_RECKONING<->REACQUISITION every ~7s across 6+ outage
+  cycles in under a minute): REACQUISITION's exit used to bail to
+  DEAD_RECKONING on the FIRST bad sample after entry, no dwell at all —
+  itself the single-noisy-sample flip Rule 16 prohibits (a leftover from
+  an earlier 2026-08-26 fix for the opposite symptom, which over-
+  corrected). Marginal indoor GNSS accuracy flickers faster than
+  reacquisitionDwellMs, so REACQUISITION never once reached GNSS_AIDED
+  in practice, which also corrupted fusion/StateEstimator.kt's
+  lastAidedAtMs bookkeeping (never updated) and made its AI-predicted
+  drift number climb unboundedly across "outages" that were never
+  really distinct (7.8m -> 49m predicted over six cycles while measured
+  drift stayed ~1-1.5m each time). Fixed by giving the exit its own
+  streak-tracked dwell (reacquisitionExitDwellMs), symmetric with every
+  other transition in this class — see GnssOutageDetectorTest.kt's
+  2026-09-02 tests for the locked-in behavior.
+Connected to: GnssModeRepository -> GnssOutageDetector -> GnssModeUiState;
+  GnssOutageDetector.mode -> fusion/StateEstimator.kt's lastAidedAtMs
+  bookkeeping -> ml/ReacquisitionDriftModel's predicted-drift input
 
 android/app/src/main/kotlin/com/sih26168/idr/gnss/LocationRepository.kt
 Status: IMPLEMENTED
