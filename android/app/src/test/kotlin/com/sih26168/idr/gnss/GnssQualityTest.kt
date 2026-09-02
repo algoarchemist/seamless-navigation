@@ -77,4 +77,31 @@ class GnssQualityTest {
     fun `confidenceWeight is 1 for a zero-or-better accuracy reading`() {
         assertEquals(1f, GnssQuality.confidenceWeight(accuracyM = 0f, maxAccuracyM = 25f), 0.0001f)
     }
+
+    @Test
+    fun `ground-truth bound is stricter than the general availability bound`() {
+        // fusion StateEstimator relies on this ordering: a fix loose enough
+        // to merely clear DEFAULT_MAX_ACCURACY_M (state-machine "GNSS is
+        // available") must NOT automatically also clear the tighter
+        // ground-truth bound used to trust a fix as an outage anchor or a
+        // drift measurement's endpoint -- see that constant's own doc for
+        // the on-device bug this guards against.
+        assertTrue(GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M < GnssQuality.DEFAULT_MAX_ACCURACY_M)
+    }
+
+    @Test
+    fun `a fix that clears the general bar but not the ground-truth bar is still classified good`() {
+        // isGood() itself is unchanged by adding the stricter constant --
+        // callers that want the tighter bar must pass it explicitly via
+        // isGood's existing maxAccuracyM parameter.
+        val looseAccuracyM = GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M + 5f
+        assertTrue(GnssQuality.isGood(fixAgeMs = 100L, accuracyM = looseAccuracyM))
+        assertFalse(
+            GnssQuality.isGood(
+                fixAgeMs = 100L,
+                accuracyM = looseAccuracyM,
+                maxAccuracyM = GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M,
+            ),
+        )
+    }
 }
