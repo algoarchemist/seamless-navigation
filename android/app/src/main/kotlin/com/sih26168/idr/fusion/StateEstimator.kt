@@ -87,6 +87,16 @@ data class FusedPositionUiState(
     val roadSnapped: Boolean = false,
     /** Distance from the pre-snap fused position to the road, meters. Null unless [roadSnapped]. */
     val distanceToRoadM: Double? = null,
+    /**
+     * (2026-09-02, PRD.md Section 17's "smooth short GNSS gaps/jitter")
+     * Magnitude (meters) of [GnssJitterFilter]'s correction to this tick's
+     * raw GNSS fix, while GNSS_AIDED — 0 for every other mode, or before
+     * a trip origin is established. Exposed purely for debug/verification
+     * (CLAUDE.md Rule 19/22) — the actual correction is already folded
+     * into [fusedEastM]/[fusedNorthM]; nothing downstream needs this
+     * separately.
+     */
+    val gnssJitterOffsetM: Double = 0.0,
 )
 
 /**
@@ -157,6 +167,30 @@ data class FusedPositionUiState(
  * the ONNX asset fails to load, [positionFusion] simply keeps its
  * [PositionFusion.DEFAULT_REACQUISITION_BLEND_MS] fixed value, the exact
  * previous classical behavior.
+ *
+ * Later addition (2026-09-02): PRD.md Section 17's OTHER still-open
+ * fusion piece — "the IMU-derived velocity/heading are used to smooth
+ * short GNSS gaps/jitter" (the bias-calibration half,
+ * [com.sih26168.idr.fusion.VelocityBiasCalibrator], and FR13's
+ * continuous accuracy weighting,
+ * [com.sih26168.idr.gnss.GnssQuality.confidenceWeight], were already
+ * wired in earlier). [gnssJitterFilter] runs a simple complementary
+ * filter (see its own doc) every tick a trustworthy fix arrives while
+ * `GNSS_AIDED`, in a FIXED local frame anchored at [tripOriginLatDeg]/
+ * [tripOriginLonDeg] (set once, from the first-ever good fix this run —
+ * deliberately NOT the same frame as [outageAnchorLatDeg]/
+ * [outageAnchorLonDeg], which must keep snapping to the literal latest
+ * good fix for reacquisition/drift-measurement correctness; blending
+ * that anchor itself would have silently reintroduced the exact
+ * ground-truth-corruption bug [outageAnchorAccuracyM] was added to fix).
+ * The resulting small correction is passed to [positionFusion] as
+ * `gnssJitterOffsetEastM`/`gnssJitterOffsetNorthM`, which
+ * [PositionFusion.update]'s `GNSS_AIDED` branch now returns directly
+ * instead of a hard-coded (0,0) — see that class's own doc.
+ * [gnssJitterFilter] is reset whenever GNSS is freshly (re)trusted after
+ * NOT being `GNSS_AIDED` last tick (including this run's very first
+ * tick), so it never predicts across a stale multi-second/-minute gap
+ * from a pre-outage position.
  */
 class StateEstimator(
     private val gnssModeRepository: GnssModeRepository,
@@ -181,6 +215,17 @@ class StateEstimator(
     private var outageAnchorAccuracyM: Float? = null
     private var lastAidedAtMs: Long? = null
     private var previousMode: GnssMode? = null
+
+    // (2026-09-02, PRD.md Section 17's jitter-smoothing half) A FIXED
+    // reference point, set ONCE from the first-ever good fix this run —
+    // deliberately never moved again, unlike outageAnchorLatDeg/LonDeg
+    // above. GnssJitterFilter needs a stable frame to accumulate a
+    // smoothed position IN across many ticks; a continuously-moving
+    // reference (like the outage anchor) would make consecutive local-
+    // meter readings incomparable.
+    private var tripOriginLatDeg: Double? = null
+    private var tripOriginLonDeg: Double? = null
+    private val gnssJitterFilter = GnssJitterFilter()
     private var lastDriftSummary: DriftSummaryResult? = null
     private val driftHistory = mutableListOf<DriftSummaryResult>()
 
@@ -245,6 +290,9 @@ class StateEstimator(
         driftHistory.clear()
         lastConfidentHeadingDeg = 0f
         outageSpeedStats.reset()
+        tripOriginLatDeg = null
+        tripOriginLonDeg = null
+        gnssJitterFilter.reset()
         _state.value = FusedPositionUiState()
 
         collectJob = scope.launch {
@@ -271,11 +319,61 @@ class StateEstimator(
                 // fixAgeMs/accuracyM this fix was already classified with
                 // upstream) closes that gap: only a fix that is ACTUALLY good
                 // right now can move the anchor.
+                // (2026-09-02, PRD.md Section 17's jitter-smoothing half —
+                // see this class's own doc for the full reasoning) Computed
+                // in the SAME "is this fix actually trustworthy right now"
+                // branch as the outage anchor above, but into a completely
+                // separate, FIXED local frame — never written back into
+                // outageAnchorLatDeg/LonDeg/AccuracyM, so the reacquisition/
+                // drift-measurement logic above is untouched by this.
+                var gnssJitterOffsetEastM = 0.0
+                var gnssJitterOffsetNorthM = 0.0
+
                 if (gnssState.mode == GnssMode.GNSS_AIDED && GnssQuality.isGood(gnssState.fixAgeMs, fix.accuracyM)) {
                     outageAnchorLatDeg = fix.latitudeDeg
                     outageAnchorLonDeg = fix.longitudeDeg
                     outageAnchorAccuracyM = fix.accuracyM
                     lastAidedAtMs = nowMs
+
+                    if (tripOriginLatDeg == null || tripOriginLonDeg == null) {
+                        tripOriginLatDeg = fix.latitudeDeg
+                        tripOriginLonDeg = fix.longitudeDeg
+                    }
+                    // GNSS was NOT trusted last tick (a fresh outage just
+                    // ended, or this is the very first tick this run) —
+                    // reset so the filter's next prediction step doesn't
+                    // try to dead-reckon across that stale gap from a
+                    // pre-outage position.
+                    if (previousMode != GnssMode.GNSS_AIDED) {
+                        gnssJitterFilter.reset()
+                    }
+                    val originLat = tripOriginLatDeg
+                    val originLon = tripOriginLonDeg
+                    if (originLat != null && originLon != null) {
+                        val (rawFixEastM, rawFixNorthM) = GeoProjection.toLocalMeters(
+                            latDeg = fix.latitudeDeg,
+                            lonDeg = fix.longitudeDeg,
+                            refLatDeg = originLat,
+                            refLonDeg = originLon,
+                        )
+                        val currentVelocity = deadReckoningRepository.state.value
+                        val (smoothedEastM, smoothedNorthM) = gnssJitterFilter.update(
+                            nowMs = nowMs,
+                            rawFixEastM = rawFixEastM,
+                            rawFixNorthM = rawFixNorthM,
+                            velocityEastMps = currentVelocity.velocityEastMps,
+                            velocityNorthMps = currentVelocity.velocityNorthMps,
+                            confidenceWeight = GnssQuality.confidenceWeight(fix.accuracyM),
+                        )
+                        // The SMOOTHED position minus THIS tick's raw fix —
+                        // since the outage anchor above is set FROM this
+                        // same raw fix, "meters from anchor" (what
+                        // PositionFusion's GNSS_AIDED branch reports) is
+                        // exactly this small correction, not a hard-coded
+                        // zero.
+                        gnssJitterOffsetEastM = smoothedEastM - rawFixEastM
+                        gnssJitterOffsetNorthM = smoothedNorthM - rawFixNorthM
+                    }
                 } else if (outageAnchorLatDeg == null) {
                     // REAL BUG (2026-08-26, user report: "no feature to track
                     // my position on the map"): without ANY anchor,
@@ -439,6 +537,8 @@ class StateEstimator(
                     drNorthM = drNorthM,
                     newFixEastM = newFixEastM,
                     newFixNorthM = newFixNorthM,
+                    gnssJitterOffsetEastM = gnssJitterOffsetEastM,
+                    gnssJitterOffsetNorthM = gnssJitterOffsetNorthM,
                 )
 
                 // Round 2 (2026-08-28 — PRD.md FR8/Section 18): DR-derived
@@ -538,6 +638,7 @@ class StateEstimator(
                     fusedHeadingDeg = fusedHeadingDeg,
                     roadSnapped = roadSnapEastM != null,
                     distanceToRoadM = roadDistanceM,
+                    gnssJitterOffsetM = hypot(gnssJitterOffsetEastM, gnssJitterOffsetNorthM),
                 )
             }
         }

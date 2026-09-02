@@ -23,8 +23,16 @@ data class FusedPosition(val eastM: Double, val northM: Double)
  * it with a newly reacquired fix.
  *
  * Per-mode behavior:
- * - `GNSS_AIDED`: always (0, 0) — GNSS is trusted directly, no DR delta
- *   has accumulated (by construction of the callers' own reset behavior).
+ * - `GNSS_AIDED`: [gnssJitterOffsetEastM]/[gnssJitterOffsetNorthM] (both
+ *   default 0.0) — GNSS is trusted directly (by construction of the
+ *   callers' own DR-integrator reset behavior, `drEastM`/`drNorthM` are
+ *   never used for this mode), but PRD.md Section 17's "smooth short
+ *   GNSS gaps/jitter" means the position isn't necessarily the raw fix
+ *   UNMODIFIED either — see [com.sih26168.idr.fusion.GnssJitterFilter]
+ *   and [com.sih26168.idr.fusion.StateEstimator]'s own doc for how that
+ *   small complementary-filtered offset is computed. Passing 0.0 (the
+ *   default, and every pre-existing call site) reproduces the exact
+ *   original "always (0,0)" behavior.
  * - `TRANSITION`: frozen at whatever the DR position was the INSTANT
  *   TRANSITION was entered. This is the "freeze" half of Section 18's
  *   "freeze/average" — chosen over averaging because TRANSITION's default
@@ -113,6 +121,8 @@ class PositionFusion(
         drNorthM: Double,
         newFixEastM: Double?,
         newFixNorthM: Double?,
+        gnssJitterOffsetEastM: Double = 0.0,
+        gnssJitterOffsetNorthM: Double = 0.0,
     ): FusedPosition {
         if (mode != lastMode) {
             modeEnteredAtMs = nowMs
@@ -125,7 +135,7 @@ class PositionFusion(
         }
 
         return when (mode) {
-            GnssMode.GNSS_AIDED -> FusedPosition(0.0, 0.0)
+            GnssMode.GNSS_AIDED -> FusedPosition(gnssJitterOffsetEastM, gnssJitterOffsetNorthM)
             GnssMode.TRANSITION -> frozenPosition
             GnssMode.DEAD_RECKONING -> FusedPosition(drEastM, drNorthM)
             GnssMode.REACQUISITION -> {

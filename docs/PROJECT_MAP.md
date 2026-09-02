@@ -83,7 +83,14 @@ the Map tab's displayed marker onto the active route's geometry
 remaining item from the original SIH requirements list that was still
 just PLANNED. Deliberately display-only: `fusion/StateEstimator.kt`'s
 canonical `fusedEastM`/`fusedNorthM` (which feeds the measured drift
-number and route progress) is untouched by this correction.
+number and route progress) is untouched by this correction. **REMOVED
+2026-09-02**: a second, independently-built implementation of this exact
+feature (`map/MapConstraint.kt`) landed two days later and started
+correcting `fusedEastM`/`fusedNorthM` UPSTREAM in `StateEstimator.kt`
+itself — nobody reconciled the two, so this class's own correction was
+silently stacking on top of MapConstraint's every tick. See
+`fusion/RoadSnap.kt`'s own (now REMOVED) entry below for the full bug
+writeup; MapConstraint.kt is the sole surviving implementation.
 
 ---
 
@@ -1930,7 +1937,11 @@ Purpose: The position-level counterpart to gnss/GnssOutageDetector.kt's
   NOT duplicate that reset logic, it only decides how much of the DR
   delta to trust/show per mode.
 Important functions/classes: update(nowMs, mode, drEastM, drNorthM,
-  newFixEastM?, newFixNorthM?) — GNSS_AIDED always returns (0,0);
+  newFixEastM?, newFixNorthM?, gnssJitterOffsetEastM=0.0,
+  gnssJitterOffsetNorthM=0.0 — the last two added 2026-09-02, see UPDATE
+  below) — GNSS_AIDED returns (gnssJitterOffsetEastM, gnssJitterOffsetNorthM),
+  which is (0,0) — the exact original hard-coded behavior — at every
+  pre-existing call site/test, since both default to 0.0;
   TRANSITION freezes at the DR position from the INSTANT TRANSITION was
   entered (chosen "freeze" half of "freeze/average" — simpler, and
   TRANSITION's short ~1s default dwell makes freeze vs. average nearly
@@ -1967,6 +1978,59 @@ UPDATE (2026-08-30, PRD.md Section 17's "AI-based" GNSS+INS fusion —
   ReacquisitionDriftModel failed to load, `reacquisitionBlendMs` simply
   stays at DEFAULT_REACQUISITION_BLEND_MS (1000ms) — the exact previous
   classical behavior, same resilience pattern as the ML velocity path.
+UPDATE (2026-09-02, PRD.md Section 17's OTHER still-open fusion piece —
+  "smooth short GNSS gaps/jitter"): `update()` gained
+  `gnssJitterOffsetEastM`/`gnssJitterOffsetNorthM` params (both default
+  0.0), returned directly by the `GNSS_AIDED` branch instead of a
+  hard-coded `(0, 0)`. `fusion/StateEstimator.kt` computes this small
+  correction via the new `fusion/GnssJitterFilter.kt` (see its own
+  entry) and passes it in every tick — this class itself stays
+  unchanged in spirit (still a pure per-mode dispatcher), just no longer
+  hard-codes an assumption about what "GNSS is trusted directly" means
+  numerically.
+
+fusion/GnssJitterFilter.kt
+Status: IMPLEMENTED (2026-09-02)
+Purpose: PRD.md Section 17's "the IMU-derived velocity/heading are used
+  to smooth short GNSS gaps/jitter" — the one piece of Section 17 that
+  was still genuinely unbuilt (the velocity-bias half,
+  fusion/VelocityBiasCalibrator.kt, and FR13's continuous accuracy
+  weighting, gnss/GnssQuality.confidenceWeight, were both already wired
+  in on 2026-08-28, before this file existed). Without this, the map
+  marker snapped to each new raw GNSS fix directly while GNSS_AIDED —
+  Android's Location.getAccuracy() is a 68%-confidence RADIUS, not a
+  promise of fix-to-fix repeatability, so consecutive "good" fixes can
+  still visibly jitter a few meters. Pure Kotlin, no Android dependency,
+  unit-testable (CLAUDE.md Rule 19). A simple COMPLEMENTARY filter,
+  deliberately NOT a Kalman filter (CLAUDE.md's "What Not To Build" /
+  PRD.md Section 7) — no covariance propagation, just a fixed blend.
+Inputs (per update() call): nowMs; rawFixEastM/rawFixNorthM (a GNSS fix
+  in a FIXED local-meter frame — caller's responsibility to keep the
+  reference point constant across calls); velocityEastMps/velocityNorthMps
+  (current IMU/DR-derived WORLD-frame velocity, for the short-term
+  prediction step between fixes); confidenceWeight in [0,1] (typically
+  gnss/GnssQuality.confidenceWeight — how hard to pull the prediction
+  toward the raw fix this tick; 1 = trust it completely, 0 = pure IMU
+  dead reckoning).
+Outputs: (smoothedEastM, smoothedNorthM) — same local-meter frame as the
+  input.
+Important functions/classes: update() — first-ever sample is trusted
+  outright (no prior estimate to blend against, same convention
+  fusion/VelocityBiasCalibrator's own first sample already uses);
+  otherwise predicts forward from the last smoothed position using
+  velocity * dt, then blends that prediction toward the raw fix by
+  confidenceWeight (predicted + w * (raw - predicted)). reset() clears
+  all state — callers must call it whenever GNSS is freshly (re)trusted
+  after not being GNSS_AIDED, so the next update() doesn't predict
+  across a stale multi-second/-minute gap from a pre-outage position.
+Important concepts/assumptions: operates entirely in whatever local-
+  meter frame the caller supplies — carries no lat/lon or GeoProjection
+  dependency itself (kept in the caller, fusion/StateEstimator.kt).
+Connected to: fusion/StateEstimator (owns the instance, computes its
+  inputs, resets it on GNSS_AIDED re-entry) -> PositionFusion.update()'s
+  gnssJitterOffsetEastM/NorthM params -> FusedPositionUiState.fusedEastM/
+  fusedNorthM (via the GNSS_AIDED branch) and
+  FusedPositionUiState.gnssJitterOffsetM (debug-only magnitude).
 
 fusion/HeadingFusion.kt
 Status: IMPLEMENTED (Round 2, 2026-08-28)
@@ -2236,12 +2300,34 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   ground-truth quality) — this only gates whether a number gets
   PRESENTED to the user as a measured drift result, not the live
   position-fusion behavior.
+  UPDATE (2026-09-02, PRD.md Section 17's other still-open fusion piece —
+  "smooth short GNSS gaps/jitter"): two new fields,
+  `tripOriginLatDeg`/`tripOriginLonDeg`, set ONCE from the first-ever
+  good fix this run and never moved again — deliberately a SEPARATE
+  frame from the continuously-moving `outageAnchorLatDeg`/
+  `outageAnchorLonDeg` above, so this addition cannot touch the
+  anchor-accuracy drift-measurement fix from the 2026-09-01 UPDATE just
+  above. A new `gnssJitterFilter` (`fusion/GnssJitterFilter.kt`) runs
+  every tick a trustworthy fix arrives while GNSS_AIDED (the SAME strict
+  branch that already sets the outage anchor): converts the fix to local
+  meters relative to the trip origin, feeds it plus the current physics
+  velocity and `GnssQuality.confidenceWeight(fix.accuracyM)` into the
+  filter, and the resulting (smoothed - raw) delta is passed to
+  `positionFusion.update()` as `gnssJitterOffsetEastM`/
+  `gnssJitterOffsetNorthM` — see PositionFusion.kt's own UPDATE note for
+  how its GNSS_AIDED branch now returns this instead of a hard-coded
+  `(0,0)`. `gnssJitterFilter.reset()` fires whenever `previousMode !=
+  GNSS_AIDED` at the moment a good fix arrives (a fresh outage just
+  ended, or this run's very first tick), so the filter never predicts
+  across a stale gap. New `FusedPositionUiState.gnssJitterOffsetM` field
+  (magnitude, debug-only) surfaces the correction size for verification.
 Connected to: GnssModeRepository, BaselineDeadReckoningRepository,
   MlVelocityRepository -> StateEstimator -> MainActivity (Compose UI);
   fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8);
   fusion/HeadingFusion -> StateEstimator.fusedHeadingDeg -> ui/screens/MapScreen.kt (Round 2, 2026-08-28);
   ui/screens/MapScreen.kt -> StateEstimator.setActiveRouteGeometry() -> map/MapConstraint.snapToRoad() -> FusedPositionUiState.fusedEastM/fusedNorthM;
-  fusion/RunningStats, ml/ReacquisitionDriftModel -> StateEstimator -> fusion/PositionFusion.setReacquisitionBlendMs() (2026-08-30)
+  fusion/RunningStats, ml/ReacquisitionDriftModel -> StateEstimator -> fusion/PositionFusion.setReacquisitionBlendMs() (2026-08-30);
+  gnss/GnssQuality.confidenceWeight, fusion/GnssJitterFilter -> StateEstimator -> fusion/PositionFusion.update()'s gnssJitterOffsetEastM/NorthM (2026-09-02)
 
 fusion/DriftSummary.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -2387,78 +2473,36 @@ Connected to: SensorRepository -> FloorChangeRepository -> MainActivity
   (debug screen only so far — see MainActivity.kt's entry)
 
 android/app/src/main/kotlin/com/sih26168/idr/fusion/RoadSnap.kt
-Status: IMPLEMENTED (Round 2, 2026-08-28)
-NOTE (2026-08-30 merge): `map/MapConstraint.kt` (see its own entry
-  below) is a SEPARATE, independently-built implementation of the same
-  PRD.md Section 19 map-constraint feature, added on the other Round 2
-  branch and merged in alongside this one rather than replacing it — the
-  two now serve genuinely different consumers (this class only corrects
-  `ui/screens/MapScreen.kt`'s marker DISPLAY position via
-  `fusion/StateEstimator.kt`'s already-fused position; `MapConstraint.kt`
-  corrects `fusion/StateEstimator.kt`'s own `fusedEastM`/`fusedNorthM`
-  OUTPUT before either DriftSummary or MapScreen ever see it), so both
-  were kept rather than one being deleted as redundant — flagged here as
-  a real duplication worth a deliberate follow-up decision (CLAUDE.md
-  Rule 4), not a silent accident.
-Purpose: PRD.md Section 19's MVP map-constraint layer — nearest-road
-  snapping, explicitly NOT a full HMM-based map matcher (ruled out by
-  Section 19/34 as Future Work). Pure Kotlin, no Android dependency,
-  unit-testable (CLAUDE.md Rule 19).
-Scope decision (PRD.md Section 19's 2026-08-28 amendment): rather than
-  fetching a general road-network graph (which would need a NEW service,
-  e.g. Overpass API — CLAUDE.md Rule 2's "no new dependency without
-  discussing it first"), this snaps onto the geometry of the user's OWN
-  already-computed active route (`routing/RoutingRepository.kt`, OSRM) —
-  the road the demo is actually driving. Reuses Slice 8b's existing
-  infrastructure, needs no new network call. No active route = nothing
-  to snap to = an honest "no correction," not a crash or a guess.
-Inputs: positionEastM/positionNorthM (local meters, same frame as the
-  route geometry below), headingDeg (nullable — null skips the heading
-  check entirely rather than assuming straight-ahead travel),
-  routeGeometryLocalMeters (the active route's geometry, pre-projected
-  by the CALLER via fusion/GeoProjection.toLocalMeters against the same
-  reference point as the position).
-Outputs: SnapResult(eastM, northM, correctionDistanceM)?, null if no
-  route, no heading-compatible segment nearby, or nothing within range.
-Important functions/classes: snap() — for each route segment, finds the
-  nearest point via standard point-to-segment projection (clamped to the
-  segment, not the infinite line), REJECTS any segment whose own bearing
-  disagrees with the estimated heading by more than
-  DEFAULT_MAX_HEADING_DELTA_DEG (45 deg — "simple nearest-segment +
-  heading-compatibility check, not an HMM," PRD.md Section 19's own
-  wording verbatim), then returns the closest surviving candidate within
-  DEFAULT_MAX_SNAP_DISTANCE_M (25m, comparable to GnssQuality's own
-  max-accuracy threshold). Heading comparison is CIRCULAR-safe (same
-  0/360-wrap technique fusion/HeadingFusion.kt and
-  ui/map/PositionSmoother.kt already use) — a naive linear subtraction
-  would wrongly reject e.g. 359 deg vs. a 0-deg segment as a 359-degree
-  mismatch instead of the true 1-degree one.
-Important concepts/assumptions: engineering defaults (25m/45deg), not
-  yet validated against a real test drive (CLAUDE.md Rule 13).
-  Zero-length segments (duplicate consecutive geometry points) are
-  skipped rather than dividing by zero.
-Connected to: ui/screens/MapScreen.kt -> RoadSnap -> StreetMapView.kt's
-  marker position ONLY — deliberately does NOT correct
-  fusion/StateEstimator.kt's `fusedEastM`/`fusedNorthM` itself, since
-  that value also feeds fusion/DriftSummary.kt's measured drift number
-  and MapScreen's own routeProgress, both of which must stay an HONEST,
-  uncorrected measurement of the DR system's real error (CLAUDE.md
-  Rule 13) rather than an artifact of the snapping algorithm's own
-  assumptions — matches PRD.md Section 16's framing of map-constraint
-  snapping as "a correction... rather than the primary estimator."
-Unit tests: tests/.../fusion/RoadSnapTest.kt — fewer than 2 geometry
-  points returns null; an on-segment position snaps to itself with zero
-  correction; an off-to-the-side position snaps perpendicular onto the
-  segment (hand-derived); a position beyond the segment's endpoint
-  clamps to the endpoint rather than the infinite line; a
-  heading-incompatible segment is rejected even when geometrically
-  closer than a compatible one; a null heading skips the compatibility
-  check; a position beyond the max snap distance returns null even if
-  heading-compatible; among multiple segments the heading-INcompatible
-  closer one is correctly rejected in favor of the farther compatible
-  one; the 0/360 wrap boundary is handled correctly (359 deg vs. a 0-deg
-  segment is a 1-degree delta, not 359); a duplicate consecutive point is
-  skipped without a divide-by-zero.
+Status: REMOVED (2026-09-02) — was IMPLEMENTED (Round 2, 2026-08-28)
+REAL BUG FOUND AND FIXED: the 2026-08-30 NOTE this entry used to carry
+  ("a real duplication worth a deliberate follow-up decision") turned out
+  to be an ACTIVE bug, not just latent duplication risk — MapScreen.kt's
+  `currentLatDeg`/`currentLonDeg` computation called `RoadSnap.snap()` on
+  `fusedState.fusedEastM`/`fusedNorthM`, but `map/MapConstraint.kt` (its
+  own entry below) had ALREADY corrected that exact same field upstream
+  inside `fusion/StateEstimator.kt`, before this screen ever saw it —
+  every tick a route was active outside GNSS_AIDED, TWO independent
+  nearest-segment projections were stacking, with slightly different
+  tolerances (this class's 25m/45deg vs MapConstraint's 30m/45deg),
+  risking a marker position neither implementation alone would have
+  computed (and wasting a per-tick projection twice). The "deliberately
+  does NOT correct fusion/StateEstimator.kt's fusedEastM/fusedNorthM"
+  claim this entry used to make was accurate when written (2026-08-28,
+  before MapConstraint existed) and became FALSE the moment
+  MapConstraint started writing into that same field two days later —
+  nobody reconciled the two Round 2 branches that each built this
+  feature independently before both got merged. Consolidated on
+  MapConstraint.kt (the architecturally cleaner spot — corrects the
+  canonical output ONCE, upstream, matching PRD.md Section 16's own
+  framing of map-constraint as "a correction... rather than the primary
+  estimator"); this file and `tests/.../fusion/RoadSnapTest.kt` are
+  deleted, and `ui/screens/MapScreen.kt`'s `currentLatDeg`/`currentLonDeg`
+  now simply projects `fusedState.fusedEastM`/`fusedNorthM` (already
+  MapConstraint-corrected) back to lat/lon — see that file's own updated
+  comment. `fusion/DriftSummary.kt`'s measured drift number was and
+  remains unaffected either way — `fusion/StateEstimator.kt` snapshots it
+  from `drEastM`/`drNorthM` and the newly-reacquired GNSS fix BEFORE
+  `PositionFusion.update()`/`MapConstraint` run that tick.
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/LowPassFilter.kt
 Status: IMPLEMENTED (2026-08-30)
@@ -2544,7 +2588,13 @@ Connected to: ml/MlVelocityRepository -> LongitudinalMotionClassifier ->
   debug screen.
 
 android/app/src/main/kotlin/com/sih26168/idr/map/MapConstraint.kt
-Status: IMPLEMENTED (2026-08-30)
+Status: IMPLEMENTED (2026-08-30) — now the SOLE road-snap implementation
+  (2026-09-02): `fusion/RoadSnap.kt`, a separately-built duplicate of
+  this exact PRD.md Section 19 feature from an independent Round 2
+  branch, was deleted after its own call site in `ui/screens/MapScreen.kt`
+  was found double-snapping on top of this class's upstream correction —
+  see `fusion/RoadSnap.kt`'s (now REMOVED) entry above for the full bug
+  writeup.
 Purpose: PRD.md Section 19's MVP-level map constraint — nearest-road-snap
   plus a heading-compatibility check, explicitly NOT a Hidden Markov
   Model or general map-matching engine (PRD.md Section 19/CLAUDE.md's
@@ -2594,6 +2644,18 @@ UPDATE (Round 2, 2026-08-28): `ui/screens/MapScreen.kt`'s
   `remember` declaration was moved earlier in the composable (was
   previously declared with the rest of the search/routing state, further
   down) so this computation can read it.
+UPDATE (2026-09-02, REAL BUG FIX): the `RoadSnap` call above was
+  double-snapping on top of `map/MapConstraint.kt`'s own upstream
+  correction to the exact same `fusedEastM`/`fusedNorthM` field — see
+  `fusion/RoadSnap.kt`'s (now REMOVED) entry above for the full writeup.
+  `currentLatDeg`/`currentLonDeg` now simply projects
+  `fusedState.fusedEastM`/`fusedNorthM` (already MapConstraint-corrected)
+  back to lat/lon via `GeoProjection.toLatLon` — no second snap. The
+  `activeRoute` dependency was dropped from this `remember` block (no
+  longer read here) but its `remember` declaration stays where it was
+  moved to, since `LaunchedEffect(activeRoute)` still needs it to feed
+  `onActiveRouteGeometryChanged` -> `StateEstimator.setActiveRouteGeometry()`
+  (MapConstraint's own geometry input, unaffected by this change).
 
 ui/theme/Color.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)

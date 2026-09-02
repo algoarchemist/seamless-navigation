@@ -34,7 +34,6 @@ import androidx.compose.ui.unit.dp
 import com.sih26168.idr.dr.DeadReckoningState
 import com.sih26168.idr.fusion.FusedPositionUiState
 import com.sih26168.idr.fusion.GeoProjection
-import com.sih26168.idr.fusion.RoadSnap
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.ml.MlVelocityUiState
@@ -111,24 +110,36 @@ fun MapScreen(
 
     // The real lat/lon to center on and mark. Preference order: a live
     // GNSS fix (most accurate, no projection error) while GNSS_AIDED,
-    // else the fused local-meter position — SNAPPED onto the active
-    // route's geometry when one exists and a compatible nearby segment is
-    // found (PRD.md Section 19, Round 2 addition, 2026-08-28 — see
-    // fusion/RoadSnap.kt), else the raw unsnapped fused position — all
-    // projected back through the SAME outage anchor fusion/StateEstimator.kt
-    // already tracks (fusion/GeoProjection.kt's exact inverse of the
-    // forward projection it already uses). Null (no marker, map still
-    // renders) only before any GNSS fix has EVER been seen this run, since
-    // there is then no anchor to project against.
+    // else the fused local-meter position, projected back through the
+    // SAME outage anchor fusion/StateEstimator.kt already tracks
+    // (fusion/GeoProjection.kt's exact inverse of the forward projection
+    // it already uses). Null (no marker, map still renders) only before
+    // any GNSS fix has EVER been seen this run, since there is then no
+    // anchor to project against.
     //
-    // Deliberately snaps ONLY the marker's DISPLAYED position, never
-    // fusedState.fusedEastM/fusedNorthM itself — that field also feeds
-    // fusion/DriftSummary.kt's measured drift number and this screen's own
-    // routeProgress below, both of which must stay an HONEST, uncorrected
-    // measurement of the DR system's real error (CLAUDE.md Rule 13) rather
-    // than an artifact of the snapping algorithm's own assumptions. This
-    // mirrors PRD.md Section 16's framing: map-constraint snapping is "a
-    // correction... rather than the primary estimator."
+    // REAL BUG FOUND AND FIXED (2026-09-02): this used to ALSO run
+    // fusion/RoadSnap.kt's own nearest-route-segment projection here, on
+    // top of fusedState.fusedEastM/fusedNorthM — but map/MapConstraint.kt
+    // (added 2026-08-30, after this screen's original comment was
+    // written) already corrects THAT SAME field upstream, inside
+    // fusion/StateEstimator.kt, before it ever reaches this screen. Two
+    // independent nearest-segment projections were stacking on every
+    // tick a route was active outside GNSS_AIDED — with slightly
+    // different tolerances (RoadSnap's 25m/45deg vs MapConstraint's
+    // 30m/45deg) — wasting a per-tick projection twice and risking a
+    // marker position neither implementation alone would have computed.
+    // fusion/RoadSnap.kt (and its test) has been deleted; MapConstraint
+    // is now the SOLE road-snap implementation, applied once, upstream,
+    // matching PRD.md Section 16's framing of map-constraint as "a
+    // correction... rather than the primary estimator." This screen now
+    // simply projects the already-correct fusedEastM/fusedNorthM back to
+    // lat/lon — no second snap.
+    //
+    // fusion/DriftSummary.kt's measured drift number remains provably
+    // unaffected by MapConstraint's correction either way: StateEstimator
+    // snapshots it from drEastM/drNorthM and the newly-reacquired GNSS fix
+    // BEFORE PositionFusion.update()/MapConstraint ever run that tick —
+    // see StateEstimator.kt's own doc.
     val (currentLatDeg, currentLonDeg) = remember(
         gnssState.mode,
         gnssState.latestFix,
@@ -136,8 +147,6 @@ fun MapScreen(
         fusedState.anchorLonDeg,
         fusedState.fusedEastM,
         fusedState.fusedNorthM,
-        fusedState.fusedHeadingDeg,
-        activeRoute,
     ) {
         val fix = gnssState.latestFix
         val anchorLat = fusedState.anchorLatDeg
@@ -145,28 +154,9 @@ fun MapScreen(
         when {
             gnssState.mode == GnssMode.GNSS_AIDED && fix != null -> fix.latitudeDeg to fix.longitudeDeg
             anchorLat != null && anchorLon != null -> {
-                val route = activeRoute
-                val snapped = if (route != null) {
-                    val routeLocalMeters = route.geometry.map { point ->
-                        GeoProjection.toLocalMeters(point.latitude, point.longitude, anchorLat, anchorLon)
-                    }
-                    RoadSnap.snap(
-                        positionEastM = fusedState.fusedEastM,
-                        positionNorthM = fusedState.fusedNorthM,
-                        headingDeg = fusedState.fusedHeadingDeg,
-                        routeGeometryLocalMeters = routeLocalMeters,
-                    )
-                } else {
-                    null
-                }
-                val (displayEastM, displayNorthM) = if (snapped != null) {
-                    snapped.eastM to snapped.northM
-                } else {
-                    fusedState.fusedEastM to fusedState.fusedNorthM
-                }
                 GeoProjection.toLatLon(
-                    eastM = displayEastM,
-                    northM = displayNorthM,
+                    eastM = fusedState.fusedEastM,
+                    northM = fusedState.fusedNorthM,
                     refLatDeg = anchorLat,
                     refLonDeg = anchorLon,
                 )
