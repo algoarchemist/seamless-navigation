@@ -1,0 +1,31 @@
+Test results:
+ I tried testing the existing prototype earlier and I put a destination to route and while I was travelling I cant get a GNSS outage tunnel like situation so what I did is that I just turned off the GPS mid travel and I noticed that the current location was actually changing along our way with dotted drift lines but it didn't keep lanes with respect to road but it worked. when I turned off GPS first it went to transition mode, the drift was showing on dead reckoning mode and then when I turned on the GPS again it went to reacquisition mode and after a recenter of the current location it went to GNSS_aided mode and started working as usual by tracking with the help of GPS. it snapped right back with the screen orientation upside down and it didnt feel smooth but it worked. 
+
+Next plan of action:
+Functions/features to add:
+GNSS/DR blending on reacquisition — for both position and heading/map-orientation. Right now both are hard cutovers with zero interpolation, which is exactly what produced the position snap and the upside-down flip.
+Phone-to-vehicle alignment applied to the physics DR path — the alignment correction (AlignmentEstimator) currently only feeds the ML velocity path. The physics path still uses raw device azimuth uncorrected, which is what let the DR heading drift far enough from true heading to flip the map ~180° on reacquisition.
+Motion classifier — train_motion_classifier.py exists only as a stub (status: PLANNED). Nothing currently gates when the ML velocity output should be trusted vs. discounted.
+Damping/smoothing on the ML velocity output — the physics path has integrator "memory" that absorbs a single bad reading; the ML path has none, so one jolt (your desk-bump test) produces a visible position jump. Needs either a min-speed cutoff, exponential smoothing, or gating from the motion classifier above.
+Out-of-distribution guard on the ML model — if live sensor input falls outside what the model was trained on, it still confidently outputs a number with no sanity check or fallback to physics.
+Map-constrained output (snap-to-road) — not built at all currently; your test confirmed the dot doesn't follow lanes.
+End-to-end drift measurement/logging — you currently have per-tick velocity MAE measured, not actual accumulated position drift over a real outage. Worth instrumenting so a real number gets logged automatically on every DR session, not just eyeballed.
+Barometer-based floor/level change detection — directly useful for the "multi-level parking" scenario named in the SIH problem statement itself; nothing currently uses altitude at all.
+Cross-language parity test between Python feature_extraction.py and Kotlin FeatureExtractor.kt — right now they're "mirrored" by hand with no automated check that they stay identical; any future edit to one and not the other silently corrupts ML input.
+Loopholes / guardrails to fix
+Stationary detector can't tell "parked" from "coasting at a perfectly steady speed" — both look identical to accel+gyro alone. Already disclosed as a known limitation in your own code comments, not yet mitigated.
+GNSS quality thresholds (3000ms fix age, 25m accuracy) are undocumented engineering guesses, explicitly flagged in your own code as not validated against a real outage run — worth an actual tuning pass with real data before quoting them to judges as considered values.
+GNSS confidence is binary, not continuous — a fix at 24m accuracy is trusted exactly the same as one at 2m. No graduated blending by signal quality yet.
+The one held-out trip where physics beat the ML model (S-Vtb3) was never investigated — you don't actually know why, which means you don't know if it's a one-off or a pattern (e.g. the model underperforming on short/low-speed trips).
+accel_up_std_mps2 dominates feature importance at 0.672 — plausibly a road-vibration proxy rather than a true kinematic signal. Untested generalization risk across different vehicles, mounts, and road surfaces.
+The GeocodingRepository silent-failure bug you already fixed once (collapsing search failures into an empty result instead of surfacing an error) is a pattern worth auditing for elsewhere in the codebase — same silent-swallow anti-pattern could exist in other repositories and you wouldn't know until something goes quietly wrong in front of judges.
+No automated regression check that the physics/ML/state-machine numbers you're citing still hold after each new change — right now, staying honest depends on remembering to manually re-run and re-check.
+Other phone sensors not currently used
+Linear acceleration sensor (TYPE_LINEAR_ACCELERATION) — Android's own hardware/software-fused, already-gravity-removed accelerometer. Could replace or cross-check your current manual gravity-subtraction step.
+Gravity sensor (TYPE_GRAVITY) — a dedicated smoothed gravity vector, separate from raw accel. IO-VNBD's own dataset records this separately; your app currently just uses a fixed gravity constant instead.
+Game rotation vector (TYPE_GAME_ROTATION_VECTOR) — orientation from gyro+accel only, no magnetometer. More stable than your current rotation-vector sensor inside a metal vehicle cabin where magnetic interference from the car itself is a real problem.
+Magnetometer (TYPE_MAGNETIC_FIELD) — IO-VNBD logs this and you don't read it at all currently, despite it being right there for heading correction (with the usual caveat that it's noisy near vehicle electronics).
+Barometer (TYPE_PRESSURE) — altitude/floor-change detection, directly relevant to multi-level parking.
+Step detector / step counter (TYPE_STEP_DETECTOR, TYPE_STEP_COUNTER) — more reliable than accel heuristics for your existing walking-mode toggle.
+Significant motion sensor — low-power wake trigger; useful for battery efficiency if the phone sits truly idle for long stretches.
+Proximity sensor — cheap signal for "phone in pocket vs. mounted," which is directly relevant context for the not-yet-built motion classifier.
