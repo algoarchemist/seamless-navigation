@@ -1125,7 +1125,9 @@ Purpose: JUnit4 unit tests for YawRate.radPerSecond — first sample (no
   direction is preserved (sign matters, not just magnitude).
 
 android/app/src/test/kotlin/com/sih26168/idr/alignment/AlignmentEstimatorTest.kt
-Status: IMPLEMENTED (Slice 6)
+Status: IMPLEMENTED (Slice 6). UPDATE (2026-09-02): 5 new tests added for
+  the roll/pitch mounting baseline + reducedConfidenceDueToRoll flag —
+  see AlignmentEstimator.kt's entry.
 Purpose: JUnit4 unit tests for the yaw-alignment accumulator — starts
   unaligned; matching azimuth/bearing converges to a zero offset once
   enough samples accumulate; a consistent 10-degree offset is correctly
@@ -1436,7 +1438,10 @@ UPDATE (Round 2, 2026-08-28) — GnssQuality gained a second function,
 
 android/app/src/main/kotlin/com/sih26168/idr/alignment/{YawRate,AlignmentEstimator}.kt
 Status: IMPLEMENTED (Slice 6, 2026-08-25) — see `## Slice 1-6` build
-  verification below for full detail.
+  verification below for full detail. UPDATE (2026-09-02): see the
+  `reset() also clears...` note below — AlignmentEstimator now also
+  estimates a roll/pitch mounting baseline and a motorcycle-lean
+  confidence flag.
 Purpose: PRD.md Section 15's phone-to-vehicle YAW alignment. Scope
   note: pitch/roll are deliberately NOT separately estimated — Android's
   rotation-vector sensor already fuses gravity into its own azimuth/
@@ -1447,7 +1452,10 @@ Purpose: PRD.md Section 15's phone-to-vehicle YAW alignment. Scope
   resolve (PRD.md Section 15's own stated reason for using GNSS course).
 Inputs: azimuthRad (from OrientationSample), gnssBearingDeg/gnssSpeedMps
   (nullable, from GnssFix), a wall/boot-time nowNs per tick.
-Outputs: AlignmentEstimate(yawOffsetRad, sampleCount, isAligned).
+Outputs: AlignmentEstimate(yawOffsetRad, sampleCount, isAligned,
+  rollOffsetRad, pitchOffsetRad, pitchRollSampleCount,
+  isPitchRollAligned, reducedConfidenceDueToRoll — the last five added
+  2026-09-02).
 Important functions/classes: YawRate.radPerSecond (pure, angle-unwrap-
   aware WORLD-frame turning-rate calculation from consecutive azimuth
   samples — deliberately NOT derived from raw device gyro Z, which only
@@ -1470,6 +1478,24 @@ Important concepts/assumptions: engineering-default thresholds
   alignment/AlignmentRepository.kt below, which also moved this class's
   one caller from being MlVelocityRepository-only to a shared repository
   both DR paths read.
+  UPDATE (2026-09-02, PRD.md Section 15's motorcycle-lean carve-out):
+  evaluate() now also takes pitchRad/rollRad and accumulates a roll/pitch
+  MOUNTING baseline (same circular-mean technique as yaw) while the
+  vehicle is near-stationary with a GNSS fix (speed <= 1.0 m/s — a parked
+  vehicle's own roll/pitch is ~0, so the device's roll/pitch at that
+  moment IS the mounting tilt). Once that baseline is established
+  (>= 20 samples, same convention as yaw's minSamplesForAligned),
+  reducedConfidenceDueToRoll flags true whenever the CURRENT roll
+  deviates from it by more than ~20 degrees (DEFAULT_MAX_ROLL_EXCURSION_RAD,
+  engineering default, CLAUDE.md Rule 13) — a real lean, a slipped mount,
+  etc. This is deliberately a FLAG only, not a lean-dynamics correction —
+  PRD.md Section 15 explicitly excludes modeling the lean itself. Both
+  pitchRad/rollRad params default to 0f so all pre-existing yaw-only call
+  sites/tests remain valid unmodified. A true device->vehicle 3-axis
+  rotation matrix is still NOT built beyond this baseline — this
+  project's 2D horizontal navigation only ever needs a heading (yaw),
+  which mounting pitch/roll tilt doesn't change (see this file's own
+  updated class doc for the full reasoning).
 Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository -> AlignmentEstimator
 
 android/app/src/main/kotlin/com/sih26168/idr/alignment/AlignmentRepository.kt
@@ -1497,13 +1523,18 @@ Purpose: The Android/coroutine glue that turns the pure AlignmentEstimator
   longer exists).
 Inputs: SensorRepository.state (orientation), GnssModeRepository.state
   (GNSS bearing/speed/latestFix).
-Outputs: AlignmentUiState(yawOffsetRad, sampleCount, isAligned) — same
-  three fields AlignmentEstimate already had, republished as this
-  repository's own StateFlow.
+Outputs: AlignmentUiState(yawOffsetRad, sampleCount, isAligned,
+  rollOffsetRad, pitchOffsetRad, pitchRollSampleCount,
+  isPitchRollAligned, reducedConfidenceDueToRoll) — same fields
+  AlignmentEstimate now has (the last five added 2026-09-02), republished
+  as this repository's own StateFlow.
 Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository ->
   dr/BaselineDeadReckoningRepository (vehicle-heading correction for
   NonHolonomicConstraint) AND ml/MlVelocityRepository (unchanged feature-
-  path correction); MainActivity's "recalibrate" button ->
+  path correction, PLUS (2026-09-02) republishes reducedConfidenceDueToRoll
+  into MlVelocityUiState -> ui/screens/StatusOverlayContent.kt /
+  MainActivity's debug screen, PRD.md Section 31's "alignment/confidence
+  indicator"); MainActivity's "recalibrate" button ->
   AlignmentRepository.reset(); motion/PhoneMovedDetector ->
   AlignmentRepository (automatic reset trigger)
 
@@ -1688,7 +1719,8 @@ Purpose: The Android/coroutine glue wiring SensorRepository +
   is directly visible on-device, not just a desktop-measured claim.
 Outputs: StateFlow<MlVelocityUiState> — {predictedVelocityMps,
   isAligned, yawOffsetDeg, alignmentSampleCount, positionEastM,
-  positionNorthM}.
+  positionNorthM, reducedConfidenceDueToRoll (added 2026-09-02, republished
+  from AlignmentRepository.state — see that class's entry)}.
 Important concepts/assumptions: yaw rate for the gyro feature is
   computed by rotating the RAW gyro vector into world frame the same
   way as accel (angular velocity transforms as a vector under a pure

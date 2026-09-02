@@ -826,6 +826,15 @@ private fun IdrSensorScreen(
                         },
                     )
                     Text(
+                        text = if (mlState.reducedConfidenceDueToRoll) {
+                            "Phone-to-vehicle roll baseline: REDUCED CONFIDENCE — current roll " +
+                                "deviates from the stationary-established mounting baseline by more " +
+                                "than the motorcycle-lean threshold (PRD Section 15)"
+                        } else {
+                            "Phone-to-vehicle roll baseline: within normal range"
+                        },
+                    )
+                    Text(
                         text = if (mlState.isCruising) {
                             "Motion state: CRUISING (looks physically still, but the raw model " +
                                 "still predicts real speed — ZUPT skipped this tick)"

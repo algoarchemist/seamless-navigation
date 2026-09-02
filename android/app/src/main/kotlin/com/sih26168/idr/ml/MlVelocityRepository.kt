@@ -44,6 +44,8 @@ data class MlVelocityUiState(
     val isAligned: Boolean = false,
     val yawOffsetDeg: Float? = null,
     val alignmentSampleCount: Int = 0,
+    /** (2026-09-02) PRD.md Section 15's motorcycle-lean flag — see AlignmentEstimator.kt's doc. Republished from AlignmentRepository, not computed here. */
+    val reducedConfidenceDueToRoll: Boolean = false,
     val positionEastM: Double = 0.0,
     val positionNorthM: Double = 0.0,
     /** MotionStateClassifier overrode a physically-still tick to NOT ZUPT, because the raw model still predicts real speed. */
@@ -338,6 +340,7 @@ class MlVelocityRepository(
                     isAligned = alignment.isAligned,
                     yawOffsetDeg = alignment.yawOffsetRad?.let { Math.toDegrees(it.toDouble()).toFloat() },
                     alignmentSampleCount = alignment.sampleCount,
+                    reducedConfidenceDueToRoll = alignment.reducedConfidenceDueToRoll,
                     positionEastM = positionState.positionEastM,
                     positionNorthM = positionState.positionNorthM,
                     isCruising = motionClassification.isCruising,
