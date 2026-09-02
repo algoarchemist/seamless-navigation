@@ -13,14 +13,14 @@ no benchmark number here is invented (per `CLAUDE.md` Rule 13).
 
 | # | Capability | Status | Where |
 |---|---|---|---|
-| 1 | In-Vehicle Alignment & Calibration Engine | 🟡 Yaw shared across both DR paths + auto re-calibration implemented (2026-08-30), see below | `alignment/AlignmentRepository.kt`, `alignment/AlignmentEstimator.kt`, `motion/PhoneMovedDetector.kt` |
+| 1 | In-Vehicle Alignment & Calibration Engine | 🟡 Yaw shared across both DR paths + auto re-calibration + roll/pitch mounting baseline + motorcycle-lean confidence flag implemented (2026-09-02), see below | `alignment/AlignmentRepository.kt`, `alignment/AlignmentEstimator.kt`, `motion/PhoneMovedDetector.kt` |
 | 2 | AI Speed & Vibration Filter | 🟡 Velocity ✅, vibration filter + Accelerating/Braking implemented (2026-08-30), trained classifier still ❌ (blocked on real data), see below | `ml/VelocityModel.kt`, `dr/LowPassFilter.kt`, `motion/LongitudinalMotionClassifier.kt` |
 | 3 | Advanced Map-Matching & Kinematic Constraints | 🟡 MVP-level map snap + Turning exemption implemented (2026-08-30), see below | `map/MapConstraint.kt`, `motion/TurningDetector.kt`, `dr/NonHolonomicConstraint.kt` |
-| 4 | GNSS+INS Fusion Engine | 🟡 AI-based adaptive REACQUISITION blend implemented (2026-08-30), see below | `ml/ReacquisitionDriftModel.kt`, `fusion/PositionFusion.kt`, `fusion/RunningStats.kt` |
+| 4 | GNSS+INS Fusion Engine | 🟡 AI-based adaptive REACQUISITION blend + continuous-accuracy velocity weighting + GNSS jitter smoothing implemented (2026-09-02), see below | `ml/ReacquisitionDriftModel.kt`, `fusion/PositionFusion.kt`, `fusion/GnssJitterFilter.kt`, `fusion/VelocityBiasCalibrator.kt` |
 | 5 | Seamless GNSS Deficit Handler | 🟡 Implemented, timing unvalidated | `gnss/GnssOutageDetector.kt` |
 | 6 | Real-time Navigation Interface | 🟡 Marker now animates + rotates with heading (2026-08-31), symmetric GNSS-reacquired banner added, see below | `ui/map/StreetMapView.kt`, `ui/screens/MapScreen.kt`, `ui/components/GnssModeChangeBanner.kt` |
 
-## 1. In-Vehicle Alignment & Calibration Engine — 🟡 yaw shared + auto-recalibration, implemented 2026-08-30
+## 1. In-Vehicle Alignment & Calibration Engine — 🟡 yaw + roll/pitch baseline + auto-recalibration, implemented 2026-09-02
 
 **What exists:** `AlignmentEstimator.kt` still computes a **yaw offset
 only** — a circular mean of `(device azimuth − GNSS course-over-ground)`,
@@ -50,14 +50,33 @@ is unchanged; what changed is who runs and consumes it:
   button now calls `AlignmentRepository.reset()` directly, decoupled
   from ML load success.
 
-**Still missing relative to the literal ask:** pitch/roll are still not
-separately estimated — an unchanged, documented design choice (Android's
-rotation-vector sensor already gravity-references pitch/roll), so there
-is still no true device→vehicle 3-axis rotation matrix, only a scalar
-yaw correction. `PhoneMovedDetector`'s 15°/1s thresholds are engineering
-defaults, unvalidated against real "phone picked up mid-drive" data
-(CLAUDE.md Rule 13) — no real-world false-positive/false-negative rate
-can be quoted yet.
+**Closed 2026-09-02:** PRD.md Section 15's own explicitly-scoped
+remaining piece — "does not model motorcycle lean beyond flagging it as
+reduced confidence during large roll excursions" — is now implemented.
+`AlignmentEstimator.kt` accumulates a roll/pitch MOUNTING baseline (same
+circular-mean technique as yaw) while the vehicle is near-stationary
+with a GNSS fix (≤1.0 m/s — a parked vehicle's own roll/pitch is ~0, so
+the device's roll/pitch at that moment IS the mounting tilt), then flags
+`reducedConfidenceDueToRoll` whenever the CURRENT roll deviates from
+that baseline by more than ~20° (engineering default, CLAUDE.md Rule 13,
+unvalidated against real lean/remount data). Republished through
+`AlignmentRepository` → `MlVelocityRepository`'s `MlVelocityUiState` →
+shown as a warning in `StatusOverlayContent.kt` (PRD §31's "alignment/
+confidence indicator") and in `MainActivity`'s debug screen. 5 new unit
+tests in `AlignmentEstimatorTest.kt`.
+
+**Still missing relative to the literal ask:** this is still a FLAG, not
+a corrected lean estimate — PRD.md Section 15 explicitly excludes
+building a lean-dynamics model, so that's a deliberate non-goal, not a
+gap. A full device→vehicle 3-axis rotation matrix is still deliberately
+NOT built beyond this baseline — this project's 2D horizontal navigation
+only ever needs a heading (yaw), which mounting pitch/roll tilt doesn't
+change; see `AlignmentEstimator.kt`'s own doc for the full reasoning.
+`PhoneMovedDetector`'s 15°/1s thresholds and the new ~20° roll-excursion
+threshold are both engineering defaults, unvalidated against real
+"phone picked up mid-drive" / "real lean or remount" data (CLAUDE.md
+Rule 13) — no real-world false-positive/false-negative rate can be
+quoted yet for either.
 
 ## 2. AI Speed & Vibration Filter — 🟡 velocity done, filter/classifier missing
 
@@ -143,7 +162,7 @@ real labeled data.
   physics path, which stays a separate, larger change (Roadmap item #5
   below) rather than folded into this one.
 
-## 4. GNSS+INS Fusion Engine — 🟡 AI-based adaptive blend, implemented 2026-08-30
+## 4. GNSS+INS Fusion Engine — 🟡 AI-based adaptive blend + jitter smoothing, implemented 2026-09-02
 
 `fusion/PositionFusion.kt` is still a rule-based state machine at its
 core — position is **frozen** during `TRANSITION`, then **linearly
@@ -176,12 +195,42 @@ that) — this stays a simple, transparent formula fed by a small learned
 prediction, matching the "Learned adaptive REACQUISITION blend" option
 chosen at this decision point (see below) over a full EKF/UKF filter.
 
-**Still missing relative to the literal ask:** the underlying blend
+**Closed 2026-09-02:** PRD.md Section 17's OTHER still-open fusion
+piece — "the IMU-derived velocity/heading are used to smooth short GNSS
+gaps/jitter" — is now implemented. This turned out to have TWO already-
+built halves this doc hadn't previously called out by name (both landed
+2026-08-28, before today's session): the velocity-bias half
+(`VelocityBiasCalibrator`, unchanged) and FR13's continuous accuracy
+weighting (`GnssQuality.confidenceWeight`, already wired into that
+calibrator's `update()` calls). What was genuinely still missing was
+POSITION jitter smoothing — the map marker snapped to each new raw GNSS
+fix directly while `GNSS_AIDED`, with zero IMU smoothing, since
+`PositionFusion`'s `GNSS_AIDED` branch was hard-coded to `(0, 0)`
+(exactly the raw fix, unmodified). `fusion/GnssJitterFilter.kt` (new) is
+a simple COMPLEMENTARY filter — deliberately not a Kalman filter, same
+"What Not To Build" exclusion as the REACQUISITION blend above — that
+predicts forward from the last smoothed position using the current
+IMU/DR velocity, then pulls that prediction toward each new raw fix by
+`GnssQuality.confidenceWeight` (reusing the exact same FR13 signal, so a
+precise fix snaps close to raw GNSS almost immediately while a marginal-
+but-still-"good" fix leans more on the IMU prediction). Runs in a FIXED
+local frame (`StateEstimator.tripOriginLatDeg/LonDeg`, set once) kept
+deliberately separate from the continuously-moving reacquisition anchor
+(`outageAnchorLatDeg/LonDeg`), so this change cannot touch the anchor-
+accuracy drift-measurement fix that landed hours earlier the same day.
+6 new unit tests (`GnssJitterFilterTest.kt`) + 1 new `PositionFusionTest`
+case.
+
+**Still missing relative to the literal ask:** the REACQUISITION blend
 mechanism is still linear interpolation, not a state-space estimator;
-only its duration is now learned. No real outdoor test drive has yet
-exercised this adaptive path — the 500–3000ms bounds and the
-30ms-per-meter scale factor are engineering defaults, unvalidated against
-real reacquisition events (CLAUDE.md Rule 13).
+only its duration is now learned. The new jitter filter is a fixed-
+formula complementary filter too, not a covariance-aware estimator —
+both are deliberate, per CLAUDE.md's "What Not To Build" (no Kalman/EKF).
+No real outdoor test drive has yet exercised either adaptive path — the
+500–3000ms REACQUISITION bounds, the 30ms-per-meter scale factor, and
+the jitter filter's own behavior are all engineering defaults/untuned
+formulas, unvalidated against real reacquisition events or real GNSS
+jitter (CLAUDE.md Rule 13).
 
 ## 5. Seamless GNSS Deficit Handler — 🟡 implemented, timing unvalidated
 
@@ -296,7 +345,21 @@ Strategies) first.
    path only, per that entry's own reasoning (ONNX train/inference parity)
    — still needs a real outdoor test drive to see whether it measurably
    reduces the physics baseline's own drift.
-7. **Collect a small self-captured labeled dataset** (Pothole,
+7. ~~**Flag reduced confidence during large roll excursions**
+   (PRD.md Section 15's own explicitly-scoped motorcycle-lean carve-out)
+   — establish a roll/pitch mounting baseline from gravity while
+   near-stationary, then flag a deviation beyond it.~~ **DONE
+   (2026-09-02)** — see capability #1 above (`AlignmentEstimator.kt`'s
+   `reducedConfidenceDueToRoll`). Still needs a real outdoor test drive
+   (or real motorcycle-lean/remount data) to validate the ~20° threshold.
+8. ~~**Smooth short GNSS gaps/jitter with IMU velocity** (PRD.md
+   Section 17's other still-open fusion piece — the map marker snapped
+   to each raw GNSS fix directly while GNSS_AIDED, with zero smoothing)
+   — a simple complementary filter, not a Kalman filter.~~ **DONE
+   (2026-09-02)** — see capability #4 above (`fusion/GnssJitterFilter.kt`).
+   Still needs a real outdoor test drive to validate whether it visibly
+   reduces marker jitter without introducing a lag artifact.
+9. **Collect a small self-captured labeled dataset** (Pothole,
    Phone-Moved, Turning, Accelerating, Braking) and train
    `train_motion_classifier.py`, replacing ALL FIVE deterministic
    stand-ins (`MotionStateClassifier`, `PotholeShockDetector`,

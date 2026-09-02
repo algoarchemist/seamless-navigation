@@ -6,6 +6,16 @@ package com.sih26168.idr.capture
  * sensor clock family accel/gyro/orientation timestamps already use
  * (CLAUDE.md Rule 9/14) — NOT wall-clock time, and NOT reconciled against
  * GNSS's wall-clock fixes.
+ *
+ * [label] (added 2026-09-01, PRD.md Section 24's "self-captured labelled
+ * data" for the two motion-classifier classes IO-VNBD doesn't provide
+ * ground truth for — Pothole and Phone Moved, per the Phase 4 finding in
+ * docs/PROJECT_MAP.md) is whichever of [CaptureLabel] was ACTIVE at the
+ * instant this tick was recorded, set by MainActivity's marker buttons —
+ * not derived from the sensor values themselves (this class stays a dumb
+ * recorder, same as before this field existed). Defaults to
+ * [CaptureLabel.NONE] so a capture with no marker taps is still valid
+ * (background/negative-class data, useful on its own).
  */
 data class SensorRecordEntry(
     val elapsedMs: Long,
@@ -18,7 +28,24 @@ data class SensorRecordEntry(
     val azimuthRad: Float,
     val pitchRad: Float,
     val rollRad: Float,
+    val label: String = CaptureLabel.NONE,
 )
+
+/**
+ * The only two PRD.md Section 14 motion-classifier classes this project
+ * actually needs manually-marked ground truth for (see SensorRecordEntry's
+ * own doc) — every other class (Stationary/Moving/Accelerating/Braking/
+ * Cruising/Turning) already has a deterministic stand-in or is weak-
+ * labelable from GNSS speed/heading, per the Phase 4 dataset-inspection
+ * finding in docs/PROJECT_MAP.md. Plain string constants, not a Kotlin
+ * enum, so [SensorRecordEntry.label] round-trips through CSV/JSON without
+ * a separate (de)serializer (CLAUDE.md Rule 2 — no new tooling for this).
+ */
+object CaptureLabel {
+    const val NONE = "NONE"
+    const val POTHOLE = "POTHOLE"
+    const val PHONE_MOVED = "PHONE_MOVED"
+}
 
 /**
  * Minimal one-off data-capture tool (CLAUDE.md Rule 18: a small prototype
@@ -51,6 +78,7 @@ class SensorRecorder {
         azimuthRad: Float,
         pitchRad: Float,
         rollRad: Float,
+        label: String = CaptureLabel.NONE,
     ) {
         val start = startTimestampNs ?: timestampNs.also { startTimestampNs = it }
         val elapsedMs = (timestampNs - start) / 1_000_000L
@@ -65,6 +93,7 @@ class SensorRecorder {
             azimuthRad = azimuthRad,
             pitchRad = pitchRad,
             rollRad = rollRad,
+            label = label,
         )
     }
 
@@ -85,7 +114,8 @@ class SensorRecorder {
             sb.append("\"elapsedMs\":${e.elapsedMs},")
             sb.append("\"accelXMps2\":${e.accelXMps2},\"accelYMps2\":${e.accelYMps2},\"accelZMps2\":${e.accelZMps2},")
             sb.append("\"gyroXRadPerSec\":${e.gyroXRadPerSec},\"gyroYRadPerSec\":${e.gyroYRadPerSec},\"gyroZRadPerSec\":${e.gyroZRadPerSec},")
-            sb.append("\"azimuthRad\":${e.azimuthRad},\"pitchRad\":${e.pitchRad},\"rollRad\":${e.rollRad}")
+            sb.append("\"azimuthRad\":${e.azimuthRad},\"pitchRad\":${e.pitchRad},\"rollRad\":${e.rollRad},")
+            sb.append("\"label\":\"${e.label}\"")
             sb.append("}")
             if (index != entries.lastIndex) sb.append(",")
             sb.append("\n")

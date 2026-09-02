@@ -18,13 +18,22 @@ motion-classification stand-ins, a Figma-derived UI with Drive/Map/
 History tabs, real OpenStreetMap street tiles, and full search ->
 route -> turn-by-turn navigation against live Nominatim/OSRM services.
 `train_motion_classifier.py` remains PLANNED (blocked on self-captured
-Pothole/Phone-Moved labels IO-VNBD doesn't provide). A true outdoor
-GNSS_AIDED lock (needed to verify TRANSITION/REACQUISITION blending and
-live turn-by-turn progress against real motion) has not yet happened
-this project — every fix so far has come from indoor/marginal-signal
-on-device testing, which has itself surfaced and fixed several real
-bugs (noisy Doppler speed, REACQUISITION flapping, a missing map
-anchor, tile-loading fights with `animateTo`, and others).
+Pothole/Phone-Moved labels IO-VNBD doesn't provide). UPDATE (2026-09-01):
+a real outdoor GNSS_AIDED lock has now happened (325.9s drive, 3
+GNSS_AIDED segments up to 149.9s, 3 genuine DEAD_RECKONING stretches up
+to 37.8s) — see DriveDataLogger.kt's entry below for the full result.
+It surfaced a real, measured finding: StationaryDetector's ZUPT is 100%
+false-negative on real urban-traffic data and no fixed accel/gyro
+threshold fixes it (the two classes don't cleanly separate) — flagged,
+not silently patched. Before that drive, every fix had come from
+indoor/marginal-signal on-device testing, which had itself surfaced and
+fixed several real bugs (noisy Doppler speed, REACQUISITION flapping, a
+missing map anchor, tile-loading fights with `animateTo`, and others).
+Same day: SensorRecorder.kt gained a `CaptureLabel`
+(NONE/POTHOLE/PHONE_MOVED) marker mechanism and two debug-screen buttons
+so a real self-captured labeled drive can now be recorded — tooling
+only so far, no labeled drive has actually been captured yet, so
+`train_motion_classifier.py` stays PLANNED.
 
 **The full chronological history — every dated bug fix, scope decision,
 and on-device verification — now lives in `summary.txt` at the repo
@@ -74,7 +83,27 @@ the Map tab's displayed marker onto the active route's geometry
 remaining item from the original SIH requirements list that was still
 just PLANNED. Deliberately display-only: `fusion/StateEstimator.kt`'s
 canonical `fusedEastM`/`fusedNorthM` (which feeds the measured drift
-number and route progress) is untouched by this correction.
+number and route progress) is untouched by this correction. **REMOVED
+2026-09-02**: a second, independently-built implementation of this exact
+feature (`map/MapConstraint.kt`) landed two days later and started
+correcting `fusedEastM`/`fusedNorthM` UPSTREAM in `StateEstimator.kt`
+itself — nobody reconciled the two, so this class's own correction was
+silently stacking on top of MapConstraint's every tick. See
+`fusion/RoadSnap.kt`'s own (now REMOVED) entry below for the full bug
+writeup; MapConstraint.kt is the sole surviving implementation.
+
+**Context-aware ZUPT update:** `motion/StopEventClassifier.kt` (NEW)
+replaces the flat "accel/gyro quiet -> ZUPT" gate both DR paths used —
+the 2026-09-01 finding that accel/gyro-only detection was 100%
+false-negative on real traffic stops is now addressed with a second,
+independent signal (a sustained drop from a meaningful reference speed
+to near-zero, preferring GNSS speed when trustworthy) rather than
+retuning the same unreliable threshold. Rule-based, not ML (no labeled
+stop-event data exists — CLAUDE.md Rule 3). Both
+`dr/BaselineDeadReckoningRepository.kt` and `ml/MlVelocityRepository.kt`
+now go through it; `dr/StationaryDetector.kt` itself is unchanged,
+composed rather than replaced. See its own entry below for the full
+design and honest limitations.
 
 ---
 
@@ -433,7 +462,84 @@ Important concepts/assumptions: HONEST LIMITATION — constant-velocity
   ML classifier; neither is available here. Thresholds (0.25 m/s^2,
   0.05 rad/s, 300ms dwell) are engineering defaults, not yet validated
   against a real test drive (CLAUDE.md Rule 13).
-Connected to: BaselineDeadReckoningRepository -> StationaryDetector -> BaselinePhysicsIntegrator.overrideVelocity
+Connected to: BaselineDeadReckoningRepository -> StopEventClassifier -> StationaryDetector (wrapped, unchanged);
+  MlVelocityRepository -> StopEventClassifier -> StationaryDetector (wrapped, unchanged)
+UPDATE: no longer called directly by either DR repository — both now go
+  through motion/StopEventClassifier.kt (see its own entry below), which
+  composes this class UNCHANGED as one of its two signals. This class's
+  own behavior, signature, and tests are untouched.
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/StopEventClassifier.kt
+Status: IMPLEMENTED
+Purpose: Context-aware replacement for gating ZUPT on "accel/gyro quiet
+  for N ms" alone (PRD.md Section 14's Stationary effect) — distinguishes
+  MOVING / SUDDEN_STOP / BRIEF_STOP / LONG_IDLE instead of a flat
+  stationary/not-stationary boolean. REAL FINDING driving this class's
+  existence (2026-09-01 real outdoor drive, see StationaryDetector.kt's
+  own doc): cross-checked against GNSS speed as ground truth,
+  accel/gyro-only stationary detection was 100% false-negative on real
+  urban-traffic stops — engine-idle/road vibration keeps accel/gyro
+  elevated even while genuinely stopped in traffic, so no fixed threshold
+  on that signal alone separates the classes. Adds a SECOND, independent
+  signal: a sustained drop from a meaningful reference speed to
+  near-zero, corroborated by GNSS speed when it's actually trustworthy —
+  deliberately NOT gated on the same strict accel/gyro threshold, since
+  that's exactly the signal measured unreliable for this case.
+Inputs: nowMs, linearAccelMagnitudeMps2, gyroMagnitudeRadPerSec (same as
+  StationaryDetector, passed straight through to the wrapped instance),
+  currentSpeedEstimateMps (caller's own pre-ZUPT speed — the physics
+  integrator's pre-override speed, or the ML model's damped prediction),
+  gnssSpeedMps (nullable — only passed by callers once they've verified
+  GNSS_AIDED + GnssQuality.isGood; preferred over currentSpeedEstimateMps
+  when present).
+Outputs: StopClassification(context, shouldApplyZupt, stationaryDurationMs,
+  recentPeakSpeedMps, currentSpeedEstimateMps, dwellConfirmedStationary,
+  reason) — shouldApplyZupt is the actual gate (true for every context
+  except MOVING); dwellConfirmedStationary exposes StationaryDetector's
+  own plain accel/gyro-dwell result so a caller that still needs that
+  exact signal (ml/MlVelocityRepository.kt's MotionStateClassifier
+  contract) doesn't need a second, redundant StationaryDetector instance.
+Important functions/classes: evaluate() — SUDDEN_STOP requires BOTH a
+  recent (within suddenStopLookbackMs=2000ms) reference speed
+  >= suddenStopPriorSpeedMps (1.5 m/s) AND the reference speed sustaining
+  <= nearZeroSpeedMps (0.3 m/s, matching scripts/analyze_drive_log.py's
+  own report_zupt_validation ground-truth bound) for
+  nearZeroConfirmMs (150ms — deliberately shorter than
+  StationaryDetector's 300ms dwell, since the prior-speed evidence
+  already raises confidence). BRIEF_STOP/LONG_IDLE fall back to
+  StationaryDetector's own accel/gyro dwell (split at
+  longIdleDurationMs=8000ms) — the sole signal when there's no meaningful
+  prior-speed evidence, e.g. right after launch. All five thresholds are
+  engineering defaults, not yet validated against a real labeled
+  stop-event drive (CLAUDE.md Rule 13) — no such drive has been captured
+  (see capture/SensorRecorder.kt's CaptureLabel tooling, still unused for
+  a real drive). reset() clears this class's own history/state but
+  deliberately does NOT reset the wrapped StationaryDetector, which has
+  no reset() of its own — matches existing app behavior (neither
+  repository reset it before this class existed either).
+Important concepts/assumptions: Rule-based by design, not ML — no
+  labeled stop-event data exists in this project
+  (train_motion_classifier.py stays PLANNED, blocked on self-captured
+  labels), and CLAUDE.md Rule 3 requires a measured reason to reach for
+  ML over a simple deterministic solution. HONEST LIMITATION: when no
+  GNSS speed is available (mid-outage, exactly when ZUPT matters most),
+  the reference speed is this app's own DR/ML estimate, not independent
+  ground truth — a sustained speed-estimate glitch during real continued
+  motion could in principle misfire into SUDDEN_STOP; preferring GNSS
+  speed whenever trustworthy minimizes but does not eliminate this.
+Connected to: dr/BaselineDeadReckoningRepository.kt, ml/MlVelocityRepository.kt
+  -> StopEventClassifier -> StationaryDetector (wrapped)
+Unit tests: tests/.../motion/StopEventClassifierTest.kt (11 cases) — long
+  idle after sustained no-prior-motion quiet; a brief stop stays
+  BRIEF_STOP under the idle bound; sudden stop after high-speed movement
+  fires before the accel/gyro dwell alone would; stop after low-speed
+  movement does NOT qualify for the fast path (falls back to the dwell
+  path); a single noisy near-zero glitch during real continued motion
+  does not false-ZUPT; resuming motion from LONG_IDLE returns to MOVING
+  and resets duration; GNSS speed is preferred over the own estimate when
+  supplied; falls back to the own estimate when GNSS speed isn't supplied
+  (mid-outage); SUDDEN_STOP decays to BRIEF_STOP once the lookback window
+  ages out; reset() forgets prior speed history.
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/NonHolonomicConstraint.kt
 Status: IMPLEMENTED
@@ -553,6 +659,27 @@ Important concepts/assumptions: orientation and accel come from
   enough from true vehicle heading to flip the map ~180 degrees on GNSS
   reacquisition — see alignment/AlignmentRepository.kt's entry above and
   PRD.md Section 15's 2026-08-28 amendment.
+  UPDATE (2026-09-01, following the real outdoor drive's ZUPT finding —
+  see DriveDataLogger.kt's entry): also computes
+  rawLinearAccelMagnitudeMps2/rawGyroMagnitudeRadPerSec from the SAME
+  east/north/up + gyro components the filtered magnitude uses, just
+  BEFORE LowPassFilter.filter() runs on them, and publishes both onto
+  DeadReckoningState. StationaryDetector still gates on the FILTERED
+  fields only — the raw fields exist purely so a future drive log can
+  compare raw vs. filtered separability offline (see
+  scripts/analyze_drive_log.py's report_raw_vs_filtered).
+  UPDATE (context-aware ZUPT): the `stationary` decision now comes from
+  `motion/StopEventClassifier.kt` (see its own entry) instead of calling
+  `StationaryDetector` directly — this class supplies the classifier's
+  two extra inputs (this tick's pre-ZUPT integrated speed, captured right
+  after `integrator.update()`; GNSS speed when `GnssMode.GNSS_AIDED` and
+  `GnssQuality.isGood`) and acts on `StopClassification.shouldApplyZupt`
+  exactly where the old boolean was read. `DeadReckoningState.isStationary`
+  keeps its exact prior meaning (was ZUPT applied this tick); the new
+  `stationaryContext` field carries the richer classification for
+  logging/debug/UI only. Logs (`Log.d`) on every context change, not
+  every tick (CLAUDE.md Rule 17, same "log transitions, not the stream"
+  convention `gnss/GnssModeRepository.kt` already uses).
 Bug found + fixed during Slice 4 on-device verification (2026-08-25):
   lastProcessedAccelTimestampNs was originally a Long defaulting to 0L
   as the "no sample yet" sentinel. On the very first accel sample of a
@@ -630,19 +757,42 @@ Outputs: current GnssMode; a running List<GnssModeTransition> log
   pure-math layer (GnssModeRepository additionally Logcats each one).
 Important functions/classes: evaluate() (the state machine step);
   outageEnterDwellMs / reacquisitionEnterDwellMs / transitionDwellMs /
-  reacquisitionDwellMs (constructor params, defaults 2000/2000/1000/
-  1000ms — engineering defaults, not yet empirically validated).
+  reacquisitionDwellMs / reacquisitionExitDwellMs (constructor params,
+  defaults 2000/2000/1000/1000/2000ms — engineering defaults, not yet
+  empirically validated).
 Important concepts/assumptions: hysteresis (CLAUDE.md Rule 16) — a
   single bad/good sample cannot flip the mode; leaving GNSS_AIDED
   requires GNSS bad continuously for outageEnterDwellMs, leaving
   DEAD_RECKONING requires GNSS good continuously for
-  reacquisitionEnterDwellMs, and TRANSITION/REACQUISITION each have
-  their own minimum dwell before the next transition is even
-  considered. TRANSITION/REACQUISITION are state-machine bookkeeping
-  ONLY in this slice — they do NOT yet blend GNSS and DR position
-  estimates together (PRD.md Section 18's "freeze/average"/"blend"
-  behavior is Slice 7, Fusion / re-alignment on GNSS reacquisition).
-Connected to: GnssModeRepository -> GnssOutageDetector -> GnssModeUiState
+  reacquisitionEnterDwellMs, REACQUISITION advances to GNSS_AIDED only
+  with GNSS good continuously for reacquisitionDwellMs, and bails back
+  to DEAD_RECKONING only with GNSS bad continuously for
+  reacquisitionExitDwellMs — all four transitions use the same
+  streak-tracked dwell pattern. TRANSITION/REACQUISITION are
+  state-machine bookkeeping ONLY in this slice — they do NOT yet blend
+  GNSS and DR position estimates together (PRD.md Section 18's
+  "freeze/average"/"blend" behavior is Slice 7, Fusion / re-alignment
+  on GNSS reacquisition).
+  REAL BUG FIX (2026-09-02, on-device test via ADB screenshots + logcat
+  during a live session — phone stationary indoors, mode visibly
+  flapping DEAD_RECKONING<->REACQUISITION every ~7s across 6+ outage
+  cycles in under a minute): REACQUISITION's exit used to bail to
+  DEAD_RECKONING on the FIRST bad sample after entry, no dwell at all —
+  itself the single-noisy-sample flip Rule 16 prohibits (a leftover from
+  an earlier 2026-08-26 fix for the opposite symptom, which over-
+  corrected). Marginal indoor GNSS accuracy flickers faster than
+  reacquisitionDwellMs, so REACQUISITION never once reached GNSS_AIDED
+  in practice, which also corrupted fusion/StateEstimator.kt's
+  lastAidedAtMs bookkeeping (never updated) and made its AI-predicted
+  drift number climb unboundedly across "outages" that were never
+  really distinct (7.8m -> 49m predicted over six cycles while measured
+  drift stayed ~1-1.5m each time). Fixed by giving the exit its own
+  streak-tracked dwell (reacquisitionExitDwellMs), symmetric with every
+  other transition in this class — see GnssOutageDetectorTest.kt's
+  2026-09-02 tests for the locked-in behavior.
+Connected to: GnssModeRepository -> GnssOutageDetector -> GnssModeUiState;
+  GnssOutageDetector.mode -> fusion/StateEstimator.kt's lastAidedAtMs
+  bookkeeping -> ml/ReacquisitionDriftModel's predicted-drift input
 
 android/app/src/main/kotlin/com/sih26168/idr/gnss/LocationRepository.kt
 Status: IMPLEMENTED
@@ -832,14 +982,27 @@ Purpose: A minimal, one-off data-capture tool (CLAUDE.md Rule 18) for
   file IO inside the class itself, so the elapsed-ms math stays
   plain-JVM unit-testable (CLAUDE.md Rule 19); writing the JSON to disk
   is `MainActivity`'s job.
-Inputs: record() takes one sensor tick (timestampNs + accel/gyro/orientation floats).
+Inputs: record() takes one sensor tick (timestampNs + accel/gyro/orientation
+  floats + a label String, added 2026-09-01, default CaptureLabel.NONE).
 Outputs: toJsonArray() — hand-written JSON (no new dependency, CLAUDE.md
-  Rule 2), a flat array of flat per-tick objects.
+  Rule 2), a flat array of flat per-tick objects, each now including its
+  `label`.
 Important functions/classes: record() (elapsedMs computed relative to
   the FIRST recorded tick's timestampNs, same boot-time-monotonic clock
   family as every other sensor timestamp in this codebase — CLAUDE.md
   Rule 9/14, NOT wall-clock); reset(); recordedCount.
-Connected to: MainActivity (Start/Stop Recording button, own
+  UPDATE (2026-09-01, following the real outdoor drive's ZUPT finding —
+  see DriveDataLogger.kt's entry): added `CaptureLabel` (NONE/POTHOLE/
+  PHONE_MOVED — the only two PRD.md Section 14 classes IO-VNBD has no
+  ground truth for, per the Phase 4 finding below) and a `label` field on
+  SensorRecordEntry, set from OUTSIDE this class by whichever label
+  MainActivity's marker buttons say is active at record() time — this
+  class stays a dumb recorder, it doesn't derive labels from the sensor
+  values itself. This is the tooling for PRD.md Section 24's "self-
+  captured labelled data" step, not the captured data itself — no real
+  labeled drive has been recorded with it yet.
+Connected to: MainActivity (Start/Stop Recording button + Mark
+  Pothole/Phone Moved buttons, 2026-09-01, own
   sensorRepository.state collector) -> SensorRecorder -> JSON file
   (getExternalFilesDir(null), pulled via `adb pull` for offline
   inspection)
@@ -887,6 +1050,93 @@ Real usage (2026-08-29): smoke-tested indoors (phone handled, not a real
   drive with an intentional GNSS-denied stretch (tunnel/underpass/
   parking structure) is still needed before any of the three threshold
   groups above can be called validated.
+REAL OUTDOOR DRIVE (2026-09-01): first genuine outdoor test drive,
+  325.9s / 3246 rows at a real ~10 Hz. GNSS_AIDED achieved a real
+  multi-minute lock (3 segments, up to 149.9s), with 3 genuine
+  DEAD_RECKONING stretches (up to 37.8s) and clean TRANSITION/
+  REACQUISITION segments (878-1003ms, close to the 1000ms dwell
+  constants) — the "no true outdoor GNSS_AIDED lock yet" gap noted
+  elsewhere in this file is now closed. GNSS fix accuracy was good
+  (p50=3.0m, p90=5.9m) with one outlier (max=114.9m) GnssQuality's
+  25m ceiling correctly should reject.
+  REAL FINDING — ZUPT is not usable as-is: cross-checked against GNSS
+  speed (independent ground truth) while GNSS_AIDED, StationaryDetector's
+  isStationary flag was 100% false-negative (280/280 truly-stopped rows
+  not flagged) and 0% false-positive. The filtered accel/gyro magnitude
+  distributions for truly-stationary vs. truly-moving rows overlap
+  heavily (stationary accel p50=1.517 m/s^2 vs. moving accel p50=1.656
+  m/s^2) — see scripts/analyze_drive_log.py's new
+  report_zupt_threshold_sweep, which grid-searched accel/gyro thresholds
+  against this same log and found NO combination keeps both false
+  negatives and false positives low (best combined-error point:
+  accel<=2.25 m/s^2, gyro<=0.10 rad/s -> still ~23.6% FN / ~23.1% FP).
+  This matches StationaryDetector.kt's own documented "constant-velocity
+  motion looks stationary too" limitation, now measured on real urban-
+  traffic data rather than assumed. NOT fixed by retuning the fixed
+  threshold — CLAUDE.md Rule 18 prototype-first approach was applied
+  (grid search before any code change) and the honest conclusion is this
+  needs either GNSS-speed gating (only available while GNSS_AIDED,
+  i.e. not during the outages ZUPT exists for) or the real ML motion
+  classifier's Stationary class (train_motion_classifier.py, still
+  PLANNED) — not a better fixed accel/gyro threshold. Left unchanged in
+  Kotlin pending that; flagged here rather than silently shipped as
+  "validated." Full narrative in summary.txt's 2026-09-01 entry.
+  Follow-up instrumentation added the same day: DeadReckoningState/
+  DriveLogEntry now also carry rawLinearAccelMagnitudeMps2/
+  rawGyroMagnitudeRadPerSec (PRE-filter, computed in
+  BaselineDeadReckoningRepository right before LowPassFilter.filter()
+  runs) so a FUTURE drive log can compare raw vs. filtered separability
+  and let LowPassFilter's cutoffHz itself be tuned — today's log
+  predates these fields, so that comparison isn't possible yet (see
+  scripts/analyze_drive_log.py's report_raw_vs_filtered, which degrades
+  gracefully on older logs missing these columns).
+
+scripts/analyze_drive_log.py
+Status: IMPLEMENTED
+Purpose: Single responsibility (CLAUDE.md Rule 5): turn a DriveDataLogger
+  CSV into a real, printed answer for whether the app's "engineering
+  default, not yet validated" thresholds (GnssQuality's max-accuracy/
+  max-fix-age, GnssOutageDetector's four dwell constants,
+  StationaryDetector's ZUPT accel/gyro/dwell thresholds) hold up against
+  one real drive — the offline half of the DriveDataLogger.kt prototype
+  described in that file's own doc (CLAUDE.md Rule 18). Deliberately only
+  REPORTS — never edits the Kotlin constants itself, since trading off
+  false-positive vs. false-negative ZUPT (or a flappier vs. slower GNSS
+  state machine) is a human judgment call, not something to auto-apply.
+Inputs: one positional csv_path (a drive_log_<ts>.csv pulled via
+  `adb pull` from the app's Start/Stop debug-screen logger).
+Outputs: stdout report only — overview (tick count/duration/observed
+  Hz), real GNSS-mode segment durations, GNSS fix-quality percentiles,
+  a ZUPT false-positive/false-negative confusion check against GNSS
+  speed as independent ground truth, a ZUPT threshold grid-sweep, and a
+  raw-vs-filtered accel/gyro comparison. Exit 1 if the CSV doesn't exist
+  or is missing a required column.
+Important functions: load_log (schema check), report_mode_segments
+  (groups consecutive same-mode rows into real dwell segments),
+  report_zupt_validation (GNSS speed < 0.3 m/s while GNSS_AIDED as
+  ground truth for "was it really stationary" — independent of the
+  accel/gyro signal being validated, so not circular),
+  sweep_zupt_thresholds (added 2026-09-01, after the first real drive
+  found ZUPT 100% false-negative — grid-searches accel/gyro threshold
+  combinations against the SAME ground truth to check whether a
+  different FIXED threshold would fix it, or whether the two classes
+  just aren't separable this way on real data; see the REAL OUTDOOR
+  DRIVE finding in DriveDataLogger.kt's entry above for the answer),
+  report_raw_vs_filtered (added 2026-09-01, compares
+  rawLinearAccelMagnitudeMps2 against the filtered magnitude when a log
+  has both — lets LowPassFilter's cutoffHz be tuned from a future log,
+  not just the StationaryDetector threshold; degrades gracefully via
+  has_raw_columns on older logs that predate these fields).
+Unit tests: tests/scripts/test_analyze_drive_log.py (6 cases, added
+  2026-09-01, synthetic data only — CLAUDE.md Rule 19) — sweep finds a
+  zero-error threshold when classes are perfectly separable; sweep
+  correctly finds NO zero-error threshold when classes fully overlap
+  (proves the sweep can detect "not separable," not just always find a
+  win); DEAD_RECKONING-mode rows (no independent ground truth) are
+  excluded from the sweep; has_raw_columns true/false on logs with/
+  without the 2026-09-01 raw fields. `python -m pytest
+  tests/scripts/test_analyze_drive_log.py` — 6/6 pass; full suite
+  (`python -m pytest tests/`) — 43/43 pass, no regressions.
 
 android/app/src/test/kotlin/com/sih26168/idr/sensors/SampleRateTest.kt
 Status: IMPLEMENTED
@@ -984,7 +1234,9 @@ Purpose: JUnit4 unit tests for YawRate.radPerSecond — first sample (no
   direction is preserved (sign matters, not just magnitude).
 
 android/app/src/test/kotlin/com/sih26168/idr/alignment/AlignmentEstimatorTest.kt
-Status: IMPLEMENTED (Slice 6)
+Status: IMPLEMENTED (Slice 6). UPDATE (2026-09-02): 5 new tests added for
+  the roll/pitch mounting baseline + reducedConfidenceDueToRoll flag —
+  see AlignmentEstimator.kt's entry.
 Purpose: JUnit4 unit tests for the yaw-alignment accumulator — starts
   unaligned; matching azimuth/bearing converges to a zero offset once
   enough samples accumulate; a consistent 10-degree offset is correctly
@@ -1295,7 +1547,10 @@ UPDATE (Round 2, 2026-08-28) — GnssQuality gained a second function,
 
 android/app/src/main/kotlin/com/sih26168/idr/alignment/{YawRate,AlignmentEstimator}.kt
 Status: IMPLEMENTED (Slice 6, 2026-08-25) — see `## Slice 1-6` build
-  verification below for full detail.
+  verification below for full detail. UPDATE (2026-09-02): see the
+  `reset() also clears...` note below — AlignmentEstimator now also
+  estimates a roll/pitch mounting baseline and a motorcycle-lean
+  confidence flag.
 Purpose: PRD.md Section 15's phone-to-vehicle YAW alignment. Scope
   note: pitch/roll are deliberately NOT separately estimated — Android's
   rotation-vector sensor already fuses gravity into its own azimuth/
@@ -1306,7 +1561,10 @@ Purpose: PRD.md Section 15's phone-to-vehicle YAW alignment. Scope
   resolve (PRD.md Section 15's own stated reason for using GNSS course).
 Inputs: azimuthRad (from OrientationSample), gnssBearingDeg/gnssSpeedMps
   (nullable, from GnssFix), a wall/boot-time nowNs per tick.
-Outputs: AlignmentEstimate(yawOffsetRad, sampleCount, isAligned).
+Outputs: AlignmentEstimate(yawOffsetRad, sampleCount, isAligned,
+  rollOffsetRad, pitchOffsetRad, pitchRollSampleCount,
+  isPitchRollAligned, reducedConfidenceDueToRoll — the last five added
+  2026-09-02).
 Important functions/classes: YawRate.radPerSecond (pure, angle-unwrap-
   aware WORLD-frame turning-rate calculation from consecutive azimuth
   samples — deliberately NOT derived from raw device gyro Z, which only
@@ -1329,6 +1587,24 @@ Important concepts/assumptions: engineering-default thresholds
   alignment/AlignmentRepository.kt below, which also moved this class's
   one caller from being MlVelocityRepository-only to a shared repository
   both DR paths read.
+  UPDATE (2026-09-02, PRD.md Section 15's motorcycle-lean carve-out):
+  evaluate() now also takes pitchRad/rollRad and accumulates a roll/pitch
+  MOUNTING baseline (same circular-mean technique as yaw) while the
+  vehicle is near-stationary with a GNSS fix (speed <= 1.0 m/s — a parked
+  vehicle's own roll/pitch is ~0, so the device's roll/pitch at that
+  moment IS the mounting tilt). Once that baseline is established
+  (>= 20 samples, same convention as yaw's minSamplesForAligned),
+  reducedConfidenceDueToRoll flags true whenever the CURRENT roll
+  deviates from it by more than ~20 degrees (DEFAULT_MAX_ROLL_EXCURSION_RAD,
+  engineering default, CLAUDE.md Rule 13) — a real lean, a slipped mount,
+  etc. This is deliberately a FLAG only, not a lean-dynamics correction —
+  PRD.md Section 15 explicitly excludes modeling the lean itself. Both
+  pitchRad/rollRad params default to 0f so all pre-existing yaw-only call
+  sites/tests remain valid unmodified. A true device->vehicle 3-axis
+  rotation matrix is still NOT built beyond this baseline — this
+  project's 2D horizontal navigation only ever needs a heading (yaw),
+  which mounting pitch/roll tilt doesn't change (see this file's own
+  updated class doc for the full reasoning).
 Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository -> AlignmentEstimator
 
 android/app/src/main/kotlin/com/sih26168/idr/alignment/AlignmentRepository.kt
@@ -1356,13 +1632,18 @@ Purpose: The Android/coroutine glue that turns the pure AlignmentEstimator
   longer exists).
 Inputs: SensorRepository.state (orientation), GnssModeRepository.state
   (GNSS bearing/speed/latestFix).
-Outputs: AlignmentUiState(yawOffsetRad, sampleCount, isAligned) — same
-  three fields AlignmentEstimate already had, republished as this
-  repository's own StateFlow.
+Outputs: AlignmentUiState(yawOffsetRad, sampleCount, isAligned,
+  rollOffsetRad, pitchOffsetRad, pitchRollSampleCount,
+  isPitchRollAligned, reducedConfidenceDueToRoll) — same fields
+  AlignmentEstimate now has (the last five added 2026-09-02), republished
+  as this repository's own StateFlow.
 Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository ->
   dr/BaselineDeadReckoningRepository (vehicle-heading correction for
   NonHolonomicConstraint) AND ml/MlVelocityRepository (unchanged feature-
-  path correction); MainActivity's "recalibrate" button ->
+  path correction, PLUS (2026-09-02) republishes reducedConfidenceDueToRoll
+  into MlVelocityUiState -> ui/screens/StatusOverlayContent.kt /
+  MainActivity's debug screen, PRD.md Section 31's "alignment/confidence
+  indicator"); MainActivity's "recalibrate" button ->
   AlignmentRepository.reset(); motion/PhoneMovedDetector ->
   AlignmentRepository (automatic reset trigger)
 
@@ -1547,7 +1828,8 @@ Purpose: The Android/coroutine glue wiring SensorRepository +
   is directly visible on-device, not just a desktop-measured claim.
 Outputs: StateFlow<MlVelocityUiState> — {predictedVelocityMps,
   isAligned, yawOffsetDeg, alignmentSampleCount, positionEastM,
-  positionNorthM}.
+  positionNorthM, reducedConfidenceDueToRoll (added 2026-09-02, republished
+  from AlignmentRepository.state — see that class's entry)}.
 Important concepts/assumptions: yaw rate for the gyro feature is
   computed by rotating the RAW gyro vector into world frame the same
   way as accel (angular velocity transforms as a vector under a pure
@@ -1652,12 +1934,29 @@ REAL FINDING from on-device testing (2026-08-25) — position drift
   `confidenceWeight = GnssQuality.confidenceWeight(fix.accuracyM)`
   instead of relying on `GnssQuality.isGood`'s binary gate alone — see
   `fusion/VelocityBiasCalibrator.kt`'s entry for the effective-alpha math.
+  UPDATE (context-aware ZUPT): the owned `StationaryDetector` field is
+  replaced by `motion/StopEventClassifier.kt` (see its own entry) —
+  `dampedVelocityMps` and (when GNSS_AIDED + GnssQuality.isGood) GNSS
+  speed feed it as the two extra inputs. `MotionStateClassifier`'s
+  existing contract is UNCHANGED — it now reads
+  `StopClassification.dwellConfirmedStationary` instead of a second,
+  redundant `StationaryDetector.evaluate()` call, but receives the exact
+  same accel/gyro-dwell-only boolean it always did. The actual ZUPT gate
+  fed to `positionIntegrator.update()` is
+  `classification.shouldApplyZupt && !motionClassification.isCruising` —
+  StopEventClassifier's context-aware decision, still overridable by the
+  existing cruising signal exactly as before, so neither signal's prior
+  protective behavior is lost. `MlVelocityUiState.stationaryContext`
+  (new field) carries the classification for logging/debug/UI only, same
+  as `DeadReckoningState.stationaryContext` on the physics side. Logs
+  (`Log.d`) on every context change, not every tick.
 Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity (Compose UI);
   MlVelocityRepository -> fusion/StateEstimator (Slice 7, reads its position + isAligned);
   motion/MotionStateClassifier, motion/PotholeShockDetector, motion/LongitudinalMotionClassifier
   (2026-08-30) -> MlVelocityRepository;
   alignment/AlignmentRepository -> MlVelocityRepository (shared alignment estimate, replaces the
   owned AlignmentEstimator); ml/VelocityGuard -> MlVelocityRepository (Round 2, 2026-08-28);
+  motion/StopEventClassifier -> MlVelocityRepository (context-aware ZUPT);
   StatusOverlayContent's recalibrate button (via MapScreen) -> MainActivity ->
   AlignmentRepository.reset() (moved off this class)
 
@@ -1757,7 +2056,11 @@ Purpose: The position-level counterpart to gnss/GnssOutageDetector.kt's
   NOT duplicate that reset logic, it only decides how much of the DR
   delta to trust/show per mode.
 Important functions/classes: update(nowMs, mode, drEastM, drNorthM,
-  newFixEastM?, newFixNorthM?) — GNSS_AIDED always returns (0,0);
+  newFixEastM?, newFixNorthM?, gnssJitterOffsetEastM=0.0,
+  gnssJitterOffsetNorthM=0.0 — the last two added 2026-09-02, see UPDATE
+  below) — GNSS_AIDED returns (gnssJitterOffsetEastM, gnssJitterOffsetNorthM),
+  which is (0,0) — the exact original hard-coded behavior — at every
+  pre-existing call site/test, since both default to 0.0;
   TRANSITION freezes at the DR position from the INSTANT TRANSITION was
   entered (chosen "freeze" half of "freeze/average" — simpler, and
   TRANSITION's short ~1s default dwell makes freeze vs. average nearly
@@ -1794,6 +2097,59 @@ UPDATE (2026-08-30, PRD.md Section 17's "AI-based" GNSS+INS fusion —
   ReacquisitionDriftModel failed to load, `reacquisitionBlendMs` simply
   stays at DEFAULT_REACQUISITION_BLEND_MS (1000ms) — the exact previous
   classical behavior, same resilience pattern as the ML velocity path.
+UPDATE (2026-09-02, PRD.md Section 17's OTHER still-open fusion piece —
+  "smooth short GNSS gaps/jitter"): `update()` gained
+  `gnssJitterOffsetEastM`/`gnssJitterOffsetNorthM` params (both default
+  0.0), returned directly by the `GNSS_AIDED` branch instead of a
+  hard-coded `(0, 0)`. `fusion/StateEstimator.kt` computes this small
+  correction via the new `fusion/GnssJitterFilter.kt` (see its own
+  entry) and passes it in every tick — this class itself stays
+  unchanged in spirit (still a pure per-mode dispatcher), just no longer
+  hard-codes an assumption about what "GNSS is trusted directly" means
+  numerically.
+
+fusion/GnssJitterFilter.kt
+Status: IMPLEMENTED (2026-09-02)
+Purpose: PRD.md Section 17's "the IMU-derived velocity/heading are used
+  to smooth short GNSS gaps/jitter" — the one piece of Section 17 that
+  was still genuinely unbuilt (the velocity-bias half,
+  fusion/VelocityBiasCalibrator.kt, and FR13's continuous accuracy
+  weighting, gnss/GnssQuality.confidenceWeight, were both already wired
+  in on 2026-08-28, before this file existed). Without this, the map
+  marker snapped to each new raw GNSS fix directly while GNSS_AIDED —
+  Android's Location.getAccuracy() is a 68%-confidence RADIUS, not a
+  promise of fix-to-fix repeatability, so consecutive "good" fixes can
+  still visibly jitter a few meters. Pure Kotlin, no Android dependency,
+  unit-testable (CLAUDE.md Rule 19). A simple COMPLEMENTARY filter,
+  deliberately NOT a Kalman filter (CLAUDE.md's "What Not To Build" /
+  PRD.md Section 7) — no covariance propagation, just a fixed blend.
+Inputs (per update() call): nowMs; rawFixEastM/rawFixNorthM (a GNSS fix
+  in a FIXED local-meter frame — caller's responsibility to keep the
+  reference point constant across calls); velocityEastMps/velocityNorthMps
+  (current IMU/DR-derived WORLD-frame velocity, for the short-term
+  prediction step between fixes); confidenceWeight in [0,1] (typically
+  gnss/GnssQuality.confidenceWeight — how hard to pull the prediction
+  toward the raw fix this tick; 1 = trust it completely, 0 = pure IMU
+  dead reckoning).
+Outputs: (smoothedEastM, smoothedNorthM) — same local-meter frame as the
+  input.
+Important functions/classes: update() — first-ever sample is trusted
+  outright (no prior estimate to blend against, same convention
+  fusion/VelocityBiasCalibrator's own first sample already uses);
+  otherwise predicts forward from the last smoothed position using
+  velocity * dt, then blends that prediction toward the raw fix by
+  confidenceWeight (predicted + w * (raw - predicted)). reset() clears
+  all state — callers must call it whenever GNSS is freshly (re)trusted
+  after not being GNSS_AIDED, so the next update() doesn't predict
+  across a stale multi-second/-minute gap from a pre-outage position.
+Important concepts/assumptions: operates entirely in whatever local-
+  meter frame the caller supplies — carries no lat/lon or GeoProjection
+  dependency itself (kept in the caller, fusion/StateEstimator.kt).
+Connected to: fusion/StateEstimator (owns the instance, computes its
+  inputs, resets it on GNSS_AIDED re-entry) -> PositionFusion.update()'s
+  gnssJitterOffsetEastM/NorthM params -> FusedPositionUiState.fusedEastM/
+  fusedNorthM (via the GNSS_AIDED branch) and
+  FusedPositionUiState.gnssJitterOffsetM (debug-only magnitude).
 
 fusion/HeadingFusion.kt
 Status: IMPLEMENTED (Round 2, 2026-08-28)
@@ -2063,12 +2419,34 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   ground-truth quality) — this only gates whether a number gets
   PRESENTED to the user as a measured drift result, not the live
   position-fusion behavior.
+  UPDATE (2026-09-02, PRD.md Section 17's other still-open fusion piece —
+  "smooth short GNSS gaps/jitter"): two new fields,
+  `tripOriginLatDeg`/`tripOriginLonDeg`, set ONCE from the first-ever
+  good fix this run and never moved again — deliberately a SEPARATE
+  frame from the continuously-moving `outageAnchorLatDeg`/
+  `outageAnchorLonDeg` above, so this addition cannot touch the
+  anchor-accuracy drift-measurement fix from the 2026-09-01 UPDATE just
+  above. A new `gnssJitterFilter` (`fusion/GnssJitterFilter.kt`) runs
+  every tick a trustworthy fix arrives while GNSS_AIDED (the SAME strict
+  branch that already sets the outage anchor): converts the fix to local
+  meters relative to the trip origin, feeds it plus the current physics
+  velocity and `GnssQuality.confidenceWeight(fix.accuracyM)` into the
+  filter, and the resulting (smoothed - raw) delta is passed to
+  `positionFusion.update()` as `gnssJitterOffsetEastM`/
+  `gnssJitterOffsetNorthM` — see PositionFusion.kt's own UPDATE note for
+  how its GNSS_AIDED branch now returns this instead of a hard-coded
+  `(0,0)`. `gnssJitterFilter.reset()` fires whenever `previousMode !=
+  GNSS_AIDED` at the moment a good fix arrives (a fresh outage just
+  ended, or this run's very first tick), so the filter never predicts
+  across a stale gap. New `FusedPositionUiState.gnssJitterOffsetM` field
+  (magnitude, debug-only) surfaces the correction size for verification.
 Connected to: GnssModeRepository, BaselineDeadReckoningRepository,
   MlVelocityRepository -> StateEstimator -> MainActivity (Compose UI);
   fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8);
   fusion/HeadingFusion -> StateEstimator.fusedHeadingDeg -> ui/screens/MapScreen.kt (Round 2, 2026-08-28);
   ui/screens/MapScreen.kt -> StateEstimator.setActiveRouteGeometry() -> map/MapConstraint.snapToRoad() -> FusedPositionUiState.fusedEastM/fusedNorthM;
-  fusion/RunningStats, ml/ReacquisitionDriftModel -> StateEstimator -> fusion/PositionFusion.setReacquisitionBlendMs() (2026-08-30)
+  fusion/RunningStats, ml/ReacquisitionDriftModel -> StateEstimator -> fusion/PositionFusion.setReacquisitionBlendMs() (2026-08-30);
+  gnss/GnssQuality.confidenceWeight, fusion/GnssJitterFilter -> StateEstimator -> fusion/PositionFusion.update()'s gnssJitterOffsetEastM/NorthM (2026-09-02)
 
 fusion/DriftSummary.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)
@@ -2214,78 +2592,36 @@ Connected to: SensorRepository -> FloorChangeRepository -> MainActivity
   (debug screen only so far — see MainActivity.kt's entry)
 
 android/app/src/main/kotlin/com/sih26168/idr/fusion/RoadSnap.kt
-Status: IMPLEMENTED (Round 2, 2026-08-28)
-NOTE (2026-08-30 merge): `map/MapConstraint.kt` (see its own entry
-  below) is a SEPARATE, independently-built implementation of the same
-  PRD.md Section 19 map-constraint feature, added on the other Round 2
-  branch and merged in alongside this one rather than replacing it — the
-  two now serve genuinely different consumers (this class only corrects
-  `ui/screens/MapScreen.kt`'s marker DISPLAY position via
-  `fusion/StateEstimator.kt`'s already-fused position; `MapConstraint.kt`
-  corrects `fusion/StateEstimator.kt`'s own `fusedEastM`/`fusedNorthM`
-  OUTPUT before either DriftSummary or MapScreen ever see it), so both
-  were kept rather than one being deleted as redundant — flagged here as
-  a real duplication worth a deliberate follow-up decision (CLAUDE.md
-  Rule 4), not a silent accident.
-Purpose: PRD.md Section 19's MVP map-constraint layer — nearest-road
-  snapping, explicitly NOT a full HMM-based map matcher (ruled out by
-  Section 19/34 as Future Work). Pure Kotlin, no Android dependency,
-  unit-testable (CLAUDE.md Rule 19).
-Scope decision (PRD.md Section 19's 2026-08-28 amendment): rather than
-  fetching a general road-network graph (which would need a NEW service,
-  e.g. Overpass API — CLAUDE.md Rule 2's "no new dependency without
-  discussing it first"), this snaps onto the geometry of the user's OWN
-  already-computed active route (`routing/RoutingRepository.kt`, OSRM) —
-  the road the demo is actually driving. Reuses Slice 8b's existing
-  infrastructure, needs no new network call. No active route = nothing
-  to snap to = an honest "no correction," not a crash or a guess.
-Inputs: positionEastM/positionNorthM (local meters, same frame as the
-  route geometry below), headingDeg (nullable — null skips the heading
-  check entirely rather than assuming straight-ahead travel),
-  routeGeometryLocalMeters (the active route's geometry, pre-projected
-  by the CALLER via fusion/GeoProjection.toLocalMeters against the same
-  reference point as the position).
-Outputs: SnapResult(eastM, northM, correctionDistanceM)?, null if no
-  route, no heading-compatible segment nearby, or nothing within range.
-Important functions/classes: snap() — for each route segment, finds the
-  nearest point via standard point-to-segment projection (clamped to the
-  segment, not the infinite line), REJECTS any segment whose own bearing
-  disagrees with the estimated heading by more than
-  DEFAULT_MAX_HEADING_DELTA_DEG (45 deg — "simple nearest-segment +
-  heading-compatibility check, not an HMM," PRD.md Section 19's own
-  wording verbatim), then returns the closest surviving candidate within
-  DEFAULT_MAX_SNAP_DISTANCE_M (25m, comparable to GnssQuality's own
-  max-accuracy threshold). Heading comparison is CIRCULAR-safe (same
-  0/360-wrap technique fusion/HeadingFusion.kt and
-  ui/map/PositionSmoother.kt already use) — a naive linear subtraction
-  would wrongly reject e.g. 359 deg vs. a 0-deg segment as a 359-degree
-  mismatch instead of the true 1-degree one.
-Important concepts/assumptions: engineering defaults (25m/45deg), not
-  yet validated against a real test drive (CLAUDE.md Rule 13).
-  Zero-length segments (duplicate consecutive geometry points) are
-  skipped rather than dividing by zero.
-Connected to: ui/screens/MapScreen.kt -> RoadSnap -> StreetMapView.kt's
-  marker position ONLY — deliberately does NOT correct
-  fusion/StateEstimator.kt's `fusedEastM`/`fusedNorthM` itself, since
-  that value also feeds fusion/DriftSummary.kt's measured drift number
-  and MapScreen's own routeProgress, both of which must stay an HONEST,
-  uncorrected measurement of the DR system's real error (CLAUDE.md
-  Rule 13) rather than an artifact of the snapping algorithm's own
-  assumptions — matches PRD.md Section 16's framing of map-constraint
-  snapping as "a correction... rather than the primary estimator."
-Unit tests: tests/.../fusion/RoadSnapTest.kt — fewer than 2 geometry
-  points returns null; an on-segment position snaps to itself with zero
-  correction; an off-to-the-side position snaps perpendicular onto the
-  segment (hand-derived); a position beyond the segment's endpoint
-  clamps to the endpoint rather than the infinite line; a
-  heading-incompatible segment is rejected even when geometrically
-  closer than a compatible one; a null heading skips the compatibility
-  check; a position beyond the max snap distance returns null even if
-  heading-compatible; among multiple segments the heading-INcompatible
-  closer one is correctly rejected in favor of the farther compatible
-  one; the 0/360 wrap boundary is handled correctly (359 deg vs. a 0-deg
-  segment is a 1-degree delta, not 359); a duplicate consecutive point is
-  skipped without a divide-by-zero.
+Status: REMOVED (2026-09-02) — was IMPLEMENTED (Round 2, 2026-08-28)
+REAL BUG FOUND AND FIXED: the 2026-08-30 NOTE this entry used to carry
+  ("a real duplication worth a deliberate follow-up decision") turned out
+  to be an ACTIVE bug, not just latent duplication risk — MapScreen.kt's
+  `currentLatDeg`/`currentLonDeg` computation called `RoadSnap.snap()` on
+  `fusedState.fusedEastM`/`fusedNorthM`, but `map/MapConstraint.kt` (its
+  own entry below) had ALREADY corrected that exact same field upstream
+  inside `fusion/StateEstimator.kt`, before this screen ever saw it —
+  every tick a route was active outside GNSS_AIDED, TWO independent
+  nearest-segment projections were stacking, with slightly different
+  tolerances (this class's 25m/45deg vs MapConstraint's 30m/45deg),
+  risking a marker position neither implementation alone would have
+  computed (and wasting a per-tick projection twice). The "deliberately
+  does NOT correct fusion/StateEstimator.kt's fusedEastM/fusedNorthM"
+  claim this entry used to make was accurate when written (2026-08-28,
+  before MapConstraint existed) and became FALSE the moment
+  MapConstraint started writing into that same field two days later —
+  nobody reconciled the two Round 2 branches that each built this
+  feature independently before both got merged. Consolidated on
+  MapConstraint.kt (the architecturally cleaner spot — corrects the
+  canonical output ONCE, upstream, matching PRD.md Section 16's own
+  framing of map-constraint as "a correction... rather than the primary
+  estimator"); this file and `tests/.../fusion/RoadSnapTest.kt` are
+  deleted, and `ui/screens/MapScreen.kt`'s `currentLatDeg`/`currentLonDeg`
+  now simply projects `fusedState.fusedEastM`/`fusedNorthM` (already
+  MapConstraint-corrected) back to lat/lon — see that file's own updated
+  comment. `fusion/DriftSummary.kt`'s measured drift number was and
+  remains unaffected either way — `fusion/StateEstimator.kt` snapshots it
+  from `drEastM`/`drNorthM` and the newly-reacquired GNSS fix BEFORE
+  `PositionFusion.update()`/`MapConstraint` run that tick.
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/LowPassFilter.kt
 Status: IMPLEMENTED (2026-08-30)
@@ -2371,7 +2707,13 @@ Connected to: ml/MlVelocityRepository -> LongitudinalMotionClassifier ->
   debug screen.
 
 android/app/src/main/kotlin/com/sih26168/idr/map/MapConstraint.kt
-Status: IMPLEMENTED (2026-08-30)
+Status: IMPLEMENTED (2026-08-30) — now the SOLE road-snap implementation
+  (2026-09-02): `fusion/RoadSnap.kt`, a separately-built duplicate of
+  this exact PRD.md Section 19 feature from an independent Round 2
+  branch, was deleted after its own call site in `ui/screens/MapScreen.kt`
+  was found double-snapping on top of this class's upstream correction —
+  see `fusion/RoadSnap.kt`'s (now REMOVED) entry above for the full bug
+  writeup.
 Purpose: PRD.md Section 19's MVP-level map constraint — nearest-road-snap
   plus a heading-compatibility check, explicitly NOT a Hidden Markov
   Model or general map-matching engine (PRD.md Section 19/CLAUDE.md's
@@ -2421,6 +2763,18 @@ UPDATE (Round 2, 2026-08-28): `ui/screens/MapScreen.kt`'s
   `remember` declaration was moved earlier in the composable (was
   previously declared with the rest of the search/routing state, further
   down) so this computation can read it.
+UPDATE (2026-09-02, REAL BUG FIX): the `RoadSnap` call above was
+  double-snapping on top of `map/MapConstraint.kt`'s own upstream
+  correction to the exact same `fusedEastM`/`fusedNorthM` field — see
+  `fusion/RoadSnap.kt`'s (now REMOVED) entry above for the full writeup.
+  `currentLatDeg`/`currentLonDeg` now simply projects
+  `fusedState.fusedEastM`/`fusedNorthM` (already MapConstraint-corrected)
+  back to lat/lon via `GeoProjection.toLatLon` — no second snap. The
+  `activeRoute` dependency was dropped from this `remember` block (no
+  longer read here) but its `remember` declaration stays where it was
+  moved to, since `LaunchedEffect(activeRoute)` still needs it to feed
+  `onActiveRouteGeometryChanged` -> `StateEstimator.setActiveRouteGeometry()`
+  (MapConstraint's own geometry input, unaffected by this change).
 
 ui/theme/Color.kt
 Status: IMPLEMENTED (Slice 8, 2026-08-25)

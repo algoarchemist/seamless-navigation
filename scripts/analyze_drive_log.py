@@ -70,6 +70,13 @@ def load_log(csv_path: Path) -> pd.DataFrame:
     return df
 
 
+# rawLinearAccelMagnitudeMps2/rawGyroMagnitudeRadPerSec were added 2026-09-01
+# (after this drive log) so an older CSV won't have them - every report
+# function that uses them must degrade gracefully, not crash.
+def has_raw_columns(df: pd.DataFrame) -> bool:
+    return {"rawLinearAccelMagnitudeMps2", "rawGyroMagnitudeRadPerSec"}.issubset(df.columns)
+
+
 def report_overview(df: pd.DataFrame) -> None:
     duration_s = (df["elapsedMs"].iloc[-1] - df["elapsedMs"].iloc[0]) / 1000.0
     observed_hz = len(df) / duration_s if duration_s > 0 else float("nan")
@@ -190,6 +197,123 @@ def report_zupt_validation(df: pd.DataFrame) -> None:
     print()
 
 
+# 2026-09-01: added after the first real outdoor drive found ZUPT 100%
+# false-negative (see report_zupt_validation above) - before assuming a
+# different fixed accel/gyro threshold would fix it (CLAUDE.md Rule 18:
+# prototype/test an assumption before building on it), this sweeps a grid
+# of candidate thresholds against the SAME independent GNSS-speed ground
+# truth and reports whether ANY combination separates the two classes
+# well, or whether the ceiling itself is the real finding.
+def sweep_zupt_thresholds(
+    df: pd.DataFrame,
+    accel_grid: list[float] | None = None,
+    gyro_grid: list[float] | None = None,
+) -> pd.DataFrame:
+    aided = df[(df["gnssMode"] == "GNSS_AIDED") & df["gnssSpeedMps"].notna()]
+    truly_stationary = aided[aided["gnssSpeedMps"] < GNSS_STATIONARY_SPEED_EPSILON_MPS]
+    truly_moving = aided[aided["gnssSpeedMps"] >= GNSS_STATIONARY_SPEED_EPSILON_MPS]
+
+    if accel_grid is None:
+        accel_grid = [round(0.25 + 0.25 * i, 2) for i in range(16)]  # 0.25 .. 4.00
+    if gyro_grid is None:
+        gyro_grid = [round(0.05 + 0.05 * i, 2) for i in range(20)]  # 0.05 .. 1.00
+
+    rows = []
+    for accel_thresh in accel_grid:
+        for gyro_thresh in gyro_grid:
+            if truly_stationary.empty or truly_moving.empty:
+                continue
+            predicted_stationary_ts = (
+                (truly_stationary["linearAccelMagnitudeMps2"] <= accel_thresh)
+                & (truly_stationary["gyroMagnitudeRadPerSec"] <= gyro_thresh)
+            )
+            predicted_stationary_tm = (
+                (truly_moving["linearAccelMagnitudeMps2"] <= accel_thresh)
+                & (truly_moving["gyroMagnitudeRadPerSec"] <= gyro_thresh)
+            )
+            false_negative_rate = 1.0 - predicted_stationary_ts.mean()
+            false_positive_rate = predicted_stationary_tm.mean()
+            rows.append(
+                {
+                    "accel_thresh_mps2": accel_thresh,
+                    "gyro_thresh_radps": gyro_thresh,
+                    "false_negative_rate": false_negative_rate,
+                    "false_positive_rate": false_positive_rate,
+                    "combined_error_rate": false_negative_rate + false_positive_rate,
+                },
+            )
+    return pd.DataFrame(rows)
+
+
+def report_zupt_threshold_sweep(df: pd.DataFrame) -> None:
+    print("=== ZUPT threshold sweep (which accel/gyro combo minimizes real error?) ===")
+    sweep = sweep_zupt_thresholds(df)
+    if sweep.empty:
+        print("  Not enough GNSS_AIDED rows with both stationary and moving ground truth to sweep.")
+        print()
+        return
+
+    best_combined = sweep.sort_values("combined_error_rate").iloc[0]
+    print(
+        "  Best combined (FN+FP) point: accel<="
+        f"{best_combined['accel_thresh_mps2']:.2f}m/s^2, gyro<={best_combined['gyro_thresh_radps']:.2f}rad/s -> "
+        f"FN={100 * best_combined['false_negative_rate']:.1f}%, FP={100 * best_combined['false_positive_rate']:.1f}%",
+    )
+
+    tight_fp = sweep[sweep["false_positive_rate"] <= 0.01].sort_values("false_negative_rate")
+    if tight_fp.empty:
+        print(
+            "  No swept combination keeps false positives <=1% - the two classes are not cleanly "
+            "separable by accel/gyro magnitude alone on this drive (this matches "
+            "StationaryDetector.kt's own documented 'constant-velocity motion looks stationary too' "
+            "limitation, now measured rather than assumed).",
+        )
+    else:
+        best_tight = tight_fp.iloc[0]
+        print(
+            "  Best FN at FP<=1%: accel<="
+            f"{best_tight['accel_thresh_mps2']:.2f}m/s^2, gyro<={best_tight['gyro_thresh_radps']:.2f}rad/s -> "
+            f"FN={100 * best_tight['false_negative_rate']:.1f}%, FP={100 * best_tight['false_positive_rate']:.1f}%",
+        )
+    print(
+        "  Reminder: this sweep only re-scores the FILTERED signal already in this log against "
+        "different thresholds - it cannot test a different LowPassFilter cutoffHz. That needs a "
+        "log with rawLinearAccelMagnitudeMps2/rawGyroMagnitudeRadPerSec (added 2026-09-01) from a "
+        "future drive - see report_raw_vs_filtered below.",
+    )
+    print()
+
+
+def report_raw_vs_filtered(df: pd.DataFrame) -> None:
+    print("=== Raw vs. filtered ZUPT signal (needs a 2026-09-01+ drive log) ===")
+    if not has_raw_columns(df):
+        print(
+            "  This log predates rawLinearAccelMagnitudeMps2/rawGyroMagnitudeRadPerSec - only the "
+            "post-filter signal was captured, so the LowPassFilter cutoffHz itself can't be "
+            "re-tuned from this drive. Capture a new drive log to compare raw vs. filtered.",
+        )
+        print()
+        return
+
+    aided = df[(df["gnssMode"] == "GNSS_AIDED") & df["gnssSpeedMps"].notna()]
+    truly_stationary = aided[aided["gnssSpeedMps"] < GNSS_STATIONARY_SPEED_EPSILON_MPS]
+    if truly_stationary.empty:
+        print("  No truly-stationary rows this drive to compare.")
+        print()
+        return
+
+    raw_a = truly_stationary["rawLinearAccelMagnitudeMps2"]
+    filt_a = truly_stationary["linearAccelMagnitudeMps2"]
+    print(
+        f"  Truly-stationary accel magnitude: raw p50={raw_a.quantile(.5):.3f} "
+        f"filtered p50={filt_a.quantile(.5):.3f} m/s^2 "
+        f"(filter removed {100 * (1 - filt_a.quantile(.5) / raw_a.quantile(.5)):.0f}% of median magnitude)"
+        if raw_a.quantile(.5) > 0
+        else "  Truly-stationary raw accel magnitude is ~0 - cannot compute a meaningful ratio.",
+    )
+    print()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("csv_path", type=Path, help="Path to a drive_log_*.csv pulled from the device")
@@ -204,6 +328,8 @@ def main() -> int:
     report_mode_segments(df)
     report_gnss_quality(df)
     report_zupt_validation(df)
+    report_zupt_threshold_sweep(df)
+    report_raw_vs_filtered(df)
 
     print("Reminder: these numbers describe ONE drive. Treat single-drive results as a first "
           "signal, not a final calibration - CLAUDE.md Rule 13 still applies to whatever you do "

@@ -13,11 +13,18 @@ import kotlinx.coroutines.launch
 
 private const val TAG = "AlignmentRepository"
 
-/** Published phone-to-vehicle yaw-alignment state — see [AlignmentEstimator] for the underlying math. */
+/** Published phone-to-vehicle alignment state — see [AlignmentEstimator] for the underlying math. */
 data class AlignmentUiState(
     val yawOffsetRad: Float? = null,
     val sampleCount: Int = 0,
     val isAligned: Boolean = false,
+    /** Mounting roll/pitch baseline (PRD.md Section 15) — see [AlignmentEstimator]'s doc. */
+    val rollOffsetRad: Float? = null,
+    val pitchOffsetRad: Float? = null,
+    val pitchRollSampleCount: Int = 0,
+    val isPitchRollAligned: Boolean = false,
+    /** PRD.md Section 15's motorcycle-lean flag — true while current roll deviates from the established baseline beyond AlignmentEstimator.DEFAULT_MAX_ROLL_EXCURSION_RAD. */
+    val reducedConfidenceDueToRoll: Boolean = false,
 )
 
 /**
@@ -42,6 +49,14 @@ data class AlignmentUiState(
  * fixes both: one [AlignmentEstimator] instance, one real answer to
  * "what's the current yaw offset," read identically by whichever DR path
  * (physics, ML, or both) happens to be running.
+ *
+ * UPDATE (2026-09-02): also feeds device pitch/roll through so
+ * [AlignmentEstimator] can establish the phone's mounting roll/pitch
+ * baseline and flag PRD.md Section 15's motorcycle-lean carve-out
+ * (`reducedConfidenceDueToRoll`) — see that class's own doc for the full
+ * reasoning. Republished here alongside the yaw fields for any consumer
+ * (currently `ml/MlVelocityRepository.kt` -> `StatusOverlayContent.kt`)
+ * to surface as a confidence indicator (PRD.md Section 31).
  *
  * Also wires PRD.md Section 15's "Ongoing validation: the Motion
  * Classifier's `Phone Moved` output triggers re-initialization" —
@@ -97,12 +112,19 @@ class AlignmentRepository(
                     azimuthRad = orientation.azimuthRad,
                     gnssBearingDeg = fix?.bearingDeg,
                     gnssSpeedMps = fix?.speedMps,
+                    pitchRad = orientation.pitchRad,
+                    rollRad = orientation.rollRad,
                 )
 
                 _state.value = AlignmentUiState(
                     yawOffsetRad = alignment.yawOffsetRad,
                     sampleCount = alignment.sampleCount,
                     isAligned = alignment.isAligned,
+                    rollOffsetRad = alignment.rollOffsetRad,
+                    pitchOffsetRad = alignment.pitchOffsetRad,
+                    pitchRollSampleCount = alignment.pitchRollSampleCount,
+                    isPitchRollAligned = alignment.isPitchRollAligned,
+                    reducedConfidenceDueToRoll = alignment.reducedConfidenceDueToRoll,
                 )
             }
         }

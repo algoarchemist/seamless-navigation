@@ -22,6 +22,23 @@ class PositionFusionTest {
     }
 
     @Test
+    fun `GNSS_AIDED returns the gnss jitter offset when one is supplied`() {
+        val fusion = PositionFusion()
+        val result = fusion.update(
+            nowMs = 1000L,
+            mode = GnssMode.GNSS_AIDED,
+            drEastM = 50.0, // still ignored for GNSS_AIDED, same as the zero-offset case above
+            drNorthM = -20.0,
+            newFixEastM = null,
+            newFixNorthM = null,
+            gnssJitterOffsetEastM = 1.5,
+            gnssJitterOffsetNorthM = -0.75,
+        )
+        assertEquals(1.5, result.eastM, 0.0001)
+        assertEquals(-0.75, result.northM, 0.0001)
+    }
+
+    @Test
     fun `TRANSITION freezes at the dr position from the instant it was entered`() {
         val fusion = PositionFusion()
         val first = fusion.update(0L, GnssMode.TRANSITION, drEastM = 1.0, drNorthM = 1.0, null, null)

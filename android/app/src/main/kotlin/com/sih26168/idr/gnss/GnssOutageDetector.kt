@@ -36,20 +36,37 @@ data class GnssModeTransition(
  * TRANSITION is a fixed-duration freeze/average window (PRD.md Section
  * 18) — it always waits out [transitionDwellMs] in full before deciding,
  * once, which way to go next, by design (not a single-sample-flip bug:
- * nothing changes mid-freeze). REACQUISITION is NOT symmetric with this,
- * and deliberately so: it advances to GNSS_AIDED only once GNSS has been
- * good CONTINUOUSLY for the full [reacquisitionDwellMs], but bails back
- * to DEAD_RECKONING the instant GNSS goes bad at any point in that
- * window, without waiting out the dwell first — there's no reason to
- * keep blending toward a fix already known bad. REAL BUG FIX
- * (2026-08-26, on-device test — mode flapping constantly between
+ * nothing changes mid-freeze). REACQUISITION advances to GNSS_AIDED only
+ * once GNSS has been good CONTINUOUSLY for the full [reacquisitionDwellMs],
+ * and bails back to DEAD_RECKONING only once GNSS has been bad
+ * CONTINUOUSLY for [reacquisitionExitDwellMs] — both sides use the same
+ * streak-tracking pattern as GNSS_AIDED/DEAD_RECKONING above.
+ *
+ * REAL BUG (2026-08-26, on-device test — mode flapping constantly between
  * DEAD_RECKONING and REACQUISITION): REACQUISITION used to check
- * gnssGoodNow only ONCE, right at the dwell boundary — exactly the
- * single-noisy-sample flip Rule 16 prohibits, just on the exit side
- * instead of the entry side. With marginal/indoor GNSS accuracy hovering
- * near [GnssQuality]'s threshold, that one unlucky sample failed on
- * essentially every cycle, so REACQUISITION never once reached
- * GNSS_AIDED in practice.
+ * gnssGoodNow only ONCE, right at the dwell boundary — a single-noisy-
+ * sample flip on the exit side. That first fix made the exit instant
+ * (bail on ANY single bad sample, no dwell), which cleared the 08-26
+ * symptom but is itself the single-sample flip Rule 16 prohibits, just
+ * moved rather than removed.
+ *
+ * REAL BUG #2 (2026-09-02, on-device test — mode flapping constantly
+ * between DEAD_RECKONING and REACQUISITION again, ~every 7s, phone
+ * stationary indoors): the instant-exit from the first fix is exactly
+ * what caused this — marginal indoor GNSS accuracy flickers in and out
+ * of "good" faster than [reacquisitionDwellMs], so the very next bad
+ * sample after entering REACQUISITION bailed it out every single cycle,
+ * and REACQUISITION never once reached GNSS_AIDED. Because [lastAidedAtMs]-
+ * style "time since last real fix" bookkeeping in StateEstimator only
+ * updates on a genuine GNSS_AIDED transition, this also made the
+ * AI-predicted-drift number in StateEstimator climb without bound across
+ * "outages" that were never really distinct outages. Fixed by giving
+ * REACQUISITION's exit its own dwell, symmetric with every other
+ * transition in this class: bail to DEAD_RECKONING only once GNSS has
+ * been bad CONTINUOUSLY for [reacquisitionExitDwellMs], not on the first
+ * bad sample. A brief blip resets the good-streak (so GNSS_AIDED still
+ * requires genuine continuous-good, not just wall-clock time since entry)
+ * without immediately throwing away the whole REACQUISITION attempt.
  *
  * TRANSITION/REACQUISITION here are state-machine bookkeeping only —
  * this class itself does NOT blend GNSS and dead-reckoned position
@@ -65,6 +82,7 @@ class GnssOutageDetector(
     private val reacquisitionEnterDwellMs: Long = 2_000L,
     private val transitionDwellMs: Long = 1_000L,
     private val reacquisitionDwellMs: Long = 1_000L,
+    private val reacquisitionExitDwellMs: Long = 2_000L,
 ) {
     var mode: GnssMode = GnssMode.GNSS_AIDED
         private set
@@ -109,30 +127,27 @@ class GnssOutageDetector(
                 }
             }
             GnssMode.REACQUISITION -> {
-                // REAL BUG FIX (2026-08-26, real on-device test — mode
-                // flapping constantly between DEAD_RECKONING and
-                // REACQUISITION every ~reacquisitionDwellMs): this used to
-                // wait for the dwell timer, then check gnssGoodNow ONCE at
-                // that single instant — exactly the "a single noisy sample
-                // must never flip the mode" case CLAUDE.md Rule 16
-                // prohibits, just on the EXIT side of REACQUISITION rather
-                // than the entry side. With marginal/indoor GNSS accuracy
-                // hovering right at GnssQuality's threshold, that one
-                // unlucky sample (often landing right on a freshly-arrived,
-                // still-marginal fix) failed on every single cycle in
-                // practice, so REACQUISITION never once reached GNSS_AIDED.
-                // Now: bail out to DEAD_RECKONING as soon as GNSS goes bad
-                // at ANY point during the window (fail fast — matches this
-                // branch's own "GNSS degraded again" trigger text, and
-                // there is no reason to keep blending toward a fix that's
-                // already known bad), and only advance to GNSS_AIDED once
-                // GNSS has been good CONTINUOUSLY for the full dwell period
-                // (by construction, since any bad sample bails out
-                // immediately rather than waiting).
+                // See the class doc's "REAL BUG #2 (2026-09-02)" note: both
+                // sides of REACQUISITION need their own streak-tracked
+                // dwell, same pattern as GNSS_AIDED/DEAD_RECKONING above —
+                // neither a single bad sample nor raw wall-clock time since
+                // entry is allowed to decide the mode on its own.
                 if (!gnssGoodNow) {
-                    transitionTo(GnssMode.DEAD_RECKONING, nowMs, "GNSS degraded again during REACQUISITION window")
-                } else if (nowMs - modeEnteredAtMs >= reacquisitionDwellMs) {
-                    transitionTo(GnssMode.GNSS_AIDED, nowMs, "REACQUISITION window elapsed with GNSS continuously good")
+                    goodStreakStartMs = null
+                    val streakStart = badStreakStartMs ?: nowMs.also { badStreakStartMs = it }
+                    if (nowMs - streakStart >= reacquisitionExitDwellMs) {
+                        transitionTo(
+                            GnssMode.DEAD_RECKONING,
+                            nowMs,
+                            "GNSS degraded continuously for >= ${reacquisitionExitDwellMs}ms during REACQUISITION window",
+                        )
+                    }
+                } else {
+                    badStreakStartMs = null
+                    val streakStart = goodStreakStartMs ?: nowMs.also { goodStreakStartMs = it }
+                    if (nowMs - streakStart >= reacquisitionDwellMs) {
+                        transitionTo(GnssMode.GNSS_AIDED, nowMs, "REACQUISITION window elapsed with GNSS continuously good")
+                    }
                 }
             }
         }

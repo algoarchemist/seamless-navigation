@@ -1832,3 +1832,112 @@ select -> Start sequence -- route computed successfully (real 11.2km /
 11min route to Chennai Corporation, ActiveRouteCard rendered normally),
 process stayed alive, crash buffer stayed empty. All existing unit
 tests still pass; debug compile clean.
+
+FIRST REAL OUTDOOR DRIVE + ZUPT VALIDATED-FALSE FINDING (2026-09-01)
+---------------------------------------------------------------------
+User took the app outside and ran the Start/Stop drive logger
+(capture/DriveDataLogger.kt) for a real 325.9s test drive -- the first
+genuine outdoor test drive this project (every previous verification
+had been indoor/marginal-signal). Pulled both logged CSVs off-device via
+`adb pull` (adb wasn't on PATH; found it under
+%LOCALAPPDATA%\Android\Sdk\platform-tools) and ran
+scripts/analyze_drive_log.py against the real 3246-row log.
+
+Good news first: a real GNSS_AIDED lock happened (3 segments, up to
+149.9s), with 3 genuine DEAD_RECKONING stretches (up to 37.8s) and clean
+TRANSITION/REACQUISITION segment durations (878-1003ms, close to the
+1000ms dwell constants) -- this closes the "no true outdoor GNSS_AIDED
+lock yet" gap PROJECT_MAP.md had been carrying. GNSS fix accuracy was
+good (p50=3.0m, p90=5.9m), with one 114.9m outlier GnssQuality's 25m
+ceiling should correctly reject.
+
+The real finding: cross-checking StationaryDetector's isStationary flag
+against GNSS speed (independent ground truth, since ZUPT itself only
+sees accel/gyro) while GNSS_AIDED showed ZUPT is 100% false-negative --
+every one of 280 truly-stopped rows was missed, 0 false positives. This
+is not a case of "the threshold is a little off": filtered accel
+magnitude while truly stationary was p50=1.517 m/s^2 and gyro p50=0.058
+rad/s, both already above the 0.25 m/s^2 / 0.05 rad/s thresholds, and
+the "truly moving" accel distribution (p50=1.656 m/s^2) sits almost on
+top of the "truly stationary" one -- heavy overlap, not a small offset.
+
+Per CLAUDE.md Rule 18 (prototype/test an assumption before building on
+it), before touching any Kotlin threshold, ran a grid sweep of
+accel/gyro threshold combinations against this same log's ground truth
+(ad hoc first, then built into scripts/analyze_drive_log.py as
+sweep_zupt_thresholds/report_zupt_threshold_sweep so it's reusable on
+the next drive, not a one-off). Result: NO combination keeps both false
+negatives and false positives low. The best combined-error point
+(accel<=2.25 m/s^2, gyro<=0.10 rad/s) still leaves ~23.6% FN / ~23.1%
+FP. This matches StationaryDetector.kt's own documented, honest
+limitation ("constant-velocity motion also produces near-zero
+acceleration and near-zero gyro rate") -- now measured as the DOMINANT
+real-world failure mode in urban traffic (lots of near-constant low
+speed and brief stops), not a rare edge case. Conclusion: this needs
+either GNSS-speed gating (only available while GNSS_AIDED -- not during
+the outages ZUPT exists for) or the real ML motion classifier's
+Stationary class (train_motion_classifier.py, still PLANNED) -- not a
+smarter fixed threshold. Left the Kotlin thresholds UNCHANGED rather
+than pick an arbitrary number off one drive; flagged honestly in
+PROJECT_MAP.md instead of silently shipping it as "validated."
+
+Also added forward-looking instrumentation: DriveDataLogger only ever
+logged the FILTERED (post-LowPassFilter) accel/gyro magnitude, so there
+was no way to tell whether the vibration filter's 2.0Hz cutoff itself
+was the problem vs. the threshold. Added
+rawLinearAccelMagnitudeMps2/rawGyroMagnitudeRadPerSec to
+DeadReckoningState/DriveLogEntry (computed in
+BaselineDeadReckoningRepository right before LowPassFilter.filter()
+runs, published alongside the existing filtered fields -- Stationary
+Detector itself still only gates on filtered) and a matching
+report_raw_vs_filtered in analyze_drive_log.py that degrades gracefully
+on older logs missing these columns (today's log predates them, so that
+particular comparison waits for the next drive).
+
+Added tests/scripts/test_analyze_drive_log.py (6 cases, synthetic data,
+CLAUDE.md Rule 19) covering sweep_zupt_thresholds and has_raw_columns.
+Full suite: `python -m pytest tests/` -- 43/43 pass. Kotlin side:
+`./gradlew compileDebugKotlin` -- clean compile, no test breakage (no
+existing test referenced the changed record()/DeadReckoningState
+signatures).
+
+SELF-CAPTURED MOTION-CLASSIFIER LABELING TOOL (2026-09-01)
+------------------------------------------------------------
+Round 2 Day 2's other required item: begin self-captured motion-
+classifier data collection. `train_motion_classifier.py` has been
+PLANNED since Slice 6, blocked on real labelled Pothole/Phone-Moved
+data (IO-VNBD's Phase 4 inspection found no ground truth for either
+class -- every other PRD.md Section 14 class either has a deterministic
+stand-in already shipped, or is weak-labelable from GNSS speed/heading,
+so those two are the only ones that actually need a human tapping a
+button during a real drive).
+
+capture/SensorRecorder.kt already existed (built 2026-08-25) and
+already captures real accel/gyro/orientation at the live sensor rate,
+but had no way to mark WHEN a labeled event happened -- it was pure
+unlabeled capture. Added `CaptureLabel` (NONE/POTHOLE/PHONE_MOVED) and
+a `label` field on SensorRecordEntry, set from MainActivity at record()
+time rather than derived from the sensor values (keeps SensorRecorder a
+dumb recorder, same separation of concerns as before).
+
+MainActivity gets two new debug-screen buttons: "Mark Pothole" (a
+momentary tap that opens a 500ms labeling window around the tap --
+POTHOLE_MARKER_WINDOW_MS, an engineering default, not yet validated
+against a real capture) and "Mark Phone Moved" (a toggle, since Phone
+Moved is a state with a real start/end, not an instant). Both flags
+feed a small `currentCaptureLabel()` priority function (Pothole wins if
+somehow both are active) read once per recorded tick inside the
+existing sensorRecorder.record() collector loop -- no new collection
+loop, no change to the recording start/stop lifecycle.
+
+This is tooling only -- no real labeled drive has been captured yet.
+Next real step is a physical drive: Start recording, tap Mark Pothole
+on every real pothole hit, toggle Mark Phone Moved around any deliberate
+phone repositioning, Stop, `adb pull` the JSON, then a Python script
+(not yet written -- needs the real data shape in hand first) turns it
+into train_motion_classifier.py's training input.
+
+Verified: `./gradlew compileDebugKotlin` and `./gradlew
+testDebugUnitTest` both clean after the changes -- no existing test
+referenced SensorRecorder's changed record() signature or
+SensorRecordEntry's new field.

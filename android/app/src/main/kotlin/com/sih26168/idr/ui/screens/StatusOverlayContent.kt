@@ -219,6 +219,19 @@ internal fun StatusOverlayContent(
                 style = MaterialTheme.typography.labelMedium,
                 color = TextSecondary,
             )
+            if (mlState.reducedConfidenceDueToRoll) {
+                // PRD.md Section 15's motorcycle-lean carve-out — a FLAG,
+                // not a corrected lean estimate (that's explicitly out of
+                // scope). ReacquisitionColor reused here rather than
+                // introducing a new warning color, matching the existing
+                // palette's "something needs attention but isn't a full
+                // outage" tone.
+                Text(
+                    text = "Reduced confidence — large phone roll detected",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = ReacquisitionColor,
+                )
+            }
             if (mlModelLoadError != null) {
                 Text(
                     text = "ML unavailable: $mlModelLoadError",

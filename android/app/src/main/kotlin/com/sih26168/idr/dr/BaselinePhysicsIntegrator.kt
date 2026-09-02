@@ -1,5 +1,7 @@
 package com.sih26168.idr.dr
 
+import com.sih26168.idr.motion.StationaryContext
+
 /**
  * A WORLD-frame (East, North) 2D dead-reckoning position/velocity
  * estimate, in meters and m/s respectively, relative to wherever
@@ -29,6 +31,23 @@ package com.sih26168.idr.dr
  * output, published here for the same "make the real detector inputs/
  * decisions externally visible" reason as the ZUPT fields above — not
  * produced by this integrator either.
+ *
+ * [rawLinearAccelMagnitudeMps2]/[rawGyroMagnitudeRadPerSec] (added
+ * 2026-09-01, following the real outdoor drive that found ZUPT 100%
+ * false-negative against filtered-only logging — see
+ * `scripts/analyze_drive_log.py`'s threshold-sweep report and
+ * `summary.txt`'s 2026-09-01 entry) are the SAME magnitudes computed
+ * PRE-filter, published purely so a future drive log can compare raw vs.
+ * filtered separability and let `LowPassFilter`'s cutoffHz itself be
+ * tuned offline — not used by [StationaryDetector] or anything else
+ * on-device, which still gates on the filtered fields above.
+ *
+ * [stationaryContext] (added, following the 2026-09-01 finding above):
+ * `motion/StopEventClassifier.kt`'s richer classification for the SAME
+ * tick [isStationary] already reflects — [isStationary] stays exactly
+ * "was ZUPT applied this tick" (unchanged meaning, still what
+ * [BaselinePhysicsIntegrator]'s caller acted on), this is additional
+ * context for logging/debug/UI, not a second ZUPT decision.
  */
 data class DeadReckoningState(
     val positionEastM: Double = 0.0,
@@ -39,6 +58,9 @@ data class DeadReckoningState(
     val gyroMagnitudeRadPerSec: Double = 0.0,
     val isStationary: Boolean = false,
     val isTurning: Boolean = false,
+    val rawLinearAccelMagnitudeMps2: Double = 0.0,
+    val rawGyroMagnitudeRadPerSec: Double = 0.0,
+    val stationaryContext: StationaryContext = StationaryContext.MOVING,
 )
 
 /**

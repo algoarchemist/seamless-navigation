@@ -114,4 +114,75 @@ class AlignmentEstimatorTest {
         assertNull(estimate.yawOffsetRad)
         assertFalse(estimate.isAligned)
     }
+
+    // --- Pitch/roll mounting baseline (PRD.md Section 15's motorcycle-lean carve-out) ---
+
+    private fun newPitchRollEstimator(minSamples: Int = 3) =
+        AlignmentEstimator(minSamplesForPitchRollAligned = minSamples)
+
+    @Test
+    fun `roll baseline does not accumulate while moving above the stationary threshold`() {
+        val estimator = newPitchRollEstimator(minSamples = 3)
+        val tiltRad = Math.toRadians(15.0).toFloat()
+        var estimate = estimator.evaluate(0L, 0f, null, 10f, pitchRad = 0f, rollRad = tiltRad) // 10 m/s, not stationary
+        repeat(5) { i ->
+            estimate = estimator.evaluate((i + 1) * oneSecondNs, 0f, null, 10f, pitchRad = 0f, rollRad = tiltRad)
+        }
+        assertEquals(0, estimate.pitchRollSampleCount)
+        assertNull(estimate.rollOffsetRad)
+        assertFalse(estimate.isPitchRollAligned)
+    }
+
+    @Test
+    fun `roll baseline accumulates while near-stationary with a GNSS fix and converges to the mounting tilt`() {
+        val estimator = newPitchRollEstimator(minSamples = 3)
+        val tiltRad = Math.toRadians(15.0).toFloat()
+        var estimate = estimator.evaluate(0L, 0f, null, 0.2f, pitchRad = 0f, rollRad = tiltRad) // 0.2 m/s, below DEFAULT_MAX_SPEED_FOR_STATIONARY_MPS
+        repeat(3) { i ->
+            estimate = estimator.evaluate((i + 1) * oneSecondNs, 0f, null, 0.2f, pitchRad = 0f, rollRad = tiltRad)
+        }
+        assertTrue(estimate.isPitchRollAligned)
+        assertEquals(4, estimate.pitchRollSampleCount)
+        assertEquals(tiltRad, estimate.rollOffsetRad!!, tolerance)
+        assertEquals(0f, estimate.pitchOffsetRad!!, tolerance)
+    }
+
+    @Test
+    fun `roll excursion beyond the established baseline flags reduced confidence`() {
+        val estimator = newPitchRollEstimator(minSamples = 3)
+        // Establish a ~0 rad mounting baseline while parked.
+        repeat(4) { i ->
+            estimator.evaluate(i * oneSecondNs, 0f, null, 0.0f, pitchRad = 0f, rollRad = 0f)
+        }
+        // Now moving, with a large sudden roll (e.g. a lean or a slipped mount) — well
+        // above DEFAULT_MAX_ROLL_EXCURSION_RAD (~20 degrees) from the 0 rad baseline.
+        val leanRollRad = Math.toRadians(35.0).toFloat()
+        val estimate = estimator.evaluate(5 * oneSecondNs, 0f, null, 10f, pitchRad = 0f, rollRad = leanRollRad)
+        assertTrue(estimate.reducedConfidenceDueToRoll)
+    }
+
+    @Test
+    fun `roll within the established baseline's tolerance does not flag reduced confidence`() {
+        val estimator = newPitchRollEstimator(minSamples = 3)
+        repeat(4) { i ->
+            estimator.evaluate(i * oneSecondNs, 0f, null, 0.0f, pitchRad = 0f, rollRad = 0f)
+        }
+        val smallRollRad = Math.toRadians(5.0).toFloat() // well below the ~20 degree threshold
+        val estimate = estimator.evaluate(5 * oneSecondNs, 0f, null, 10f, pitchRad = 0f, rollRad = smallRollRad)
+        assertFalse(estimate.reducedConfidenceDueToRoll)
+    }
+
+    @Test
+    fun `reset also clears the pitch-roll baseline`() {
+        val estimator = newPitchRollEstimator(minSamples = 2)
+        estimator.evaluate(0L, 0f, null, 0.0f, pitchRad = 0f, rollRad = Math.toRadians(15.0).toFloat())
+        estimator.evaluate(oneSecondNs, 0f, null, 0.0f, pitchRad = 0f, rollRad = Math.toRadians(15.0).toFloat())
+
+        estimator.reset()
+        val estimate = estimator.evaluate(2 * oneSecondNs, 0f, null, 10f, pitchRad = 0f, rollRad = Math.toRadians(35.0).toFloat())
+        assertEquals(0, estimate.pitchRollSampleCount)
+        assertNull(estimate.rollOffsetRad)
+        assertFalse(estimate.isPitchRollAligned)
+        assertFalse(estimate.reducedConfidenceDueToRoll) // no baseline yet, so nothing to compare against
+    }
 }
