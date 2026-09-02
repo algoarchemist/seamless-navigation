@@ -1,9 +1,13 @@
 package com.sih26168.idr.dr
 
+import android.util.Log
 import com.sih26168.idr.alignment.AlignmentRepository
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
+import com.sih26168.idr.gnss.GnssQuality
 import com.sih26168.idr.motion.PotholeShockDetector
+import com.sih26168.idr.motion.StationaryContext
+import com.sih26168.idr.motion.StopEventClassifier
 import com.sih26168.idr.motion.TurningDetector
 import com.sih26168.idr.sensors.SampleRate
 import com.sih26168.idr.sensors.SensorRepository
@@ -14,6 +18,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+
+private const val TAG = "BaselineDeadReckoning"
 
 // Engineering default, unvalidated against a real outdoor test drive
 // (CLAUDE.md Rule 13) — see LowPassFilter.kt's own doc for the general
@@ -83,13 +89,23 @@ private const val DEFAULT_VIBRATION_FILTER_CUTOFF_HZ = 2.0
  * acceleration spike to detect it at all; low-pass filtering that signal
  * FIRST would itself partially smooth away the very transient event this
  * detector exists to catch.
+ *
+ * UPDATE (context-aware ZUPT): ZUPT gating now goes through
+ * [StopEventClassifier] instead of calling `StationaryDetector` directly
+ * — see that class's own doc for the real, measured reason (accel/gyro
+ * alone were 100% false-negative against real traffic stops). This class
+ * still owns none of that classification logic itself (CLAUDE.md Rule 5);
+ * it only supplies the classifier's two extra inputs — this tick's
+ * pre-ZUPT integrated speed, and GNSS speed when trustworthy — and acts
+ * on [StopClassification.shouldApplyZupt] exactly where `stationary` used
+ * to be read.
  */
 class BaselineDeadReckoningRepository(
     private val sensorRepository: SensorRepository,
     private val gnssModeRepository: GnssModeRepository,
     private val scope: CoroutineScope,
     private val alignmentRepository: AlignmentRepository,
-    private val stationaryDetector: StationaryDetector = StationaryDetector(),
+    private val stopEventClassifier: StopEventClassifier = StopEventClassifier(),
     private val potholeShockDetector: PotholeShockDetector = PotholeShockDetector(),
     private val turningDetector: TurningDetector = TurningDetector(),
     private val vibrationFilterCutoffHz: Double = DEFAULT_VIBRATION_FILTER_CUTOFF_HZ,
@@ -126,6 +142,12 @@ class BaselineDeadReckoningRepository(
     // StateFlow re-emits on every gyro/orientation update too, not just accel.
     private var lastProcessedAccelTimestampNs: Long? = null
 
+    // Logged only on a CONTEXT CHANGE, not every ~10Hz tick — same
+    // "log transitions, not the stream" convention gnss/GnssModeRepository
+    // already uses (CLAUDE.md Rule 17), so Logcat stays readable during a
+    // real drive instead of flooded.
+    private var lastLoggedContext: StationaryContext? = null
+
     private val _state = MutableStateFlow(DeadReckoningState())
     val state: StateFlow<DeadReckoningState> = _state.asStateFlow()
 
@@ -134,6 +156,7 @@ class BaselineDeadReckoningRepository(
     fun start() {
         integrator.reset()
         turningDetector.reset()
+        stopEventClassifier.reset()
         accelEastFilter.reset()
         accelNorthFilter.reset()
         accelUpFilter.reset()
@@ -141,6 +164,7 @@ class BaselineDeadReckoningRepository(
         gyroYFilter.reset()
         gyroZFilter.reset()
         lastProcessedAccelTimestampNs = null
+        lastLoggedContext = null
         _state.value = DeadReckoningState()
 
         collectJob = scope.launch {
@@ -158,6 +182,8 @@ class BaselineDeadReckoningRepository(
                 }
                 lastProcessedAccelTimestampNs = accel.timestampNs
 
+                val gnssState = gnssModeRepository.state.value
+
                 // While GNSS is trustworthy, keep the "position since drift
                 // start" odometer at zero — the moment GNSS is lost, the DR
                 // readout then represents distance traveled purely during
@@ -166,7 +192,7 @@ class BaselineDeadReckoningRepository(
                 // accumulated drift since app launch. This does NOT fuse
                 // GNSS and DR positions together — that blending is
                 // Slice 7 (Fusion / re-alignment on GNSS reacquisition).
-                if (gnssModeRepository.state.value.mode == GnssMode.GNSS_AIDED) {
+                if (gnssState.mode == GnssMode.GNSS_AIDED) {
                     integrator.reset()
                 }
 
@@ -224,11 +250,20 @@ class BaselineDeadReckoningRepository(
                 val filteredGyroYRadPerSec = gyroYFilter.filter(gyro.yRadPerSec.toDouble(), dtSeconds)
                 val filteredGyroZRadPerSec = gyroZFilter.filter(gyro.zRadPerSec.toDouble(), dtSeconds)
 
-                integrator.update(
+                // Captured so StopEventClassifier can see THIS tick's
+                // pre-ZUPT integrated speed — the "did velocity just drop
+                // sharply" evidence its SUDDEN_STOP fast path needs. This
+                // is the integrator's own accel-only estimate, before any
+                // override below.
+                val preZuptState = integrator.update(
                     dtSeconds = dtSeconds,
                     linearAccelEastMps2 = filteredAccelEastMps2,
                     linearAccelNorthMps2 = filteredAccelNorthMps2,
                 )
+                val preZuptSpeedMps = sqrt(
+                    preZuptState.velocityEastMps * preZuptState.velocityEastMps +
+                        preZuptState.velocityNorthMps * preZuptState.velocityNorthMps,
+                ).toFloat()
 
                 // ZUPT / non-holonomic correction — see StationaryDetector
                 // and NonHolonomicConstraint docs for the honest limits of
@@ -250,11 +285,44 @@ class BaselineDeadReckoningRepository(
                 // relative dwell duration, same clock family as the
                 // accel/gyro timestamps it's derived from (CLAUDE.md Rule 9/14).
                 val nowBootTimeMs = accel.timestampNs / 1_000_000L
-                val stationary = stationaryDetector.evaluate(
-                    nowBootTimeMs,
-                    linearAccelMagnitudeMps2.toFloat(),
-                    gyroMagnitudeRadPerSec.toFloat(),
+
+                // GNSS speed is only handed to the classifier when it's
+                // ACTUALLY trustworthy this tick (GNSS_AIDED + GnssQuality's
+                // own availability bar) — preferred over this class's own
+                // integrated speed when present, since it doesn't share the
+                // DR path's error modes (see StopEventClassifier's own
+                // honest-limitation note).
+                val fix = gnssState.latestFix
+                val gnssSpeedForClassifier = if (
+                    gnssState.mode == GnssMode.GNSS_AIDED &&
+                    fix != null &&
+                    GnssQuality.isGood(gnssState.fixAgeMs, fix.accuracyM)
+                ) {
+                    fix.speedMps
+                } else {
+                    null
+                }
+
+                val classification = stopEventClassifier.evaluate(
+                    nowMs = nowBootTimeMs,
+                    linearAccelMagnitudeMps2 = linearAccelMagnitudeMps2.toFloat(),
+                    gyroMagnitudeRadPerSec = gyroMagnitudeRadPerSec.toFloat(),
+                    currentSpeedEstimateMps = preZuptSpeedMps,
+                    gnssSpeedMps = gnssSpeedForClassifier,
                 )
+                val stationary = classification.shouldApplyZupt
+
+                if (classification.context != lastLoggedContext) {
+                    Log.d(
+                        TAG,
+                        "stop context -> ${classification.context} " +
+                            "(currentSpeed=${"%.2f".format(classification.currentSpeedEstimateMps)} m/s, " +
+                            "recentPeak=${"%.2f".format(classification.recentPeakSpeedMps)} m/s, " +
+                            "duration=${classification.stationaryDurationMs}ms, " +
+                            "zupt=${classification.shouldApplyZupt}): ${classification.reason}",
+                    )
+                    lastLoggedContext = classification.context
+                }
 
                 // PRD.md Section 20's `Turning` exemption: computed every
                 // tick (not just when about to gate on it) so TurningDetector's
@@ -311,6 +379,7 @@ class BaselineDeadReckoningRepository(
                     isTurning = turning,
                     rawLinearAccelMagnitudeMps2 = rawLinearAccelMagnitudeMps2,
                     rawGyroMagnitudeRadPerSec = rawGyroMagnitudeRadPerSec,
+                    stationaryContext = classification.context,
                 )
             }
         }

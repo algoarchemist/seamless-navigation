@@ -1,7 +1,7 @@
 package com.sih26168.idr.ml
 
+import android.util.Log
 import com.sih26168.idr.alignment.AlignmentRepository
-import com.sih26168.idr.dr.StationaryDetector
 import com.sih26168.idr.dr.WorldFrameAcceleration
 import com.sih26168.idr.features.FeatureExtractor
 import com.sih26168.idr.fusion.VelocityBiasCalibrator
@@ -11,6 +11,8 @@ import com.sih26168.idr.gnss.GnssQuality
 import com.sih26168.idr.motion.LongitudinalMotionClassifier
 import com.sih26168.idr.motion.MotionStateClassifier
 import com.sih26168.idr.motion.PotholeShockDetector
+import com.sih26168.idr.motion.StationaryContext
+import com.sih26168.idr.motion.StopEventClassifier
 import com.sih26168.idr.sensors.SampleRate
 import com.sih26168.idr.sensors.SensorRepository
 import kotlin.math.cos
@@ -22,6 +24,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+
+private const val TAG = "MlVelocityRepository"
 
 data class MlVelocityUiState(
     /** The ONNX model's raw output, before Slice 7's bias correction. */
@@ -56,6 +60,10 @@ data class MlVelocityUiState(
     val isAccelerating: Boolean = false,
     /** LongitudinalMotionClassifier: vehicle-frame forward acceleration is below the (negative) Braking threshold this tick. */
     val isBraking: Boolean = false,
+    /** motion/StopEventClassifier's richer context for THIS tick's ZUPT
+     * decision — additional detail for logging/debug/UI, not a second
+     * ZUPT decision (see that class's own doc). */
+    val stationaryContext: StationaryContext = StationaryContext.MOVING,
 )
 
 // If no GNSS fix has ever been received, fixAgeMs is Long.MAX_VALUE —
@@ -123,6 +131,18 @@ private const val MAX_ELAPSED_SINCE_FIX_S = 999f
  * from the SAME alignment-corrected `accelForwardMps2` the model
  * consumes. All three are deterministic stand-ins, not the trained PRD
  * Section 14 classifier — see their own class docs for why.
+ *
+ * UPDATE (context-aware ZUPT): [stopEventClassifier] replaces the direct
+ * `StationaryDetector` this class used to own — see that class's own doc
+ * for the real, measured reason (accel/gyro alone were 100%
+ * false-negative against real traffic stops). [motionStateClassifier]'s
+ * existing contract is UNCHANGED — it still receives the plain accel/gyro
+ * dwell-confirmed boolean (now read off
+ * [com.sih26168.idr.motion.StopClassification.dwellConfirmedStationary]
+ * instead of a second, redundant `StationaryDetector` call) and still
+ * gets the final say on the ML path's own cruising override; the actual
+ * ZUPT gate is `stopEventClassifier`'s result AND-ed with "not overridden
+ * to cruising," so neither signal's existing protective behavior is lost.
  */
 class MlVelocityRepository(
     private val sensorRepository: SensorRepository,
@@ -131,7 +151,7 @@ class MlVelocityRepository(
     private val scope: CoroutineScope,
     private val alignmentRepository: AlignmentRepository,
     private val featureExtractor: FeatureExtractor = FeatureExtractor(),
-    private val stationaryDetector: StationaryDetector = StationaryDetector(),
+    private val stopEventClassifier: StopEventClassifier = StopEventClassifier(),
     private val positionIntegrator: MlPositionIntegrator = MlPositionIntegrator(),
     private val biasCalibrator: VelocityBiasCalibrator = VelocityBiasCalibrator(),
     private val motionStateClassifier: MotionStateClassifier = MotionStateClassifier(),
@@ -145,11 +165,17 @@ class MlVelocityRepository(
     private var lastProcessedAccelTimestampNs: Long? = null
     private var collectJob: Job? = null
 
+    // Logged only on a CONTEXT CHANGE, not every tick — same convention as
+    // dr/BaselineDeadReckoningRepository.kt's own StopEventClassifier logging.
+    private var lastLoggedContext: StationaryContext? = null
+
     fun start() {
         positionIntegrator.reset()
         biasCalibrator.reset()
         velocityGuard.reset()
+        stopEventClassifier.reset()
         lastProcessedAccelTimestampNs = null
+        lastLoggedContext = null
 
         collectJob = scope.launch {
             sensorRepository.state.collect { sensorUiState ->
@@ -313,22 +339,66 @@ class MlVelocityRepository(
                         gyro.zRadPerSec * gyro.zRadPerSec,
                 )
                 val nowBootTimeMs = accel.timestampNs / 1_000_000L
-                val physicallyStill = stationaryDetector.evaluate(
-                    nowBootTimeMs,
-                    linearAccelMagnitudeMps2,
-                    gyroMagnitudeRadPerSec,
+
+                // Same trustworthy-GNSS-speed preference as
+                // dr/BaselineDeadReckoningRepository.kt's own wiring — see
+                // StopEventClassifier's honest-limitation note for why this
+                // is preferred over the model's own (self-referential)
+                // speed estimate whenever it's actually available.
+                val gnssSpeedForClassifier = if (
+                    gnssState.mode == GnssMode.GNSS_AIDED &&
+                    fix != null &&
+                    GnssQuality.isGood(gnssState.fixAgeMs, fix.accuracyM)
+                ) {
+                    fix.speedMps
+                } else {
+                    null
+                }
+
+                val classification = stopEventClassifier.evaluate(
+                    nowMs = nowBootTimeMs,
+                    linearAccelMagnitudeMps2 = linearAccelMagnitudeMps2,
+                    gyroMagnitudeRadPerSec = gyroMagnitudeRadPerSec,
+                    currentSpeedEstimateMps = dampedVelocityMps,
+                    gnssSpeedMps = gnssSpeedForClassifier,
                 )
-                // Motion-classification stand-in: physicallyStill alone can't
-                // tell "truly at rest" from "smoothly cruising" (see
-                // MotionStateClassifier's doc) — corroborate with the raw
-                // model prediction before deciding whether to ZUPT.
-                val motionClassification = motionStateClassifier.classify(physicallyStill, rawPredictedVelocityMps)
+
+                if (classification.context != lastLoggedContext) {
+                    Log.d(
+                        TAG,
+                        "stop context -> ${classification.context} " +
+                            "(currentSpeed=${"%.2f".format(classification.currentSpeedEstimateMps)} m/s, " +
+                            "recentPeak=${"%.2f".format(classification.recentPeakSpeedMps)} m/s, " +
+                            "duration=${classification.stationaryDurationMs}ms, " +
+                            "zupt=${classification.shouldApplyZupt}): ${classification.reason}",
+                    )
+                    lastLoggedContext = classification.context
+                }
+
+                // Motion-classification stand-in: the plain accel/gyro
+                // dwell-confirmed flag alone can't tell "truly at rest" from
+                // "smoothly cruising" (see MotionStateClassifier's doc) —
+                // corroborate with the raw model prediction before deciding
+                // whether to override the context-aware ZUPT decision below.
+                val motionClassification = motionStateClassifier.classify(
+                    classification.dwellConfirmedStationary,
+                    rawPredictedVelocityMps,
+                )
+
+                // The actual ZUPT gate: StopEventClassifier's context-aware
+                // decision (catches real post-motion stops the old
+                // accel/gyro-only signal missed), still overridable by
+                // MotionStateClassifier's existing cruising signal (the raw
+                // model still predicts real speed despite a quiet/near-zero
+                // reading) — preserves that existing protective behavior
+                // exactly as before.
+                val shouldZupt = classification.shouldApplyZupt && !motionClassification.isCruising
 
                 val positionState = positionIntegrator.update(
                     dtSeconds = dtSeconds,
                     velocityMps = dampedVelocityMps,
                     headingRad = vehicleHeadingRad,
-                    isStationary = motionClassification.isStationary,
+                    isStationary = shouldZupt,
                 )
 
                 _state.value = MlVelocityUiState(
@@ -347,6 +417,7 @@ class MlVelocityRepository(
                     potholeShockDetectedThisTick = potholeShockDetectedThisTick,
                     isAccelerating = longitudinalClassification.isAccelerating,
                     isBraking = longitudinalClassification.isBraking,
+                    stationaryContext = classification.context,
                 )
             }
         }

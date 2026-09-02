@@ -750,6 +750,14 @@ private fun IdrSensorScreen(
                         "but there is still no accelerometer bias correction, so still " +
                         "expect drift during real motion.",
                 )
+                Text(text = "Stop context: ${drState.stationaryContext}")
+                Text(
+                    text = "^ motion/StopEventClassifier.kt — SUDDEN_STOP fires fast on a " +
+                        "post-motion stop (real drive found accel/gyro alone 100% false-" +
+                        "negative on real traffic stops); BRIEF_STOP/LONG_IDLE come from the " +
+                        "original accel/gyro dwell; MOVING covers real motion AND noisy/" +
+                        "unconfirmed near-zero readings (neither gets ZUPT'd).",
+                )
 
                 Text(text = "GNSS mode: ${gnssState.mode}")
                 if (!gnssState.hasLocationPermission) {

@@ -92,6 +92,19 @@ silently stacking on top of MapConstraint's every tick. See
 `fusion/RoadSnap.kt`'s own (now REMOVED) entry below for the full bug
 writeup; MapConstraint.kt is the sole surviving implementation.
 
+**Context-aware ZUPT update:** `motion/StopEventClassifier.kt` (NEW)
+replaces the flat "accel/gyro quiet -> ZUPT" gate both DR paths used —
+the 2026-09-01 finding that accel/gyro-only detection was 100%
+false-negative on real traffic stops is now addressed with a second,
+independent signal (a sustained drop from a meaningful reference speed
+to near-zero, preferring GNSS speed when trustworthy) rather than
+retuning the same unreliable threshold. Rule-based, not ML (no labeled
+stop-event data exists — CLAUDE.md Rule 3). Both
+`dr/BaselineDeadReckoningRepository.kt` and `ml/MlVelocityRepository.kt`
+now go through it; `dr/StationaryDetector.kt` itself is unchanged,
+composed rather than replaced. See its own entry below for the full
+design and honest limitations.
+
 ---
 
 ## How to read this file
@@ -449,7 +462,84 @@ Important concepts/assumptions: HONEST LIMITATION — constant-velocity
   ML classifier; neither is available here. Thresholds (0.25 m/s^2,
   0.05 rad/s, 300ms dwell) are engineering defaults, not yet validated
   against a real test drive (CLAUDE.md Rule 13).
-Connected to: BaselineDeadReckoningRepository -> StationaryDetector -> BaselinePhysicsIntegrator.overrideVelocity
+Connected to: BaselineDeadReckoningRepository -> StopEventClassifier -> StationaryDetector (wrapped, unchanged);
+  MlVelocityRepository -> StopEventClassifier -> StationaryDetector (wrapped, unchanged)
+UPDATE: no longer called directly by either DR repository — both now go
+  through motion/StopEventClassifier.kt (see its own entry below), which
+  composes this class UNCHANGED as one of its two signals. This class's
+  own behavior, signature, and tests are untouched.
+
+android/app/src/main/kotlin/com/sih26168/idr/motion/StopEventClassifier.kt
+Status: IMPLEMENTED
+Purpose: Context-aware replacement for gating ZUPT on "accel/gyro quiet
+  for N ms" alone (PRD.md Section 14's Stationary effect) — distinguishes
+  MOVING / SUDDEN_STOP / BRIEF_STOP / LONG_IDLE instead of a flat
+  stationary/not-stationary boolean. REAL FINDING driving this class's
+  existence (2026-09-01 real outdoor drive, see StationaryDetector.kt's
+  own doc): cross-checked against GNSS speed as ground truth,
+  accel/gyro-only stationary detection was 100% false-negative on real
+  urban-traffic stops — engine-idle/road vibration keeps accel/gyro
+  elevated even while genuinely stopped in traffic, so no fixed threshold
+  on that signal alone separates the classes. Adds a SECOND, independent
+  signal: a sustained drop from a meaningful reference speed to
+  near-zero, corroborated by GNSS speed when it's actually trustworthy —
+  deliberately NOT gated on the same strict accel/gyro threshold, since
+  that's exactly the signal measured unreliable for this case.
+Inputs: nowMs, linearAccelMagnitudeMps2, gyroMagnitudeRadPerSec (same as
+  StationaryDetector, passed straight through to the wrapped instance),
+  currentSpeedEstimateMps (caller's own pre-ZUPT speed — the physics
+  integrator's pre-override speed, or the ML model's damped prediction),
+  gnssSpeedMps (nullable — only passed by callers once they've verified
+  GNSS_AIDED + GnssQuality.isGood; preferred over currentSpeedEstimateMps
+  when present).
+Outputs: StopClassification(context, shouldApplyZupt, stationaryDurationMs,
+  recentPeakSpeedMps, currentSpeedEstimateMps, dwellConfirmedStationary,
+  reason) — shouldApplyZupt is the actual gate (true for every context
+  except MOVING); dwellConfirmedStationary exposes StationaryDetector's
+  own plain accel/gyro-dwell result so a caller that still needs that
+  exact signal (ml/MlVelocityRepository.kt's MotionStateClassifier
+  contract) doesn't need a second, redundant StationaryDetector instance.
+Important functions/classes: evaluate() — SUDDEN_STOP requires BOTH a
+  recent (within suddenStopLookbackMs=2000ms) reference speed
+  >= suddenStopPriorSpeedMps (1.5 m/s) AND the reference speed sustaining
+  <= nearZeroSpeedMps (0.3 m/s, matching scripts/analyze_drive_log.py's
+  own report_zupt_validation ground-truth bound) for
+  nearZeroConfirmMs (150ms — deliberately shorter than
+  StationaryDetector's 300ms dwell, since the prior-speed evidence
+  already raises confidence). BRIEF_STOP/LONG_IDLE fall back to
+  StationaryDetector's own accel/gyro dwell (split at
+  longIdleDurationMs=8000ms) — the sole signal when there's no meaningful
+  prior-speed evidence, e.g. right after launch. All five thresholds are
+  engineering defaults, not yet validated against a real labeled
+  stop-event drive (CLAUDE.md Rule 13) — no such drive has been captured
+  (see capture/SensorRecorder.kt's CaptureLabel tooling, still unused for
+  a real drive). reset() clears this class's own history/state but
+  deliberately does NOT reset the wrapped StationaryDetector, which has
+  no reset() of its own — matches existing app behavior (neither
+  repository reset it before this class existed either).
+Important concepts/assumptions: Rule-based by design, not ML — no
+  labeled stop-event data exists in this project
+  (train_motion_classifier.py stays PLANNED, blocked on self-captured
+  labels), and CLAUDE.md Rule 3 requires a measured reason to reach for
+  ML over a simple deterministic solution. HONEST LIMITATION: when no
+  GNSS speed is available (mid-outage, exactly when ZUPT matters most),
+  the reference speed is this app's own DR/ML estimate, not independent
+  ground truth — a sustained speed-estimate glitch during real continued
+  motion could in principle misfire into SUDDEN_STOP; preferring GNSS
+  speed whenever trustworthy minimizes but does not eliminate this.
+Connected to: dr/BaselineDeadReckoningRepository.kt, ml/MlVelocityRepository.kt
+  -> StopEventClassifier -> StationaryDetector (wrapped)
+Unit tests: tests/.../motion/StopEventClassifierTest.kt (11 cases) — long
+  idle after sustained no-prior-motion quiet; a brief stop stays
+  BRIEF_STOP under the idle bound; sudden stop after high-speed movement
+  fires before the accel/gyro dwell alone would; stop after low-speed
+  movement does NOT qualify for the fast path (falls back to the dwell
+  path); a single noisy near-zero glitch during real continued motion
+  does not false-ZUPT; resuming motion from LONG_IDLE returns to MOVING
+  and resets duration; GNSS speed is preferred over the own estimate when
+  supplied; falls back to the own estimate when GNSS speed isn't supplied
+  (mid-outage); SUDDEN_STOP decays to BRIEF_STOP once the lookback window
+  ages out; reset() forgets prior speed history.
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/NonHolonomicConstraint.kt
 Status: IMPLEMENTED
@@ -578,6 +668,18 @@ Important concepts/assumptions: orientation and accel come from
   fields only — the raw fields exist purely so a future drive log can
   compare raw vs. filtered separability offline (see
   scripts/analyze_drive_log.py's report_raw_vs_filtered).
+  UPDATE (context-aware ZUPT): the `stationary` decision now comes from
+  `motion/StopEventClassifier.kt` (see its own entry) instead of calling
+  `StationaryDetector` directly — this class supplies the classifier's
+  two extra inputs (this tick's pre-ZUPT integrated speed, captured right
+  after `integrator.update()`; GNSS speed when `GnssMode.GNSS_AIDED` and
+  `GnssQuality.isGood`) and acts on `StopClassification.shouldApplyZupt`
+  exactly where the old boolean was read. `DeadReckoningState.isStationary`
+  keeps its exact prior meaning (was ZUPT applied this tick); the new
+  `stationaryContext` field carries the richer classification for
+  logging/debug/UI only. Logs (`Log.d`) on every context change, not
+  every tick (CLAUDE.md Rule 17, same "log transitions, not the stream"
+  convention `gnss/GnssModeRepository.kt` already uses).
 Bug found + fixed during Slice 4 on-device verification (2026-08-25):
   lastProcessedAccelTimestampNs was originally a Long defaulting to 0L
   as the "no sample yet" sentinel. On the very first accel sample of a
@@ -1832,12 +1934,29 @@ REAL FINDING from on-device testing (2026-08-25) — position drift
   `confidenceWeight = GnssQuality.confidenceWeight(fix.accuracyM)`
   instead of relying on `GnssQuality.isGood`'s binary gate alone — see
   `fusion/VelocityBiasCalibrator.kt`'s entry for the effective-alpha math.
+  UPDATE (context-aware ZUPT): the owned `StationaryDetector` field is
+  replaced by `motion/StopEventClassifier.kt` (see its own entry) —
+  `dampedVelocityMps` and (when GNSS_AIDED + GnssQuality.isGood) GNSS
+  speed feed it as the two extra inputs. `MotionStateClassifier`'s
+  existing contract is UNCHANGED — it now reads
+  `StopClassification.dwellConfirmedStationary` instead of a second,
+  redundant `StationaryDetector.evaluate()` call, but receives the exact
+  same accel/gyro-dwell-only boolean it always did. The actual ZUPT gate
+  fed to `positionIntegrator.update()` is
+  `classification.shouldApplyZupt && !motionClassification.isCruising` —
+  StopEventClassifier's context-aware decision, still overridable by the
+  existing cruising signal exactly as before, so neither signal's prior
+  protective behavior is lost. `MlVelocityUiState.stationaryContext`
+  (new field) carries the classification for logging/debug/UI only, same
+  as `DeadReckoningState.stationaryContext` on the physics side. Logs
+  (`Log.d`) on every context change, not every tick.
 Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity (Compose UI);
   MlVelocityRepository -> fusion/StateEstimator (Slice 7, reads its position + isAligned);
   motion/MotionStateClassifier, motion/PotholeShockDetector, motion/LongitudinalMotionClassifier
   (2026-08-30) -> MlVelocityRepository;
   alignment/AlignmentRepository -> MlVelocityRepository (shared alignment estimate, replaces the
   owned AlignmentEstimator); ml/VelocityGuard -> MlVelocityRepository (Round 2, 2026-08-28);
+  motion/StopEventClassifier -> MlVelocityRepository (context-aware ZUPT);
   StatusOverlayContent's recalibrate button (via MapScreen) -> MainActivity ->
   AlignmentRepository.reset() (moved off this class)
 
