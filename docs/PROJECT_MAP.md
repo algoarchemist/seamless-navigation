@@ -619,7 +619,20 @@ Outputs: Boolean.
 Important concepts/assumptions: thresholds are engineering defaults,
   not yet validated against a real outage test run (PRD.md Section 28)
   — not to be reported to judges as measured figures (CLAUDE.md Rule 13).
-Connected to: GnssModeRepository -> GnssQuality -> GnssOutageDetector
+  REAL BUG FIX (2026-09-01, on-device test — phone stationary indoors,
+  History tab logging 0.3-30m of "drift" every reacquisition cycle):
+  DEFAULT_MAX_ACCURACY_M (25m) answers "is GNSS available at all," but
+  Android's self-reported Location accuracy doesn't detect indoor
+  multipath — successive fixes can each individually claim <=25m while
+  actually landing 5-30m apart. Added a second, stricter constant,
+  DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M (10m), used ONLY by
+  fusion/StateEstimator.kt to decide whether a fix is trustworthy
+  enough to (a) move the outage anchor or (b) be recorded as a measured
+  drift result — isGood()'s own 25m bar for state-machine timing is
+  unchanged, so reacquisition attempt cadence doesn't change.
+Connected to: GnssModeRepository -> GnssQuality -> GnssOutageDetector;
+  fusion/StateEstimator.kt -> GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M
+  (anchor-setting and drift-recording ground-truth gate)
 
 android/app/src/main/kotlin/com/sih26168/idr/gnss/GnssOutageDetector.kt
 Status: IMPLEMENTED
@@ -2171,6 +2184,26 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   null (ONNX load failure) means `positionFusion` simply keeps its fixed
   1-second default, the exact previous classical behavior. Logged
   (`Log.i`) alongside the existing drift-summary log line.
+  UPDATE (2026-09-01, REAL BUG FIX — on-device test, phone stationary
+  indoors, History tab logging 0.3-30m of "drift" every reacquisition
+  cycle): both `outageAnchorLatDeg`/`outageAnchorLonDeg` and the
+  REACQUISITION fix were only required to pass GnssQuality's 25m "is
+  GNSS available" bar, which Android's self-reported fix accuracy can
+  satisfy even under indoor multipath (successive fixes individually
+  claim <=25m while landing 5-30m apart) — so the recorded "drift" was
+  really GNSS position noise, not DR error. A new field,
+  `outageAnchorAccuracyM`, is captured alongside the anchor whenever the
+  strict (non-provisional) anchor-set branch fires; at the "entering
+  REACQUISITION" instant, a `DriftSummary` is now only computed/recorded
+  (`driftHistory.add`, `Log.i`) when BOTH the anchor's tracked accuracy
+  and the current fix's accuracy independently clear the new, stricter
+  `GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M` (10m) bound —
+  see that constant's own doc. The state machine's own mode-transition
+  timing and the adaptive `positionFusion.setReacquisitionBlendMs()`
+  call are UNCHANGED (still run every REACQUISITION entry regardless of
+  ground-truth quality) — this only gates whether a number gets
+  PRESENTED to the user as a measured drift result, not the live
+  position-fusion behavior.
 Connected to: GnssModeRepository, BaselineDeadReckoningRepository,
   MlVelocityRepository -> StateEstimator -> MainActivity (Compose UI);
   fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8);

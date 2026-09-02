@@ -21,6 +21,32 @@ object GnssQuality {
     const val DEFAULT_MAX_ACCURACY_M = 25f
 
     /**
+     * REAL BUG (2026-09-01, on-device test — phone sitting stationary
+     * indoors, History tab still logging 0.3-30m of "drift" every
+     * reacquisition cycle): [DEFAULT_MAX_ACCURACY_M] answers "is GNSS
+     * available at all" for the state machine, but Android's self-reported
+     * `Location.getAccuracy()` is the RECEIVER's own confidence estimate —
+     * it does not detect multipath. Indoors, successive fixes can each
+     * individually claim <=25m accuracy while actually landing 5-30m apart
+     * from each other (signal bouncing off walls/ceiling before reaching
+     * the antenna). [fusion.StateEstimator] was treating any such fix as
+     * ground truth for its outage anchor and its "measured drift" claim,
+     * so it was really measuring GNSS position noise and mislabeling it as
+     * dead-reckoning drift — a violation of CLAUDE.md Rule 13 (no invented
+     * or misattributed numbers), even though every individual number was
+     * technically "real" telemetry.
+     *
+     * This tighter bound is a SEPARATE, stricter bar used only where a fix
+     * is trusted as ground truth (the outage anchor, and the fix a drift
+     * measurement is computed against) — [isGood]'s own 25m bar for
+     * state-machine timing is untouched, so reacquisition attempt cadence
+     * doesn't change. Engineering default, unvalidated against a real
+     * outdoor test run (CLAUDE.md Rule 13) — same caveat as
+     * [DEFAULT_MAX_ACCURACY_M] itself.
+     */
+    const val DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M = 10f
+
+    /**
      * @param fixAgeMs milliseconds since the most recent fix was received
      *   (Long.MAX_VALUE if no fix has ever been received).
      * @param accuracyM the most recent fix's accuracy in meters, or null

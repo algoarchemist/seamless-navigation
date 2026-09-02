@@ -172,6 +172,13 @@ class StateEstimator(
 
     private var outageAnchorLatDeg: Double? = null
     private var outageAnchorLonDeg: Double? = null
+    // Accuracy (meters) of the fix the anchor was last set FROM — null
+    // while the anchor is only the PROVISIONAL any-quality one (see the
+    // branch below), since that anchor was never claimed to be ground
+    // truth in the first place. Tracked so the drift-recording check
+    // further down can require the anchor itself, not just the
+    // reacquisition fix, to have been trustworthy (GnssQuality's doc).
+    private var outageAnchorAccuracyM: Float? = null
     private var lastAidedAtMs: Long? = null
     private var previousMode: GnssMode? = null
     private var lastDriftSummary: DriftSummaryResult? = null
@@ -231,6 +238,7 @@ class StateEstimator(
         headingFusion.reset()
         outageAnchorLatDeg = null
         outageAnchorLonDeg = null
+        outageAnchorAccuracyM = null
         lastAidedAtMs = null
         previousMode = null
         lastDriftSummary = null
@@ -266,6 +274,7 @@ class StateEstimator(
                 if (gnssState.mode == GnssMode.GNSS_AIDED && GnssQuality.isGood(gnssState.fixAgeMs, fix.accuracyM)) {
                     outageAnchorLatDeg = fix.latitudeDeg
                     outageAnchorLonDeg = fix.longitudeDeg
+                    outageAnchorAccuracyM = fix.accuracyM
                     lastAidedAtMs = nowMs
                 } else if (outageAnchorLatDeg == null) {
                     // REAL BUG (2026-08-26, user report: "no feature to track
@@ -347,25 +356,60 @@ class StateEstimator(
                     newFixEastM != null &&
                     newFixNorthM != null
                 ) {
-                    lastDriftSummary = DriftSummary.compute(
-                        drEastM = drEastM,
-                        drNorthM = drNorthM,
-                        gnssEastM = newFixEastM,
-                        gnssNorthM = newFixNorthM,
-                    )
-                    driftHistory.add(lastDriftSummary!!)
-                    // Logged (not just shown in ui/screens/HistoryScreen.kt)
-                    // so a `logcat` capture running during a real demo/test
-                    // drive durably records the actual measured numbers
-                    // (PRD.md Section 28/35) -- the in-app History list is
-                    // in-memory only and is lost the moment the app process
-                    // dies, which is too fragile to be the only record of a
-                    // real measured result.
-                    Log.i(
-                        TAG,
-                        "Outage #${driftHistory.size} drift: ${lastDriftSummary!!.driftMeters}m " +
-                            "over ${lastDriftSummary!!.distanceTravelledMeters}m travelled",
-                    )
+                    // REAL BUG (2026-09-01, on-device test — phone
+                    // stationary indoors, History tab logging 0.3-30m of
+                    // "drift" every reacquisition cycle): a drift NUMBER is
+                    // only as honest as its two endpoints. `newFixEastM`/
+                    // `newFixNorthM` above only required
+                    // GnssOutageDetector's looser "is GNSS available at
+                    // all" bar (gnssState.mode == REACQUISITION, backed by
+                    // GnssQuality.DEFAULT_MAX_ACCURACY_M's 25m) — indoors,
+                    // that's easily satisfied by a multipath-corrupted fix
+                    // that's actually 5-30m from the truth, so what got
+                    // recorded was GNSS position noise mislabeled as
+                    // dead-reckoning drift (CLAUDE.md Rule 13). Requiring
+                    // BOTH the anchor (`outageAnchorAccuracyM`, captured
+                    // when the anchor was set) and this fix to independently
+                    // clear the stricter ground-truth bar before recording
+                    // anything keeps the state machine's own timing (mode
+                    // transitions, blend duration below) untouched — it
+                    // only gates whether this cycle's gap gets PRESENTED as
+                    // a measured drift result. See
+                    // GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M's
+                    // doc for the full reasoning.
+                    val anchorAccuracyM = outageAnchorAccuracyM
+                    val anchorIsGroundTruth = anchorAccuracyM != null &&
+                        anchorAccuracyM <= GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M
+                    val fixIsGroundTruth =
+                        fix.accuracyM <= GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M
+                    if (anchorIsGroundTruth && fixIsGroundTruth) {
+                        lastDriftSummary = DriftSummary.compute(
+                            drEastM = drEastM,
+                            drNorthM = drNorthM,
+                            gnssEastM = newFixEastM,
+                            gnssNorthM = newFixNorthM,
+                        )
+                        driftHistory.add(lastDriftSummary!!)
+                        // Logged (not just shown in ui/screens/HistoryScreen.kt)
+                        // so a `logcat` capture running during a real demo/test
+                        // drive durably records the actual measured numbers
+                        // (PRD.md Section 28/35) -- the in-app History list is
+                        // in-memory only and is lost the moment the app process
+                        // dies, which is too fragile to be the only record of a
+                        // real measured result.
+                        Log.i(
+                            TAG,
+                            "Outage #${driftHistory.size} drift: ${lastDriftSummary!!.driftMeters}m " +
+                                "over ${lastDriftSummary!!.distanceTravelledMeters}m travelled",
+                        )
+                    } else {
+                        Log.i(
+                            TAG,
+                            "Reacquisition fix rejected as drift ground truth " +
+                                "(anchorAccuracyM=$anchorAccuracyM, fixAccuracyM=${fix.accuracyM}, " +
+                                "bound=${GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M}m) -- not recorded",
+                        )
+                    }
 
                     // PRD.md Section 17's "AI-based" fusion: predicts THIS
                     // outage's expected drift from its real duration + the
