@@ -2126,11 +2126,12 @@ Purpose: PRD.md Section 17's "the IMU-derived velocity/heading are used
 Inputs (per update() call): nowMs; rawFixEastM/rawFixNorthM (a GNSS fix
   in a FIXED local-meter frame — caller's responsibility to keep the
   reference point constant across calls); velocityEastMps/velocityNorthMps
-  (current IMU/DR-derived WORLD-frame velocity, for the short-term
-  prediction step between fixes); confidenceWeight in [0,1] (typically
+  (current WORLD-frame velocity, for the short-term prediction step
+  between fixes — see 2026-09-02 UPDATE below for what StateEstimator
+  actually passes here); confidenceWeight in [0,1] (typically
   gnss/GnssQuality.confidenceWeight — how hard to pull the prediction
-  toward the raw fix this tick; 1 = trust it completely, 0 = pure IMU
-  dead reckoning).
+  toward the raw fix this tick; 1 = trust it completely, 0 = pure
+  prediction from velocityEastMps/velocityNorthMps).
 Outputs: (smoothedEastM, smoothedNorthM) — same local-meter frame as the
   input.
 Important functions/classes: update() — first-ever sample is trusted
@@ -2142,6 +2143,27 @@ Important functions/classes: update() — first-ever sample is trusted
   all state — callers must call it whenever GNSS is freshly (re)trusted
   after not being GNSS_AIDED, so the next update() doesn't predict
   across a stale multi-second/-minute gap from a pre-outage position.
+UPDATE (2026-09-02, REAL BUG, found via drive-log analysis — user report:
+  "delay in the start of navigation" when moving off from stationary
+  while GNSS_AIDED): `fusion/StateEstimator.kt` originally passed
+  `dr/BaselineDeadReckoningRepository`'s velocityEastMps/velocityNorthMps
+  here, per this file's "IMU/DR-derived" description above at the time.
+  But that repository resets its own integrator to (near) zero on EVERY
+  tick while GNSS_AIDED (by design — DR must not accumulate drift while
+  GNSS is trusted; see its own PROJECT_MAP entry). That pinned this
+  filter's predict step at "no motion" regardless of real speed, so the
+  marker only ever moved via the accuracy-gated correction step — a
+  multi-second visible lag at the start of motion, worse the weaker the
+  fix accuracy. Fix: `fusion/StateEstimator.kt` now derives
+  velocityEastMps/velocityNorthMps from the current GNSS fix's own
+  Doppler speedMps/bearingDeg instead (East = speed*sin(bearing), North =
+  speed*cos(bearing), same convention ml/MlPositionIntegrator.kt already
+  uses for bearing-to-East/North) — a real, never-zeroed measure of
+  current motion, already trusted elsewhere in this codebase
+  (alignment/AlignmentEstimator.kt) for the same "vehicle is actually
+  moving" purpose. Falls back to 0,0 (not a fabricated value) when a fix
+  doesn't report speed/bearing. This class itself is unchanged — still
+  source-agnostic about where its velocity input comes from.
 Important concepts/assumptions: operates entirely in whatever local-
   meter frame the caller supplies — carries no lat/lon or GeoProjection
   dependency itself (kept in the caller, fusion/StateEstimator.kt).
@@ -2440,6 +2462,17 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   ended, or this run's very first tick), so the filter never predicts
   across a stale gap. New `FusedPositionUiState.gnssJitterOffsetM` field
   (magnitude, debug-only) surfaces the correction size for verification.
+  UPDATE (2026-09-02, REAL BUG FIX — user report: "delay in the start of
+  navigation" when moving off from stationary while GNSS_AIDED): "the
+  current physics velocity" above was `BaselineDeadReckoningRepository`'s
+  velocity, which that repository resets to (near) zero every tick while
+  GNSS_AIDED (see its own entry) — so `gnssJitterFilter`'s predict step
+  always predicted "no motion," and the marker only moved via the
+  accuracy-gated correction step, several seconds behind real motion at
+  the start of a drive-off. Now feeds `gnssJitterFilter` the current
+  fix's own Doppler speedMps/bearingDeg (converted to East/North the same
+  way ml/MlPositionIntegrator.kt does) instead of the physics velocity —
+  see fusion/GnssJitterFilter.kt's own UPDATE note for the full reasoning.
 Connected to: GnssModeRepository, BaselineDeadReckoningRepository,
   MlVelocityRepository -> StateEstimator -> MainActivity (Compose UI);
   fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8);

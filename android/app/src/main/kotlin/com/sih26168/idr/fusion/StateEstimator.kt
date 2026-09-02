@@ -9,7 +9,9 @@ import com.sih26168.idr.map.MapConstraint
 import com.sih26168.idr.ml.MlVelocityRepository
 import com.sih26168.idr.ml.ReacquisitionDriftModel
 import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.sin
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -356,13 +358,52 @@ class StateEstimator(
                             refLatDeg = originLat,
                             refLonDeg = originLon,
                         )
-                        val currentVelocity = deadReckoningRepository.state.value
+                        // REAL BUG (2026-09-02, found via drive-log analysis
+                        // — user report: "delay in the start of navigation"
+                        // when moving off from stationary while GNSS_AIDED):
+                        // this used to read deadReckoningRepository.state
+                        // .value's velocityEastMps/velocityNorthMps as the
+                        // predict step's velocity, but
+                        // BaselineDeadReckoningRepository resets that SAME
+                        // integrator to (near) zero on every tick while
+                        // GNSS_AIDED (by design — DR must not accumulate
+                        // drift while GNSS is trusted). That pinned the
+                        // predict step at "still at the last smoothed spot"
+                        // regardless of real speed, so the marker only ever
+                        // moved via the accuracy-gated correction step below
+                        // — a multi-second visible lag at the start of
+                        // motion, worse the weaker the fix accuracy.
+                        // Fix: derive the predict step's velocity from THIS
+                        // fix's own Doppler speed/bearing instead — a real,
+                        // never-zeroed measure of current motion (the same
+                        // fields alignment/AlignmentEstimator.kt already
+                        // trusts for the same "vehicle is actually moving"
+                        // purpose). fix.bearingDeg is Android's
+                        // Location.getBearing() — compass bearing, degrees
+                        // clockwise from true north — converted to this
+                        // project's East/North world-frame convention the
+                        // same way ml/MlPositionIntegrator.kt already does
+                        // (East = speed*sin(bearing), North = speed*cos
+                        // (bearing)). Falls back to 0,0 — same as the old
+                        // always-zero behavior, not a fabricated value —
+                        // when a fix doesn't report speed/bearing.
+                        val gnssBearingRad = fix.bearingDeg?.let { Math.toRadians(it.toDouble()) }
+                        val gnssVelocityEastMps = if (fix.speedMps != null && gnssBearingRad != null) {
+                            fix.speedMps.toDouble() * sin(gnssBearingRad)
+                        } else {
+                            0.0
+                        }
+                        val gnssVelocityNorthMps = if (fix.speedMps != null && gnssBearingRad != null) {
+                            fix.speedMps.toDouble() * cos(gnssBearingRad)
+                        } else {
+                            0.0
+                        }
                         val (smoothedEastM, smoothedNorthM) = gnssJitterFilter.update(
                             nowMs = nowMs,
                             rawFixEastM = rawFixEastM,
                             rawFixNorthM = rawFixNorthM,
-                            velocityEastMps = currentVelocity.velocityEastMps,
-                            velocityNorthMps = currentVelocity.velocityNorthMps,
+                            velocityEastMps = gnssVelocityEastMps,
+                            velocityNorthMps = gnssVelocityNorthMps,
                             confidenceWeight = GnssQuality.confidenceWeight(fix.accuracyM),
                         )
                         // The SMOOTHED position minus THIS tick's raw fix —

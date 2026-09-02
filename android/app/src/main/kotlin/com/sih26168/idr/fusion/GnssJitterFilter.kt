@@ -18,9 +18,23 @@ package com.sih26168.idr.fusion
  * state-space estimator with covariance propagation) — pure Kotlin, no
  * Android dependency, unit-testable per CLAUDE.md Rule 19. Each call:
  * 1. PREDICTS forward from the last smoothed position using the
- *    caller-supplied IMU/DR-derived WORLD-frame velocity over the
- *    elapsed time since the last call (short-term dead-reckoning
- *    between fixes).
+ *    caller-supplied WORLD-frame velocity over the elapsed time since
+ *    the last call (short-term dead-reckoning between fixes).
+ *    REAL BUG (2026-09-02, found via drive-log analysis — user report:
+ *    "delay in the start of navigation" when moving off from stationary
+ *    while GNSS_AIDED): the doc here used to say this velocity comes
+ *    from the IMU/DR path, and [fusion.StateEstimator] used to pass
+ *    `BaselineDeadReckoningRepository`'s velocity accordingly — but that
+ *    repository resets its own integrator to (near) zero on EVERY tick
+ *    while `GNSS_AIDED` (by design, so DR doesn't accumulate drift while
+ *    GNSS is trusted). That pinned the predict step at "no motion"
+ *    regardless of real speed, so the marker only ever moved via step 2
+ *    below, gated purely by fix accuracy — a multi-second visible lag at
+ *    the start of motion. [fusion.StateEstimator] now derives this
+ *    velocity from the current GNSS fix's own Doppler speed/bearing
+ *    instead — see its call site for the frame-conversion reasoning.
+ *    This class itself is unchanged; it still just consumes whatever
+ *    WORLD-frame velocity the caller passes in.
  * 2. Pulls that prediction toward the newly arrived raw fix by
  *    [confidenceWeight] — reusing the SAME FR13 signal
  *    [VelocityBiasCalibrator] already uses, so a fix right at the
@@ -47,12 +61,14 @@ class GnssJitterFilter {
      *   FIXED local-meter frame (caller's responsibility to keep the
      *   reference point constant across calls — a moving reference would
      *   make consecutive calls incomparable).
-     * @param velocityEastMps/velocityNorthMps current IMU/DR-derived
-     *   WORLD-frame velocity (m/s), for the short-term prediction step.
+     * @param velocityEastMps/velocityNorthMps current WORLD-frame velocity
+     *   (m/s) for the short-term prediction step — caller's choice of
+     *   source (see this class's own doc for why [fusion.StateEstimator]
+     *   uses the GNSS fix's own Doppler speed/bearing here, not IMU/DR).
      * @param confidenceWeight in [0, 1] — how hard to pull the prediction
      *   toward [rawFixEastM]/[rawFixNorthM] this tick; 1 = trust the raw
-     *   fix completely (no smoothing), 0 = ignore it entirely (pure IMU
-     *   dead reckoning). Typically
+     *   fix completely (no smoothing), 0 = ignore it entirely (pure
+     *   prediction from [velocityEastMps]/[velocityNorthMps]). Typically
      *   [com.sih26168.idr.gnss.GnssQuality.confidenceWeight].
      * @return the smoothed position, same local-meter frame as the input.
      */
