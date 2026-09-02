@@ -287,14 +287,34 @@ class BaselineDeadReckoningRepository(
                 val nowBootTimeMs = accel.timestampNs / 1_000_000L
 
                 // GNSS speed is only handed to the classifier when it's
-                // ACTUALLY trustworthy this tick (GNSS_AIDED + GnssQuality's
-                // own availability bar) — preferred over this class's own
+                // ACTUALLY trustworthy this tick (GnssQuality's own
+                // availability bar) — preferred over this class's own
                 // integrated speed when present, since it doesn't share the
                 // DR path's error modes (see StopEventClassifier's own
                 // honest-limitation note).
+                //
+                // REAL BUG (2026-09-02, found via on-device screenshot —
+                // user report: "phone is stationary but the app tells it's
+                // moving", mode=REACQUISITION, physics DR velocity had
+                // drifted to ~38.9 m/s / ~2.9km with accel/gyro confirmed at
+                // rest): this used to require gnssState.mode ==
+                // GNSS_AIDED specifically, so REACQUISITION — which by
+                // construction already has a fix that's been continuously
+                // good for >= GnssOutageDetector's reacquisitionEnterDwellMs
+                // (that's its own entry condition) — got NO trustworthy GNSS
+                // speed at all. Once physics velocity has drifted
+                // (StationaryDetector's accel/gyro threshold alone doesn't
+                // catch every case — see its own doc), StopEventClassifier's
+                // SUDDEN_STOP fast path falls back to referencing this
+                // class's OWN (already-drifted) speed estimate, which can
+                // never read as near-zero — a self-referential deadlock that
+                // only a genuinely independent signal (GNSS) can break, and
+                // REACQUISITION mode was wrongly excluded from providing
+                // one. Widened to also trust GNSS_AIDED's own vetted
+                // continuous-good guarantee during REACQUISITION.
                 val fix = gnssState.latestFix
                 val gnssSpeedForClassifier = if (
-                    gnssState.mode == GnssMode.GNSS_AIDED &&
+                    (gnssState.mode == GnssMode.GNSS_AIDED || gnssState.mode == GnssMode.REACQUISITION) &&
                     fix != null &&
                     GnssQuality.isGood(gnssState.fixAgeMs, fix.accuracyM)
                 ) {

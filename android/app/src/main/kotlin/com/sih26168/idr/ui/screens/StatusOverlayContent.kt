@@ -27,6 +27,7 @@ import com.sih26168.idr.fusion.DrSource
 import com.sih26168.idr.fusion.FusedPositionUiState
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeUiState
+import com.sih26168.idr.gnss.GnssQuality
 import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.ui.components.DriftSummaryCard
 import com.sih26168.idr.ui.components.FloatingIconButton
@@ -296,9 +297,11 @@ internal fun StatusOverlayContent(
 /**
  * FR10's "estimated speed" — reflects whichever source is actually
  * authoritative right now, matching fusion/StateEstimator's own DR-source
- * selection: real GNSS speed while GNSS_AIDED, else the ML velocity if
- * that's the DR source in use, else the physics velocity's magnitude
- * (already ZUPT-corrected by dr/BaselineDeadReckoningRepository).
+ * selection: real GNSS speed while GNSS_AIDED (or REACQUISITION with a
+ * currently-good fix — see this function's 2026-09-02 REAL BUG note
+ * below), else the ML velocity if that's the DR source in use, else the
+ * physics velocity's magnitude (already ZUPT-corrected by
+ * dr/BaselineDeadReckoningRepository).
  */
 internal fun estimateSpeedMps(
     drState: DeadReckoningState,
@@ -322,8 +325,27 @@ internal fun estimateSpeedMps(
         gnssSpeed != null &&
             physicsSpeedMps < STATIONARY_SPEED_EPSILON_MPS &&
             gnssSpeed >= STATIONARY_SPEED_EPSILON_MPS
+    // REAL BUG (2026-09-02, found via on-device screenshot — user report:
+    // "phone is stationary but the app tells it's moving", mode=
+    // REACQUISITION, chip showing ~14 m/s "Moving" while accel/gyro
+    // confirmed rest): this used to require GNSS_AIDED specifically, so
+    // REACQUISITION — which by construction already has a fix continuously
+    // good for >= GnssOutageDetector's reacquisitionEnterDwellMs — fell
+    // straight to the ML/physics fallback below, which had itself drifted
+    // with no independent signal available to correct it (see
+    // dr/BaselineDeadReckoningRepository.kt's matching 2026-09-02 fix for
+    // the full self-referential-deadlock reasoning). Widened to also trust
+    // REACQUISITION, gated on GnssQuality.isGood() the same way the other
+    // two fixed call sites are (REACQUISITION alone doesn't guarantee THIS
+    // tick's fix is good, only that it recently has been).
+    val gnssAccuracyM = gnssState.latestFix?.accuracyM
+    val gnssSpeedTrustedThisTick = gnssSpeed != null &&
+        (
+            gnssState.mode == GnssMode.GNSS_AIDED ||
+                (gnssState.mode == GnssMode.REACQUISITION && GnssQuality.isGood(gnssState.fixAgeMs, gnssAccuracyM))
+            )
     return when {
-        gnssState.mode == GnssMode.GNSS_AIDED && gnssSpeed != null && !gnssSpeedContradictsStationaryPhysics ->
+        gnssSpeedTrustedThisTick && gnssSpeed != null && !gnssSpeedContradictsStationaryPhysics ->
             gnssSpeed
         // Round 2 (2026-08-28): shows the DAMPED value, not the merely
         // bias-corrected one — this is what actually feeds the ML

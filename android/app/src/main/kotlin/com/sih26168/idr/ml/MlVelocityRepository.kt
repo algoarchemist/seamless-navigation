@@ -344,9 +344,17 @@ class MlVelocityRepository(
                 // dr/BaselineDeadReckoningRepository.kt's own wiring — see
                 // StopEventClassifier's honest-limitation note for why this
                 // is preferred over the model's own (self-referential)
-                // speed estimate whenever it's actually available.
+                // speed estimate whenever it's actually available. Also
+                // carries that file's 2026-09-02 REAL BUG fix (see its own
+                // comment for the full on-device finding): widened from
+                // GNSS_AIDED-only to also trust REACQUISITION, which by
+                // construction already has a fix continuously good for >=
+                // GnssOutageDetector's reacquisitionEnterDwellMs — excluding
+                // it left this path's ZUPT gate with no independent signal
+                // to break a self-referential "damped velocity already
+                // drifted, so it never reads as near-zero" deadlock.
                 val gnssSpeedForClassifier = if (
-                    gnssState.mode == GnssMode.GNSS_AIDED &&
+                    (gnssState.mode == GnssMode.GNSS_AIDED || gnssState.mode == GnssMode.REACQUISITION) &&
                     fix != null &&
                     GnssQuality.isGood(gnssState.fixAgeMs, fix.accuracyM)
                 ) {

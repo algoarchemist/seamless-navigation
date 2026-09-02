@@ -697,6 +697,32 @@ Bug found + fixed during Slice 4 on-device verification (2026-08-25):
   S24 FE: position/velocity now stay small (sub-2m, sub-0.1 m/s) at
   rest, as expected. (Slice 5's ZUPT then reduced that further to
   near-zero — see build-verification entry below.)
+UPDATE (2026-09-02, REAL BUG, found via on-device screenshot — user
+  report: "phone is stationary but the app tells it's moving", mode=
+  REACQUISITION, physics DR velocity had drifted to ~38.9 m/s / ~2.9km
+  with accel/gyro confirmed at rest): `gnssSpeedForClassifier` (fed to
+  `motion/StopEventClassifier.kt`, added by an earlier same-day commit)
+  required `gnssState.mode == GnssMode.GNSS_AIDED` specifically, so
+  REACQUISITION — which by construction already has a fix continuously
+  good for >= GnssOutageDetector's reacquisitionEnterDwellMs — got no
+  trustworthy GNSS speed at all. Once physics velocity had drifted (the
+  wrapped StationaryDetector's accel/gyro threshold alone doesn't catch
+  every case — see its own doc), StopEventClassifier's SUDDEN_STOP fast
+  path fell back to referencing this class's OWN already-drifted speed
+  estimate, which could never read as near-zero — a self-referential
+  deadlock only an independent signal (GNSS) can break. Widened to also
+  trust GNSS_AIDED's vetted continuous-good guarantee during
+  REACQUISITION. Re-verified live on-device: REACQUISITION now correctly
+  shows 0.0 m/s / Stationary instead of drifting further. The SAME fix
+  was applied to ml/MlVelocityRepository.kt's identical
+  gnssSpeedForClassifier block and ui/screens/StatusOverlayContent.kt's
+  estimateSpeedMps() (see their own entries/inline docs). Does NOT fix
+  ZUPT during genuine DEAD_RECKONING (no GNSS available there by
+  definition) — a fresh drive log captured immediately after (see
+  scripts/analyze_drive_log.py's UPDATE below) confirms that remains the
+  pre-existing, disclosed limitation this repository's own debug-screen
+  copy already states ("no accelerometer bias correction, so still
+  expect drift").
 
 android/app/src/main/kotlin/com/sih26168/idr/gnss/GnssFix.kt
 Status: IMPLEMENTED
