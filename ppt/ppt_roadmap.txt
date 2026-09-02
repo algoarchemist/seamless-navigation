@@ -1,0 +1,489 @@
+PPT ROADMAP — SIH 26168 Intelligent Dead Reckoning
+Built against: ppt/SIH2026-IDEA-Presentation-Format.pptx (official template, 7 slides,
+6 content slides max including title) + ppt/Ppt requirements.docx (judge-hook, evidence,
+formula requirements).
+
+==============================================================================
+0. THE STRATEGY (read this before touching PowerPoint)
+==============================================================================
+
+The requirements doc is explicit: judges should be hooked in the first 20-30
+seconds, and should walk away thinking "this team understood the problem at a
+level most teams didn't reach" — not "this team built the assigned features."
+
+That difference is entirely about EVIDENCE and SPECIFICITY, not about having
+more features. Three concrete rules, applied on every slide below:
+
+RULE 1 — Never state a problem in the abstract. State it with a number and a
+source. "GPS fails in tunnels" is a school-project sentence. "465 confirmed
+GPS spoofing events in Indian airspace between Nov 2023-Feb 2025 (DGCA)" is a
+judge-hook sentence. Every claim slide below has the number attached.
+
+RULE 2 — Use the required formula, explicitly, at least twice:
+    EXISTING SOLUTION → WORKS FOR → BUT FAILS WHEN → OUR SOLUTION → VALIDATED BY (source)
+This is not a suggestion, it's what the requirements doc literally asks for.
+Section 2 (below) below is written pre-formatted in exactly this shape —
+lift it directly onto slides 2 and 4.
+
+RULE 3 — Never inflate a number that hasn't been measured on THIS project.
+CLAUDE.md's honesty rule extends to the pitch: when citing this project's own
+results, cite only what STATUS_AND_ROADMAP.md/summary.txt actually recorded
+(measured, on-device or on IO-VNBD-simulated outages). When citing published
+research (IO-VNBD's own numbers, AVNet's <0.5% figure), attribute it clearly
+to THAT paper, not to this project — the contrast between "SOTA achieves X"
+and "we honestly haven't measured that yet, here's what we have measured" is
+ITSELF a credibility signal to a judge who's seen ten teams overclaim tonight.
+
+==============================================================================
+1. THE EVIDENCE BANK — every source, with the exact line to use
+==============================================================================
+
+Six real sources, spanning exactly the three categories the requirements doc
+asks for (research papers / government data / existing-product failure
+evidence). Full citations belong on Slide 6; short forms below are what you
+actually say out loud or put in a bullet.
+
+--- PAPER 1 (this project's own training data — use this first, it's airtight) ---
+Onyekpe, U., Palade, V., Kanarachos, S., Szkolnik, A. "IO-VNBD: Inertial and
+Odometry Benchmark Dataset for Ground Vehicle Positioning." Data in Brief,
+2021 (also arXiv:2005.01701, 2020).
+KEY FACT: ~58 hours / 4,400 km of real smartphone IMU+GPS driving data across
+UK, Nigeria, and France, built specifically because "the lack of a public,
+robust benchmark dataset hindered the advancement of ML techniques to learn
+INS error." This is not a random citation — it is literally the dataset
+ml/train_velocity_model.py and ml/train_reacquisition_model.py train against.
+USE THIS TO SAY: "We didn't invent our own toy dataset to make our numbers
+look good — we trained and evaluated against the same public benchmark the
+research community uses, specifically so our results are comparable, not
+cherry-picked."
+
+--- PAPER 2 (state-of-the-art contrast — use this to justify YOUR architecture choice) ---
+"Avnet: learning attitude and velocity for vehicular dead reckoning using
+smartphone by adapting an invariant EKF." Satellite Navigation (Springer
+Nature), 2025. DOI: 10.1186/s43020-025-00168-7.
+KEY FACT: current academic SOTA for smartphone-only vehicular dead reckoning
+uses a CNN+GRU deep neural network feeding an invariant Kalman filter, and
+reports <0.5% horizontal positioning error of distance travelled in realistic
+driving.
+USE THIS TO SAY (this is your "we thought about the alternative and chose
+deliberately" moment — huge credibility signal): "The current academic
+state-of-the-art for this exact problem uses a deep neural network plus an
+invariant Kalman filter to hit under 0.5% drift. We deliberately did NOT copy
+that architecture — a CNN+GRU is expensive to run in real time on a mid-range
+phone and its outputs aren't easily auditable. We chose lightweight,
+explainable tree-ensemble models specifically because the official SIH bar is
+under 10% drift, not under 0.5% — we're engineering to the actual requirement,
+not chasing a bigger number for its own sake." This ALSO directly answers "why
+didn't you use deep learning" before a judge asks it.
+
+--- PAPER 3 (foundational grounding — smartphone VDR is a real, established research area) ---
+Nawarathne, K., Zhao, F., Pereira, F.C., Luo, J. "Dead reckoning on
+smartphones to reduce GPS usage." IEEE ICARCV 2014. DOI:
+10.1109/ICARCV.2014.7064360.
+USE THIS TO SAY: "Smartphone-only vehicular dead reckoning isn't a novel idea
+we made up — it's been an active IEEE research area for over a decade. What's
+still missing is a version of it shipped as a real, running, honestly-measured
+consumer app, which is what we built."
+
+--- GOVERNMENT DATA 1 (the urgency stat — THIS IS YOUR HOOK LINE, see Slide 2) ---
+Directorate General of Civil Aviation (DGCA), Government of India — Advisory
+Circular ANSS AC 01 of 2023 (24 Nov 2023) on GNSS Interference in Airspace;
+subsequent reporting.
+KEY FACTS:
+  - 465 confirmed GPS spoofing events in Indian airspace, Nov 2023-Feb 2025,
+    concentrated near the Pakistan border (Amritsar, Jammu).
+  - 1,951 total GPS interference cases reported Nov 2023-Nov 2025.
+  - DGCA has since mandated real-time reporting (within 10 minutes) of GNSS
+    interference events, including a dedicated SOP for Delhi (IGI) airport
+    (Nov 2025).
+USE THIS TO SAY: "This isn't hypothetical. India's own aviation regulator
+confirmed 465 GPS spoofing events in fifteen months, concentrated on the
+border. GNSS denial is a documented, actively-monitored, worsening problem in
+Indian airspace right now — and ground vehicles have none of the backup
+inertial systems aircraft carry."
+NOTE: this is aviation-sector data, not road-sector — be precise about that
+when citing it (say "in Indian airspace," don't imply it's road data). Its
+value is proving GNSS denial is a real, measured, current Indian phenomenon,
+not an imported problem statement — not proving it happens on roads
+specifically (the tunnel/underpass argument below covers roads).
+
+--- GOVERNMENT DATA 2 (the "the problem is growing" stat) ---
+NHAI / PIB (Press Information Bureau, Government of India) reporting, FY
+2024-25 and FY 2025-26.
+KEY FACTS:
+  - NHAI constructed 5,313 km of national highway in FY 2025-26 (15% above
+    target), on ₹2.44 lakh crore of capital expenditure.
+  - 68 tunnels under construction/completed in Himachal Pradesh alone (85.1 km
+    of tunnels; 11 completed, 27 under construction as of the reporting
+    period) as part of one single highway corridor project.
+USE THIS TO SAY: "India isn't just failing to solve GNSS-denied navigation —
+it's actively building more of the problem. 68 tunnels in one state, on one
+highway corridor. Every one of those is a stretch where a driver's phone goes
+blind today."
+
+--- PRODUCT-FAILURE EVIDENCE (the "existing solution" half of the formula) ---
+Google Maps / Waze official support-community threads and public reporting on
+their tunnel-navigation feature (Waze/Google "Bluetooth beacon" tunnel
+positioning, rolled out via TechCrunch/PhoneArena coverage and Google's own
+Android support forum).
+KEY FACTS:
+  - Waze/Google Maps's own documented fix for GPS loss in tunnels is NOT
+    sensor-based dead reckoning — it's physical Bluetooth beacons installed
+    inside the tunnel infrastructure itself.
+  - Cost: reported at roughly $1,200 per mile of tunnel coverage (per-tunnel
+    infrastructure spend, borne by the city/tunnel operator, not the app).
+  - Coverage: limited to a short list of major global cities — New York,
+    Chicago, Paris, Rio, Brussels, Oslo, Sydney, Boston, Mexico City, and a
+    few others.
+  - Users on Google's own official support forum still report "GPS signal
+    lost" / incorrect map-matching to surface roads in tunnels without
+    beacons — i.e., outside that short city list, the feature simply doesn't
+    exist, and the app has no fallback.
+USE THIS TO SAY (this IS the formula, verbatim — put this exact shape on a
+slide): "Google Maps / Waze — works for tunnels in about ten major world
+cities that have paid to install Bluetooth beacons — but fails the moment
+you're in a tunnel without that installed infrastructure, which is every
+tunnel in India, including the 68 NHAI is building in Himachal Pradesh right
+now. Our solution needs zero installed infrastructure — it works from the
+sensors already inside the phone, in any tunnel, anywhere — validated by
+Waze's own $1,200/mile beacon cost structure being the reason that coverage
+stays to a handful of cities worldwide."
+This is your single strongest slide moment. It reframes the entire pitch from
+"we built dead reckoning" to "we identified exactly why the biggest nav apps
+in the world haven't solved this for 99% of tunnels, and fixed the actual
+constraint they're stuck on (infrastructure dependency), not just the symptom."
+
+==============================================================================
+2. SLIDE-BY-SLIDE ROADMAP (mapped to the official template's 7 slides)
+==============================================================================
+
+------------------------------------------------------------------------------
+SLIDE 1 — TITLE PAGE (template: fill-in fields only, do not redesign)
+------------------------------------------------------------------------------
+Content: Problem Statement ID (26168), Problem Statement Title, Theme,
+PS Category (Software), Team ID, Team Name.
+
+INSTRUCTION: Do not try to hook here — the template gives you zero room to.
+The only judgment call is TYPOGRAPHIC DISCIPLINE: make sure the Problem
+Statement Title and Team Name are legible from the back of a room (judges
+skim this in under 3 seconds before moving to slide 2, where the hook lives).
+Do not add any content beyond the template's fields — the requirements doc
+explicitly says the template's pointers must not be changed.
+
+------------------------------------------------------------------------------
+SLIDE 2 — IDEA TITLE / PROPOSED SOLUTION  ★★★ THIS IS THE HOOK SLIDE ★★★
+------------------------------------------------------------------------------
+Template fields: Proposed Solution, Detailed explanation, How it addresses
+the problem, Innovation and uniqueness of the solution.
+
+THE OPENING LINE (say this the SECOND this slide appears, before reading any
+bullet — this is your 20-second hook, memorize it):
+
+    "India's own aviation regulator confirmed 465 GPS spoofing events in
+    Indian airspace in the last fifteen months alone. On the ground, NHAI is
+    building 68 new tunnels in Himachal Pradesh right now. Every one of those
+    is a stretch where a phone's navigation goes blind today — and the two
+    biggest navigation apps in the world have no fix for it beyond installing
+    physical beacon hardware in about ten cities worldwide. We built the fix
+    that needs zero installed infrastructure — just the sensors already
+    inside a phone."
+
+Why this works as a hook: it opens with a number (not "GPS is a problem"), it
+names a real government body (credibility), it names the biggest possible
+competitors by name and shows their fix doesn't scale to India, and it states
+your solution's core differentiator (zero infrastructure) before the judge has
+even finished reading the slide title. That is the entire "sharp / thinks
+outside the box" impression landing in one breath.
+
+CONTENT — "Proposed Solution" (1-2 lines, large text):
+    "A smartphone-only Android app that keeps navigating through GNSS-denied
+    stretches — tunnels, underpasses, jamming zones — using only the phone's
+    own IMU, fused with a lightweight on-device ML model. No external
+    hardware, no installed infrastructure, no vehicle integration."
+
+CONTENT — "Detailed explanation" (use the pipeline, compressed to 5 stages,
+as icons/flow not paragraphs):
+    Sensors (accel+gyro+GNSS, ~10Hz) → Alignment+Motion Classification (ML) →
+    Physics+ML Velocity Fusion → GNSS↔DR State Machine (hysteresis) →
+    Map-Snapped Live Position
+(Full detail goes on Slide 3 — here it's a one-row visual, not text.)
+
+CONTENT — "How it addresses the problem" — USE THE FORMULA HERE, verbatim,
+as a 5-column table or 5-step horizontal flow (this is the single highest-
+value visual in the whole deck):
+
+    EXISTING (Google Maps/Waze)
+        ↓ works for
+    Tunnels in ~10 cities with installed Bluetooth beacons ($1,200/mile)
+        ↓ but fails when
+    No beacon infrastructure exists — i.e. virtually every Indian tunnel
+        ↓ our approach
+    Pure on-device sensor fusion — zero installed infrastructure required
+        ↓ validated by
+    Waze's own beacon-cost/coverage data (see Slide 6); DGCA GNSS-interference
+    reporting confirming the problem is active in Indian airspace right now
+
+CONTENT — "Innovation and uniqueness":
+    - Zero marginal hardware cost — runs on a phone the user already owns.
+    - Reaches vehicles dedicated/OEM hardware structurally can't: most
+      two-wheelers and autos in India have no OBD-II port at all.
+    - Honest-by-design: every number the app shows (drift, mode, confidence)
+      is a real, logged, on-device measurement — not a claimed accuracy. State
+      transitions are logged with timestamp+trigger for full replay/audit.
+    - Deliberately NOT deep learning: current academic SOTA (AVNet, 2025,
+      Satellite Navigation journal) uses a CNN+GRU+invariant-EKF stack to hit
+      <0.5% drift. We use lightweight, explainable tree-ensemble models
+      because the official SIH bar is <10% drift — engineered to the actual
+      requirement, not to a bigger number.
+
+EMPHASIS NOTE FOR THE PRESENTER: Do not read the slide. The slide is a visual
+anchor for what you're already saying from memory. Practice the opening line
+until it takes under 20 seconds unaided — that's the entire brief from the
+requirements doc, executed literally.
+
+------------------------------------------------------------------------------
+SLIDE 3 — TECHNICAL APPROACH
+------------------------------------------------------------------------------
+Template fields: Technologies to be used, Methodology/process (flow
+charts/images/working prototype).
+
+INSTRUCTION FROM REQUIREMENTS DOC: don't just list tool names — say WHY each
+one is used, specifically for this project. Table format, not a bullet list
+of logos:
+
+    Kotlin + Jetpack Compose
+        WHY: native Android sensor access at guaranteed low latency: ML/DR
+        math cannot run on a scripting/cross-platform layer at 10Hz without
+        jank — this has to be native to hit the sample rate.
+
+    SensorManager (Accelerometer, Gyroscope, Rotation Vector, Barometer)
+        WHY: these are the ONLY sensors in scope — deliberately no external
+        IMU, no OBD-II. The barometer specifically is used for floor/level
+        change detection in multi-level parking, a case regular DR alone
+        can't distinguish.
+
+    FusedLocationProviderClient (GNSS)
+        WHY: Android's production-grade location API, not raw GNSS chip
+        polling — gives accuracy/HDOP metadata this project's honesty checks
+        depend on (see Slide 4).
+
+    ONNX Runtime (on-device inference)
+        WHY: runs the trained velocity + drift-prediction models directly on
+        the phone, zero network dependency, zero cloud round-trip latency —
+        the DR loop has to keep functioning specifically WHEN connectivity is
+        unreliable, so a server-dependent model would defeat the point.
+
+    scikit-learn (Gradient Boosted Trees / Random Forest / LinearRegression) —
+    trained offline in Python, exported to ONNX
+        WHY: chosen over a deep neural network (see AVNet comparison, Slide
+        2) specifically for on-device feasibility and explainability — every
+        prediction is traceable to a named feature, not a black box.
+
+    osmdroid + OSM Mapnik / Nominatim / OSRM
+        WHY: open, no-API-key mapping/geocoding/routing stack — keeps the
+        prototype's cost at zero and avoids a dependency on a paid SDK key
+        during development (Google Maps SDK is a planned swap once available).
+
+METHODOLOGY / FLOW CHART: Reuse the architecture pipeline from PRD.md Section
+10 as an actual flow diagram graphic (not text) — Sensors → Preprocessing →
+Alignment/Classification/Velocity(ML) → State Estimator (ZUPT+NHC) →
+GNSS-fusion / Dead-Reckoning branch → Map-constraint → UI. This is the same
+diagram in pitch.txt Section 3 — render it as boxes+arrows, not a bullet list.
+
+HOW ML AND PHYSICS WORK TOGETHER (put this as a labeled two-track diagram,
+this is likely to get a direct judge question so make it visually clear):
+    PHYSICS TRACK (always running, the fallback):
+        heading[t] = heading[t-1] + gyro_z*dt (bias-corrected, aligned)
+        v[t] = ML velocity, or physics integration if ML is out-of-distribution
+        position[t] = position[t-1] + v[t]*(cos,sin)(heading[t])*dt
+        Gated by ZUPT (kills drift while stationary) and the non-holonomic
+        constraint (a car can't move sideways — suppresses lateral noise).
+    ML TRACK (used where it demonstrably helps, per PRD Rule 3):
+        Velocity Estimator — regression, replaces raw accelerometer double-
+        integration with a learned forward-velocity estimate.
+        Motion Classifier — 8 classes (Stationary/Moving/Accelerating/
+        Braking/Pothole/Turning/Cruising/Phone Moved), each with a real
+        downstream effect (e.g. Pothole discounts a shock spike from being
+        misread as forward acceleration).
+        Reacquisition Drift Model — predicts expected drift magnitude to set
+        an ADAPTIVE GNSS-reacquisition blend duration instead of a fixed one.
+    SAY: "Physics is the floor — it always runs, so the system never fully
+    breaks even if ML is wrong. ML is layered on top only where it measurably
+    beats the physics-only baseline — we have the comparison numbers to prove
+    it, not just the claim."
+
+------------------------------------------------------------------------------
+SLIDE 4 — FEASIBILITY AND VIABILITY
+------------------------------------------------------------------------------
+Template fields: Analysis of feasibility, potential challenges/risks,
+strategies for overcoming them.
+
+USE THE FORMULA AGAIN HERE, this time contrasting against dedicated hardware
+(this doubles down on the "we understand the market, not just the tech"
+signal — see pitch.txt's cost/feasibility section for the full version,
+condense it to this):
+
+    EXISTING (Bosch/u-blox/VectorNav dedicated automotive IMU+GNSS modules)
+        ↓ works for
+    Vehicles with the budget/integration for dedicated hardware + wiring
+        ↓ but fails when
+    Retrofitting India's existing fleet — most two-wheelers/autos have no
+    OBD-II port at all, and per-vehicle hardware+install cost doesn't scale
+        ↓ our approach
+    Zero marginal hardware cost, deployable via software update to any
+    Android phone already in a driver's hand
+        ↓ validated by
+    u-blox NEO-M8U module pricing/integration requirements (component +
+    PCB + wiring + antenna, per vehicle) vs. this app's ₹0 install cost
+
+FEASIBILITY (say numbers, not adjectives):
+    - Full pipeline already runs end-to-end on a real Android device (not a
+      simulation) — sensor capture through ONNX inference through UI, at the
+      ~10Hz target rate.
+    - 502 passing unit tests on the deterministic math (coordinate
+      transforms, the state machine, filters) — this is provably not
+      vaporware.
+    - Explicit train/inference PARITY CHECK between the Python training model
+      and the on-device ONNX model — the model that was trained is provably
+      the model that's deployed, not just assumed to match.
+    - Grounded in a real, standard research dataset (IO-VNBD, Data in Brief
+      2021) — trained and evaluated the same way the research community
+      benchmarks this exact problem.
+
+RISKS + MITIGATION (pull directly from PRD.md Section 31/32 — these are REAL,
+already-encountered risks, not hypothetical ones — say that explicitly, it's
+a differentiator):
+    - Dataset-device mismatch (IO-VNBD sensor placement/rate vs. a live
+      phone) → mitigated with self-captured supplementary data + on-device
+      validation, not assumed to transfer.
+    - Phone-to-vehicle alignment reliability on a short/imperfect init drive
+      → manual "hold flat, tap to calibrate" fallback already implemented.
+    - Model/feature mismatch between training and on-device inference →
+      closed by the parity check above, BEFORE integration was called done.
+    - GNSS state-machine flapping on marginal/indoor signal → a REAL bug we
+      found and fixed on-device (hysteresis + a stricter ground-truth
+      accuracy bar for anything presented as a measured result) — say this
+      is exactly the kind of thing that only surfaces from a real running
+      prototype, not a slide deck.
+    - No real outdoor GNSS-denied drive test yet (tunnel/underpass) — name
+      this as the single next validation step, not a hidden gap.
+
+------------------------------------------------------------------------------
+SLIDE 5 — IMPACT AND BENEFITS
+------------------------------------------------------------------------------
+Template fields: Potential impact on target audience, benefits (social,
+economic, environmental).
+
+LEAD WITH THE GOVERNMENT DATA, not a generic "helps drivers" line — apply the
+requirements doc's own example format exactly:
+
+    "465 confirmed GPS spoofing events in Indian airspace in 15 months
+    (DGCA, Nov 2023-Feb 2025) and 68 new tunnels under construction in one
+    state alone (NHAI, Himachal Pradesh corridor) — GNSS denial in India is
+    measured, current, and growing. Our solution targets this specific,
+    documented gap with a zero-hardware-cost, phone-only approach that scales
+    to every driver, not just vehicles with factory nav hardware."
+
+SOCIAL: continuity of navigation guidance exactly where drivers currently
+lose it — tunnels, underpasses, multi-level parking, forest/hill roads with
+poor sky visibility, and jamming-affected border regions (DGCA data shows
+this is concentrated near Amritsar/Jammu specifically).
+
+ECONOMIC: zero per-vehicle hardware/installation cost vs. every dedicated-
+hardware alternative (Slide 4's comparison) — deployable as a software update
+to the existing installed base of Android phones, not a new supply chain.
+
+REACH: explicitly reaches vehicle categories dedicated/OEM hardware
+structurally cannot — most two-wheelers and autos have no OBD-II port; OEM-
+integrated DR (BMW/Bosch infotainment) only exists in vehicles that shipped
+with it, none of India's existing fleet.
+
+FUTURE/SCALABILITY: fleet/logistics tracking in GNSS-poor areas (forest
+roads, hill terrain) as a natural extension once the core is validated —
+name this as future work honestly, don't oversell it as built.
+
+------------------------------------------------------------------------------
+SLIDE 6 — RESEARCH AND REFERENCES
+------------------------------------------------------------------------------
+Template field: Details/links of reference and research work.
+
+List all six sources from Section 1 above, in this format (clean, clickable,
+no annotation needed here — the annotation already happened on the slides
+that used them):
+
+    [1] Onyekpe, U., Palade, V., Kanarachos, S., Szkolnik, A. (2021).
+        "IO-VNBD: Inertial and Odometry Benchmark Dataset for Ground Vehicle
+        Positioning." Data in Brief. arXiv:2005.01701.
+
+    [2] "Avnet: learning attitude and velocity for vehicular dead reckoning
+        using smartphone by adapting an invariant EKF." Satellite Navigation
+        (Springer Nature), 2025. DOI: 10.1186/s43020-025-00168-7.
+
+    [3] Nawarathne, K., Zhao, F., Pereira, F.C., Luo, J. (2014). "Dead
+        reckoning on smartphones to reduce GPS usage." IEEE ICARCV 2014.
+        DOI: 10.1109/ICARCV.2014.7064360.
+
+    [4] Directorate General of Civil Aviation, Government of India. Advisory
+        Circular ANSS AC 01 of 2023, "GNSS Interference in Airspace" (24 Nov
+        2023), and subsequent incident reporting (465 confirmed spoofing
+        events Nov 2023-Feb 2025; 1,951 total interference reports Nov
+        2023-Nov 2025).
+
+    [5] National Highways Authority of India / Press Information Bureau,
+        Government of India. FY 2024-25 / FY 2025-26 national highway
+        construction reporting (5,313 km constructed FY25-26; 68 tunnels,
+        85.1 km, Himachal Pradesh corridor).
+
+    [6] Waze/Google Maps tunnel Bluetooth-beacon positioning — public
+        reporting (TechCrunch, PhoneArena) and Google's official Android/Waze
+        support-community threads documenting beacon cost (~$1,200/mile),
+        city coverage limits, and continued user-reported GPS loss in
+        tunnels outside that coverage.
+
+------------------------------------------------------------------------------
+SLIDE 7 — IMPORTANT INSTRUCTIONS (template's own reminder slide)
+------------------------------------------------------------------------------
+DELETE this slide before final submission — it's the template's own note to
+itself ("you can delete this slide... when you upload"). Do not present it,
+do not leave it in the PDF you upload to the portal.
+
+Before deleting, re-check its rules against what you built:
+    - Max 6 slides including title — this roadmap's Slides 1-6 = exactly 6. OK.
+    - Avoid paragraphs, favor points/diagrams/infographics — every slide
+      above is written as short lines + a diagram/table, not prose. Keep it
+      that way when building the actual PPT — do not paste the "SAY" scripts
+      from this document onto the slides themselves, they're speaker notes.
+    - Must use the provided template without changing the idea-detail
+      pointers — content above fills the template's existing fields, it
+      doesn't add new ones.
+    - Must be saved/uploaded as PDF, not PPT/DOCX.
+
+==============================================================================
+3. DELIVERY TIMING (rough guide for a ~5-7 min pitch slot; adjust to your slot)
+==============================================================================
+Slide 1 (Title):                 5-10 sec, no commentary needed
+Slide 2 (Idea/Hook):             60-90 sec — this carries the most weight
+Slide 3 (Technical Approach):    90-120 sec — this is where you prove depth
+Slide 4 (Feasibility/Viability): 60-90 sec — this is where you prove rigor
+Slide 5 (Impact/Benefits):       45-60 sec — land the "why it matters" close
+Slide 6 (References):            10-15 sec — mention it exists, don't read it
+Leave the remainder for Q&A — judges will ask about the open gaps named in
+Slide 4; having already named them yourself is what makes those questions
+easy instead of a gotcha.
+
+==============================================================================
+4. FINAL CHECKLIST BEFORE SUBMISSION
+==============================================================================
+[ ] Opening line for Slide 2 rehearsed to land in under 20 seconds
+[ ] The formula (existing→works for→fails when→ours→validated by) appears
+    explicitly, visually, at least twice (Slide 2 and Slide 4)
+[ ] Every number on every slide traces to a source in Section 1/Slide 6 —
+    no adjectives standing in for numbers ("fast", "efficient", "robust")
+[ ] Tech stack table includes a WHY for each item, not just a name/logo
+[ ] No claim about THIS project's own accuracy/drift that wasn't actually
+    measured (STATUS_AND_ROADMAP.md is the source of truth for what's real)
+[ ] Open gaps (no real outdoor drive test yet, ML validated on simulated
+    outages) stated proactively on Slide 4, not hidden
+[ ] Slide 7 deleted before export
+[ ] Exported and uploaded as PDF (portal rejects PPT/DOCX)
+[ ] Total content slides = 6 (including title)
