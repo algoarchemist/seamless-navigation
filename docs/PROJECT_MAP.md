@@ -2164,6 +2164,25 @@ UPDATE (2026-09-02, REAL BUG, found via drive-log analysis — user report:
   moving" purpose. Falls back to 0,0 (not a fabricated value) when a fix
   doesn't report speed/bearing. This class itself is unchanged — still
   source-agnostic about where its velocity input comes from.
+  UPDATE (2026-09-02, REAL BUG, found immediately after the above shipped
+  — user report: "phone is stationary but the app tells it's moving"):
+  raw GNSS speed is Doppler-derived and can report a nonzero "ghost"
+  speed from multipath/receiver noise even while genuinely parked — the
+  EXACT failure mode ui/screens/StatusOverlayContent.kt's
+  estimateSpeedMps() already guards against for its own speed/motion
+  labels (that file's own 2026-08-26 REAL BUG FIX). The predict-step
+  change just above didn't carry that guard over, so an unguarded ghost
+  reading dragged the smoothed marker away from a stationary phone's true
+  position tick after tick — not just a mislabeled UI chip. Fix:
+  `fusion/StateEstimator.kt` now also computes `physicsSpeedMps` from
+  `deadReckoningRepository.state.value` (reliably near-zero while
+  GNSS_AIDED — see this repository's own reset-every-tick behavior noted
+  above) as an independent "is it actually moving" check, and falls back
+  to 0,0 for the predict-step velocity whenever GNSS speed reports >= the
+  same 0.3 m/s epsilon StatusOverlayContent.kt uses while physics reports
+  < it (`GNSS_GHOST_SPEED_STATIONARY_EPSILON_MPS`, a local literal —
+  same cross-module-dependency tradeoff as this file's
+  MIN_SPEED_FOR_ROAD_SNAP_HEADING_MPS).
 Important concepts/assumptions: operates entirely in whatever local-
   meter frame the caller supplies — carries no lat/lon or GeoProjection
   dependency itself (kept in the caller, fusion/StateEstimator.kt).

@@ -28,6 +28,15 @@ private const val TAG = "StateEstimator"
 // constant to avoid a new cross-module dependency for one number.
 private const val MIN_SPEED_FOR_ROAD_SNAP_HEADING_MPS = 0.5
 
+// Matches ui/screens/StatusOverlayContent.kt's own
+// STATIONARY_SPEED_EPSILON_MPS (that file's 2026-08-26 REAL BUG FIX doc
+// explains the underlying "GNSS Doppler speed can read a nonzero ghost
+// value from multipath even while genuinely parked" phenomenon this
+// reuses the same threshold for) — kept as a literal here rather than a
+// shared constant, same cross-module-dependency tradeoff as
+// MIN_SPEED_FOR_ROAD_SNAP_HEADING_MPS just above.
+private const val GNSS_GHOST_SPEED_STATIONARY_EPSILON_MPS = 0.3
+
 /** Which DR source actually fed the fused position on the most recent tick. */
 enum class DrSource { PHYSICS, ML }
 
@@ -387,14 +396,46 @@ class StateEstimator(
                         // (bearing)). Falls back to 0,0 — same as the old
                         // always-zero behavior, not a fabricated value —
                         // when a fix doesn't report speed/bearing.
+                        //
+                        // REAL BUG (2026-09-02, found right after the fix
+                        // above shipped — user report: "phone is stationary
+                        // but the app tells it's moving"): raw GNSS speed is
+                        // Doppler-derived and can report a nonzero "ghost"
+                        // speed purely from multipath/receiver noise even
+                        // while genuinely parked — the EXACT failure mode
+                        // ui/screens/StatusOverlayContent.kt's
+                        // estimateSpeedMps() already had to guard against
+                        // (its own 2026-08-26 REAL BUG FIX, same doc there).
+                        // That guard rejects gnssSpeed when it contradicts a
+                        // physics/DR state that's confirmed near-zero — the
+                        // predict-step velocity here needs the SAME guard,
+                        // which the fix above didn't carry over: an
+                        // unguarded ghost speed doesn't just mislabel a UI
+                        // chip, it actively drags the smoothed marker away
+                        // from a stationary phone's true position, tick
+                        // after tick. Reuses physicsSpeedMps (physics DR's
+                        // own velocity magnitude) as the same independent
+                        // "is it actually moving" check that repository's
+                        // per-tick reset-then-one-step-integrate behavior
+                        // while GNSS_AIDED (see this class's own note just
+                        // above) keeps reliably near zero when truly
+                        // stationary, regardless of GNSS's ghost reading.
                         val gnssBearingRad = fix.bearingDeg?.let { Math.toRadians(it.toDouble()) }
-                        val gnssVelocityEastMps = if (fix.speedMps != null && gnssBearingRad != null) {
-                            fix.speedMps.toDouble() * sin(gnssBearingRad)
+                        val physicsState = deadReckoningRepository.state.value
+                        val physicsSpeedMps = hypot(physicsState.velocityEastMps, physicsState.velocityNorthMps)
+                        val gnssSpeedContradictsStationaryPhysics = fix.speedMps != null &&
+                            physicsSpeedMps < GNSS_GHOST_SPEED_STATIONARY_EPSILON_MPS &&
+                            fix.speedMps >= GNSS_GHOST_SPEED_STATIONARY_EPSILON_MPS
+                        val trustGnssSpeedForPredict = fix.speedMps != null &&
+                            gnssBearingRad != null &&
+                            !gnssSpeedContradictsStationaryPhysics
+                        val gnssVelocityEastMps = if (trustGnssSpeedForPredict) {
+                            fix.speedMps!!.toDouble() * sin(gnssBearingRad!!)
                         } else {
                             0.0
                         }
-                        val gnssVelocityNorthMps = if (fix.speedMps != null && gnssBearingRad != null) {
-                            fix.speedMps.toDouble() * cos(gnssBearingRad)
+                        val gnssVelocityNorthMps = if (trustGnssSpeedForPredict) {
+                            fix.speedMps!!.toDouble() * cos(gnssBearingRad!!)
                         } else {
                             0.0
                         }
