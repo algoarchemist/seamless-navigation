@@ -11,7 +11,16 @@ private val PRIOR_SPEED_MPS = StopEventClassifier.DEFAULT_SUDDEN_STOP_PRIOR_SPEE
 private val LOOKBACK_MS = StopEventClassifier.DEFAULT_SUDDEN_STOP_LOOKBACK_MS
 private val NEAR_ZERO_CONFIRM_MS = StopEventClassifier.DEFAULT_NEAR_ZERO_CONFIRM_MS
 private val LONG_IDLE_MS = StopEventClassifier.DEFAULT_LONG_IDLE_DURATION_MS
+private val HARDWARE_IDLE_MS = StopEventClassifier.DEFAULT_HARDWARE_IDLE_CONFIRM_MS
 private const val ACCEL_DWELL_MS = 300L // com.sih26168.idr.dr.StationaryDetector.DEFAULT_MIN_STATIONARY_DWELL_MS
+
+// A magnitude high enough that neither StationaryDetector's accel gate nor
+// its gyro gate would ever confirm dwell-stationary on its own -- exactly
+// the "real ambient vibration keeps accel/gyro elevated" case
+// HARDWARE_CONFIRMED_IDLE exists for (see StopEventClassifier's own doc,
+// measured from data/drive_logs/drive_log_1788362193352.csv).
+private const val VIBRATION_ACCEL_MPS2 = 1.5f
+private const val VIBRATION_GYRO_RADPS = 0.4f
 
 class StopEventClassifierTest {
 
@@ -231,6 +240,154 @@ class StopEventClassifierTest {
         )
         assertEquals(
             "the pre-reset 20 m/s sample must not still count as recent prior-speed evidence",
+            StationaryContext.MOVING,
+            result.context,
+        )
+    }
+
+    @Test
+    fun `hardware-confirmed idle fires despite elevated accel-gyro once significant motion stops triggering`() {
+        val classifier = newClassifier()
+        // t=0: bootstrap tick -- just captures the starting count, does NOT
+        // itself count as an observed trigger (see evaluate()'s own comment
+        // on why a pre-existing count can't be trusted for timing).
+        classifier.evaluate(
+            0L,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 5.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 0,
+        )
+        // t=50: the count actually CHANGES -- a real, timed trigger.
+        classifier.evaluate(
+            50L,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 5.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 1,
+        )
+        // no further trigger, but accel/gyro STAY elevated (real vibration,
+        // not corroborated by any speed drop) -- neither SUDDEN_STOP nor
+        // the accel/gyro dwell (StationaryDetector) would fire here.
+        val stillTooEarly = classifier.evaluate(
+            50L + HARDWARE_IDLE_MS - 1,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 0.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 1,
+        )
+        assertEquals(StationaryContext.MOVING, stillTooEarly.context)
+
+        val result = classifier.evaluate(
+            50L + HARDWARE_IDLE_MS,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 0.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 1,
+        )
+        assertEquals(StationaryContext.HARDWARE_CONFIRMED_IDLE, result.context)
+        assertTrue(
+            "elevated accel/gyro alone must not block the hardware-confirmed path -- that's the whole point",
+            result.shouldApplyZupt,
+        )
+    }
+
+    @Test
+    fun `a new significant-motion trigger resets the hardware-idle clock`() {
+        val classifier = newClassifier()
+        classifier.evaluate(
+            0L,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 5.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 0,
+        )
+        classifier.evaluate(
+            50L,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 5.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 1,
+        )
+        // a real second trigger fires again just before the idle dwell
+        // (measured from the FIRST trigger) would have elapsed -- the
+        // vehicle moved again, so the clock must restart from here.
+        classifier.evaluate(
+            50L + HARDWARE_IDLE_MS - 100,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 5.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 2,
+        )
+        val result = classifier.evaluate(
+            50L + HARDWARE_IDLE_MS,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 5.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 2,
+        )
+        assertEquals(
+            "only 100ms since the SECOND trigger -- must not have confirmed idle yet",
+            StationaryContext.MOVING,
+            result.context,
+        )
+    }
+
+    @Test
+    fun `hardware idle never fires before any real trigger has been observed, even after a long silent launch`() {
+        val classifier = newClassifier()
+        // supported, but count has never changed since app launch -- must
+        // NOT be trusted as "confirmed idle since launch" (a session opened
+        // WHILE ALREADY MOVING would otherwise wrongly ZUPT -- see
+        // evaluate()'s own comment for why this is deliberately conservative).
+        classifier.evaluate(
+            0L,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 5.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 0,
+        )
+        val result = classifier.evaluate(
+            HARDWARE_IDLE_MS * 10,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 5.0f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 0,
+        )
+        assertEquals(StationaryContext.MOVING, result.context)
+    }
+
+    @Test
+    fun `hardware idle signal is ignored when the device has no significant-motion sensor`() {
+        val classifier = newClassifier()
+        classifier.evaluate(
+            0L,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 0.0f,
+            significantMotionSupported = false,
+            significantMotionEventCount = 0,
+        )
+        val result = classifier.evaluate(
+            HARDWARE_IDLE_MS * 10,
+            linearAccelMagnitudeMps2 = VIBRATION_ACCEL_MPS2,
+            gyroMagnitudeRadPerSec = VIBRATION_GYRO_RADPS,
+            currentSpeedEstimateMps = 0.0f,
+            significantMotionSupported = false,
+            significantMotionEventCount = 0,
+        )
+        assertEquals(
+            "unsupported devices must fall back to exactly the pre-existing behavior",
             StationaryContext.MOVING,
             result.context,
         )

@@ -29,6 +29,16 @@ enum class StationaryContext {
     /** Accel/gyro confirmed quiet for at least
      * [StopEventClassifier.longIdleDurationMs] — parked/idle. */
     LONG_IDLE,
+
+    /** (2026-09-03) Android's TYPE_SIGNIFICANT_MOTION hardware sensor has
+     * reported no real-motion trigger for at least
+     * [StopEventClassifier.hardwareIdleConfirmMs] — see this class's own
+     * doc for why this exists: a THIRD, genuinely independent signal from
+     * accel/gyro magnitude, for the one case neither [SUDDEN_STOP] nor
+     * accel/gyro dwell ([BRIEF_STOP]/[LONG_IDLE]) can cover — stationary
+     * with real ambient vibration (engine idle, road/mount buzz) and no
+     * GNSS speed available to corroborate a stop. */
+    HARDWARE_CONFIRMED_IDLE,
 }
 
 /** One tick's classification result — everything a caller needs to both
@@ -103,6 +113,45 @@ data class StopClassification(
  * minimizes this, since GNSS speed doesn't share the DR/ML path's own
  * error modes — but it is not eliminated. Not yet validated against a
  * real labeled stop-event drive (none has been captured).
+ *
+ * UPDATE (2026-09-03, [StationaryContext.HARDWARE_CONFIRMED_IDLE] — REAL
+ * BUG: user report "even my phone was still it shows moving" while in
+ * DEAD_RECKONING/TRANSITION, i.e. no GNSS speed available at all): the
+ * SUDDEN_STOP fast path needs a recent meaningful prior speed, and
+ * BRIEF_STOP/LONG_IDLE need [stationaryDetector]'s accel/gyro dwell to
+ * confirm — neither fires for "was already stationary since before this
+ * outage started, and ambient vibration keeps accel/gyro elevated."
+ * Re-analyzing `data/drive_logs/drive_log_1788362193352.csv` (the SAME
+ * log the 2026-09-02 fixes above were validated against) with
+ * `scripts/analyze_drive_log.py`'s threshold sweep confirms this is not a
+ * threshold-tuning problem: no accel/gyro cutoff separates the classes on
+ * this drive even at a generous 30% false-positive budget (best
+ * achievable false-negative rate at FP<=30% is still 73.6%) — the same
+ * "not cleanly separable" conclusion this class's own doc already reached
+ * from the 2026-09-01 urban-traffic drive, now measured twice,
+ * independently. Critically, that drive's GYRO magnitude was ALSO ~5x
+ * over [stationaryDetector]'s threshold while GNSS-confirmed stationary
+ * (p50 0.268 rad/s vs. the 0.05 rad/s threshold) — gyro has no gravity
+ * dependency, so this rules out "orientation-driven gravity leakage into
+ * accel" as a sufficient explanation and points to genuine ambient
+ * rotational vibration (engine idle, mount buzz), which magnitude
+ * thresholds fundamentally cannot separate from slow real motion.
+ *
+ * The fix is a THIRD, genuinely independent signal, not a better
+ * threshold: Android's TYPE_SIGNIFICANT_MOTION hardware trigger sensor
+ * (vendor/chipset-tuned specifically to answer "did the device really
+ * move," at the sensor-hub level, below this app's accel/gyro magnitude
+ * math entirely) — see `sensors/SensorRepository.kt`'s own doc for the
+ * sensor wiring. [significantMotionSupported]/[significantMotionEventCount]
+ * below feed [HARDWARE_CONFIRMED_IDLE]: "no trigger for
+ * >= [hardwareIdleConfirmMs]" fires ZUPT regardless of accel/gyro
+ * magnitude, closing exactly the gap the paragraph above measured. Not
+ * yet on-device-validated (CLAUDE.md Rule 13/18 — no physical device was
+ * available to capture a fresh drive log at the time this was written;
+ * unit-tested against synthetic trigger-count sequences only) — treat
+ * [DEFAULT_HARDWARE_IDLE_CONFIRM_MS] as a disclosed engineering default
+ * pending a real re-test, same status every other threshold in this
+ * class already carries.
  */
 class StopEventClassifier(
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
@@ -111,6 +160,7 @@ class StopEventClassifier(
     private val nearZeroSpeedMps: Float = DEFAULT_NEAR_ZERO_SPEED_MPS,
     private val nearZeroConfirmMs: Long = DEFAULT_NEAR_ZERO_CONFIRM_MS,
     private val longIdleDurationMs: Long = DEFAULT_LONG_IDLE_DURATION_MS,
+    private val hardwareIdleConfirmMs: Long = DEFAULT_HARDWARE_IDLE_CONFIRM_MS,
 ) {
     companion object {
         // Engineering defaults, not yet validated against a real labeled
@@ -146,6 +196,17 @@ class StopEventClassifier(
         /** Stationary (accel/gyro-dwell-confirmed) beyond this duration is
          * [StationaryContext.LONG_IDLE] rather than [StationaryContext.BRIEF_STOP]. */
         const val DEFAULT_LONG_IDLE_DURATION_MS = 8_000L
+
+        /** How long TYPE_SIGNIFICANT_MOTION must report NO trigger before
+         * [StationaryContext.HARDWARE_CONFIRMED_IDLE] fires. Unlike
+         * [nearZeroConfirmMs] (fast, because prior-speed evidence already
+         * raises confidence), this signal has no such corroboration the
+         * first time it's consulted, so it gets a longer, more cautious
+         * window — deliberately in the same ballpark as
+         * [DEFAULT_LONG_IDLE_DURATION_MS], not [DEFAULT_MIN_STATIONARY_DWELL_MS]-fast
+         * (see class doc: not yet validated on real hardware, so err
+         * conservative). */
+        const val DEFAULT_HARDWARE_IDLE_CONFIRM_MS = 2_000L
     }
 
     private data class SpeedSample(val atMs: Long, val speedMps: Float)
@@ -153,6 +214,14 @@ class StopEventClassifier(
     private val speedHistory = ArrayDeque<SpeedSample>()
     private var nearZeroStreakStartMs: Long? = null
     private var stationaryEnteredAtMs: Long? = null
+
+    // TYPE_SIGNIFICANT_MOTION bookkeeping (2026-09-03) — see class doc's
+    // HARDWARE_CONFIRMED_IDLE section. lastSeenMotionEventCount is null
+    // only before the first evaluate() call this session; lastSignificantMotionAtMs
+    // stays null until a real trigger has been observed (deliberately no
+    // "assume idle since launch" fallback — see evaluate()'s own comment).
+    private var lastSeenMotionEventCount: Int? = null
+    private var lastSignificantMotionAtMs: Long? = null
 
     /**
      * @param nowMs monotonic clock, ms — same boot-time family callers
@@ -168,6 +237,14 @@ class StopEventClassifier(
      *   [com.sih26168.idr.gnss.GnssQuality.isGood]) — null otherwise. When
      *   present, this is preferred over [currentSpeedEstimateMps] as the
      *   reference speed (see class doc's honest-limitation note).
+     * @param significantMotionSupported whether this device actually has a
+     *   TYPE_SIGNIFICANT_MOTION sensor
+     *   ([com.sih26168.idr.sensors.SensorRepository.hasSignificantMotionSensor]) —
+     *   MUST be checked by the caller, not inferred from
+     *   [significantMotionEventCount] alone (see class doc).
+     * @param significantMotionEventCount running trigger count from
+     *   [com.sih26168.idr.sensors.SensorUiState.significantMotionEventCount] —
+     *   meaningless when [significantMotionSupported] is false.
      */
     fun evaluate(
         nowMs: Long,
@@ -175,6 +252,8 @@ class StopEventClassifier(
         gyroMagnitudeRadPerSec: Float,
         currentSpeedEstimateMps: Float,
         gnssSpeedMps: Float? = null,
+        significantMotionSupported: Boolean = false,
+        significantMotionEventCount: Int = 0,
     ): StopClassification {
         val referenceSpeedMps = gnssSpeedMps ?: currentSpeedEstimateMps
 
@@ -199,10 +278,43 @@ class StopEventClassifier(
         // lean on (e.g. right after launch, already stationary).
         val dwellConfirmedStationary = stationaryDetector.evaluate(nowMs, linearAccelMagnitudeMps2, gyroMagnitudeRadPerSec)
 
+        // TYPE_SIGNIFICANT_MOTION bookkeeping — see HARDWARE_CONFIRMED_IDLE's
+        // doc. A count CHANGE means the hardware just saw real motion, so
+        // that resets the idle clock exactly like a fresh nearZeroStreakStartMs
+        // reset above; the count only ever increases, so "changed" and
+        // "increased" are the same check here.
+        if (significantMotionSupported) {
+            val lastSeen = lastSeenMotionEventCount
+            if (lastSeen != null && significantMotionEventCount != lastSeen) {
+                lastSignificantMotionAtMs = nowMs
+            }
+            lastSeenMotionEventCount = significantMotionEventCount
+        }
+        // Deliberately NO "assume idle since session start" fallback here
+        // (unlike nearZeroStreakStartMs/dwellConfirmedStationary above,
+        // which DO treat "already at rest since launch" as valid): a
+        // session launched WHILE ALREADY MOVING (very plausible -- app
+        // opened mid-drive) would otherwise misread "no trigger yet
+        // because none has had a chance to fire" as HARDWARE_CONFIRMED_IDLE
+        // after hardwareIdleConfirmMs elapsed, ZUPT'ing a moving vehicle --
+        // strictly worse than this class's original gap (missing a real
+        // stop), which this new path exists to fix, not to trade for a new
+        // false-positive risk. Requires at least one real observed trigger
+        // first, establishing the sensor is actually alive and has seen
+        // this session's initial motion, before its absence counts as
+        // evidence of idle.
+        val hardwareConfirmedIdle = significantMotionSupported &&
+            lastSignificantMotionAtMs != null &&
+            nowMs - lastSignificantMotionAtMs!! >= hardwareIdleConfirmMs
+
         val context: StationaryContext = when {
             cameFromMeaningfulSpeed && nearZeroConfirmed -> {
                 if (stationaryEnteredAtMs == null) stationaryEnteredAtMs = nowMs
                 StationaryContext.SUDDEN_STOP
+            }
+            hardwareConfirmedIdle -> {
+                if (stationaryEnteredAtMs == null) stationaryEnteredAtMs = nowMs
+                StationaryContext.HARDWARE_CONFIRMED_IDLE
             }
             dwellConfirmedStationary -> {
                 if (stationaryEnteredAtMs == null) stationaryEnteredAtMs = nowMs
@@ -239,6 +351,8 @@ class StopEventClassifier(
             "brief stop: accel/gyro quiet %dms (< %dms long-idle bound)".format(stationaryDurationMs, longIdleDurationMs)
         StationaryContext.LONG_IDLE ->
             "long idle: accel/gyro quiet %dms".format(stationaryDurationMs)
+        StationaryContext.HARDWARE_CONFIRMED_IDLE ->
+            "hardware idle: no TYPE_SIGNIFICANT_MOTION trigger for %dms (accel/gyro may still read elevated -- see class doc)".format(stationaryDurationMs)
         StationaryContext.MOVING ->
             "moving: no confirmed near-zero speed streak and accel/gyro not dwell-quiet"
     }
@@ -252,5 +366,7 @@ class StopEventClassifier(
         speedHistory.clear()
         nearZeroStreakStartMs = null
         stationaryEnteredAtMs = null
+        lastSeenMotionEventCount = null
+        lastSignificantMotionAtMs = null
     }
 }

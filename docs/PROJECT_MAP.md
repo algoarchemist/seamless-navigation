@@ -299,12 +299,15 @@ Inputs: android.content.Context (for SensorManager).
 Outputs: StateFlow<SensorUiState> — {latestAccel, latestGyro,
   latestOrientation, accelHz, gyroHz, orientationHz, latestPressure,
   pressureHz, latestLinearAcceleration, latestGravity (last four, Round 2,
-  2026-08-28)}.
+  2026-08-28), significantMotionEventCount (2026-09-03)}.
 Connected to: MainActivity -> SensorRepository -> (StateFlow) -> Compose UI
   ; SensorRepository -> OrientationMath (pure function, orientation
   conversion only, no reverse dependency);
   SensorRepository -> motion/FloorChangeRepository (Round 2, 2026-08-28,
-  reads latestPressure)
+  reads latestPressure); SensorRepository -> motion/StopEventClassifier
+  (2026-09-03, via dr/BaselineDeadReckoningRepository.kt and
+  ml/MlVelocityRepository.kt — reads hasSignificantMotionSensor() +
+  significantMotionEventCount)
 Important functions/classes: start()/stop() (lifecycle-tied — called
   from onResume/onPause, not onCreate/onDestroy, so sensors aren't
   active while backgrounded); hasRequiredSensors() (now also requires
@@ -324,6 +327,18 @@ UPDATE (Round 2, 2026-08-28 — PRD.md FR12 + Section 11): registers three
   screen, NOT wired into the DR pipeline — PRD.md Section 11 explicitly
   says "adopted only if it measures out better... decided empirically,"
   which hasn't happened yet, so nothing was swapped, only instrumented).
+UPDATE (2026-09-03 — real ZUPT gap fix, see motion/StopEventClassifier.kt's
+  own entry for the full measured finding): registers TYPE_SIGNIFICANT_MOTION,
+  a ONE-SHOT trigger sensor (android.hardware.TriggerEventListener — a
+  DIFFERENT API from the SensorEventListener above; no Handler/sampling
+  period, the platform wakes the app only on an actual trigger). Each
+  firing increments SensorUiState.significantMotionEventCount by 1 and
+  re-arms itself (armSignificantMotionTrigger()) so it keeps watching for
+  the rest of the session. hasSignificantMotionSensor() lets callers check
+  device support — like the barometer, NOT every device has this sensor,
+  and callers MUST check before trusting "count never changed" as
+  "confirmed idle" (see StopEventClassifier's own doc for why). stop()
+  cancels the pending trigger request via cancelTriggerSensor().
 Important concepts/assumptions: listener callbacks run on a dedicated
   background HandlerThread ("SensorRepositoryThread"), never the
   main/UI thread, per CLAUDE.md Android Rule 7. StateFlow is the
@@ -473,8 +488,8 @@ android/app/src/main/kotlin/com/sih26168/idr/motion/StopEventClassifier.kt
 Status: IMPLEMENTED
 Purpose: Context-aware replacement for gating ZUPT on "accel/gyro quiet
   for N ms" alone (PRD.md Section 14's Stationary effect) — distinguishes
-  MOVING / SUDDEN_STOP / BRIEF_STOP / LONG_IDLE instead of a flat
-  stationary/not-stationary boolean. REAL FINDING driving this class's
+  MOVING / SUDDEN_STOP / BRIEF_STOP / LONG_IDLE / HARDWARE_CONFIRMED_IDLE
+  instead of a flat stationary/not-stationary boolean. REAL FINDING driving this class's
   existence (2026-09-01 real outdoor drive, see StationaryDetector.kt's
   own doc): cross-checked against GNSS speed as ground truth,
   accel/gyro-only stationary detection was 100% false-negative on real
@@ -491,7 +506,10 @@ Inputs: nowMs, linearAccelMagnitudeMps2, gyroMagnitudeRadPerSec (same as
   integrator's pre-override speed, or the ML model's damped prediction),
   gnssSpeedMps (nullable — only passed by callers once they've verified
   GNSS_AIDED + GnssQuality.isGood; preferred over currentSpeedEstimateMps
-  when present).
+  when present), significantMotionSupported/significantMotionEventCount
+  (2026-09-03 addition — from sensors/SensorRepository.kt's
+  hasSignificantMotionSensor()/SensorUiState.significantMotionEventCount;
+  see below).
 Outputs: StopClassification(context, shouldApplyZupt, stationaryDurationMs,
   recentPeakSpeedMps, currentSpeedEstimateMps, dwellConfirmedStationary,
   reason) — shouldApplyZupt is the actual gate (true for every context
@@ -527,9 +545,44 @@ Important concepts/assumptions: Rule-based by design, not ML — no
   ground truth — a sustained speed-estimate glitch during real continued
   motion could in principle misfire into SUDDEN_STOP; preferring GNSS
   speed whenever trustworthy minimizes but does not eliminate this.
+UPDATE (2026-09-03, HARDWARE_CONFIRMED_IDLE — REAL BUG: user report "even
+  my phone was still it shows moving" in DEAD_RECKONING/TRANSITION, i.e.
+  no GNSS speed available at all — neither SUDDEN_STOP nor
+  BRIEF_STOP/LONG_IDLE fires here): re-analyzed
+  data/drive_logs/drive_log_1788362193352.csv (the same log the
+  2026-09-02 REACQUISITION fixes below were validated against) with
+  scripts/analyze_drive_log.py's threshold sweep — confirmed this is NOT
+  a threshold-tuning problem: no accel/gyro cutoff separates the classes
+  even at a 30% false-positive budget (best achievable false-negative
+  rate at FP<=30% is still 73.6%), and gyro magnitude was ALSO ~5x over
+  StationaryDetector's threshold while GNSS-confirmed stationary (p50
+  0.268 rad/s vs. 0.05 rad/s) — gyro has no gravity dependency, ruling out
+  "orientation-driven gravity leakage into accel" as a sufficient
+  explanation and pointing to genuine ambient rotational vibration
+  (engine idle/mount buzz), which magnitude thresholds fundamentally
+  cannot separate from slow real motion (same "not cleanly separable"
+  conclusion this class's 2026-09-01 doc already reached, now measured
+  twice). Fix: a THIRD, genuinely independent signal —
+  Android's TYPE_SIGNIFICANT_MOTION hardware trigger sensor
+  (chipset-tuned to answer "did the device really move," below this
+  app's own accel/gyro magnitude math). "No trigger for
+  >= hardwareIdleConfirmMs (2000ms, engineering default)" now fires
+  HARDWARE_CONFIRMED_IDLE regardless of accel/gyro magnitude. Deliberately
+  requires at least one REAL trigger to have been observed first before
+  its absence counts as evidence (no "assume idle since launch"
+  fallback) — a session opened while already moving must not misread
+  "no trigger yet because none has had a chance to fire" as confirmed
+  idle; that would trade this gap for a worse one (ZUPT'ing real motion).
+  Not yet on-device-validated (no physical device available when this was
+  written) — unit-tested against synthetic trigger-count sequences only;
+  treat DEFAULT_HARDWARE_IDLE_CONFIRM_MS as disclosed-pending-re-test,
+  same status every other threshold here carries (CLAUDE.md Rule 13/18).
 Connected to: dr/BaselineDeadReckoningRepository.kt, ml/MlVelocityRepository.kt
-  -> StopEventClassifier -> StationaryDetector (wrapped)
-Unit tests: tests/.../motion/StopEventClassifierTest.kt (11 cases) — long
+  -> StopEventClassifier -> StationaryDetector (wrapped);
+  sensors/SensorRepository.kt (hasSignificantMotionSensor(),
+  SensorUiState.significantMotionEventCount) feeds the new
+  HARDWARE_CONFIRMED_IDLE path.
+Unit tests: tests/.../motion/StopEventClassifierTest.kt (15 cases) — long
   idle after sustained no-prior-motion quiet; a brief stop stays
   BRIEF_STOP under the idle bound; sudden stop after high-speed movement
   fires before the accel/gyro dwell alone would; stop after low-speed
@@ -539,7 +592,12 @@ Unit tests: tests/.../motion/StopEventClassifierTest.kt (11 cases) — long
   and resets duration; GNSS speed is preferred over the own estimate when
   supplied; falls back to the own estimate when GNSS speed isn't supplied
   (mid-outage); SUDDEN_STOP decays to BRIEF_STOP once the lookback window
-  ages out; reset() forgets prior speed history.
+  ages out; reset() forgets prior speed history; (2026-09-03)
+  HARDWARE_CONFIRMED_IDLE fires despite elevated accel/gyro once
+  significant motion stops triggering; a new trigger resets the
+  hardware-idle clock; hardware idle never fires before any real trigger
+  has been observed even after a long silent launch; the signal is
+  ignored entirely when the device has no significant-motion sensor.
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/NonHolonomicConstraint.kt
 Status: IMPLEMENTED
@@ -723,6 +781,16 @@ UPDATE (2026-09-02, REAL BUG, found via on-device screenshot — user
   pre-existing, disclosed limitation this repository's own debug-screen
   copy already states ("no accelerometer bias correction, so still
   expect drift").
+UPDATE (2026-09-03 — closes the DEAD_RECKONING gap the paragraph above
+  left open, same user report: "even my phone was still it shows
+  moving"): now also passes `significantMotionSupported`/
+  `significantMotionEventCount` (from `sensorRepository.hasSignificantMotionSensor()`/
+  `sensorUiState.significantMotionEventCount`) into
+  `stopEventClassifier.evaluate()` — see `motion/StopEventClassifier.kt`'s
+  own entry for the measured evidence this specific gap could not be
+  closed by threshold-tuning, and why a hardware trigger sensor was
+  needed instead. This class itself owns none of the new decision logic
+  (CLAUDE.md Rule 5) — it only supplies the two extra readings.
 
 android/app/src/main/kotlin/com/sih26168/idr/gnss/GnssFix.kt
 Status: IMPLEMENTED
@@ -1976,6 +2044,11 @@ REAL FINDING from on-device testing (2026-08-25) — position drift
   (new field) carries the classification for logging/debug/UI only, same
   as `DeadReckoningState.stationaryContext` on the physics side. Logs
   (`Log.d`) on every context change, not every tick.
+  UPDATE (2026-09-03): same significantMotionSupported/
+  significantMotionEventCount wiring into stopEventClassifier.evaluate()
+  as dr/BaselineDeadReckoningRepository.kt's identical fix — see that
+  class's entry and motion/StopEventClassifier.kt's own entry for the
+  measured finding and reasoning; not duplicated here.
 Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity (Compose UI);
   MlVelocityRepository -> fusion/StateEstimator (Slice 7, reads its position + isAligned);
   motion/MotionStateClassifier, motion/PotholeShockDetector, motion/LongitudinalMotionClassifier

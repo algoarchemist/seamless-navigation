@@ -369,6 +369,10 @@ class MlVelocityRepository(
                     gyroMagnitudeRadPerSec = gyroMagnitudeRadPerSec,
                     currentSpeedEstimateMps = dampedVelocityMps,
                     gnssSpeedMps = gnssSpeedForClassifier,
+                    // Same 2026-09-03 fix as dr/BaselineDeadReckoningRepository.kt
+                    // -- see StopEventClassifier's own doc.
+                    significantMotionSupported = sensorRepository.hasSignificantMotionSensor(),
+                    significantMotionEventCount = sensorUiState.significantMotionEventCount,
                 )
 
                 if (classification.context != lastLoggedContext) {

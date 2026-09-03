@@ -5,8 +5,11 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -41,7 +44,27 @@ data class SensorUiState(
     val latestLinearAcceleration: AccelSample? = null,
     /** (Round 2 addition, 2026-08-28) Android's own fused gravity vector (TYPE_GRAVITY), DEVICE frame — same cross-check purpose as [latestLinearAcceleration]. */
     val latestGravity: AccelSample? = null,
+    /**
+     * (Round 2 addition, 2026-09-03 — real ZUPT gap fix) Incremented once
+     * per TYPE_SIGNIFICANT_MOTION trigger. This is a one-shot HARDWARE
+     * sensor (vendor/chipset-tuned to distinguish real device movement
+     * from ambient vibration — exactly the separation
+     * `dr/StationaryDetector.kt`'s own accel/gyro magnitude threshold was
+     * measured, twice, on two independent real drives, NOT able to make;
+     * see `motion/StopEventClassifier.kt`'s doc), not a continuous stream
+     * — [SensorRepository] just counts trigger events and re-arms after
+     * each one; [motion/StopEventClassifier.kt] is what turns "the count
+     * hasn't changed in N ms" into a stationary decision. A count (not a
+     * nullable timestamp) so a caller can always tell "no event yet this
+     * run" (count still 0) apart from "an event happened at t=0" without
+     * a sentinel value. Stays 0 forever on a device that doesn't have
+     * this sensor — see [hasSignificantMotionSensor] — callers MUST check
+     * that before trusting "0 = definitely idle."
+     */
+    val significantMotionEventCount: Int = 0,
 )
+
+private const val TAG = "SensorRepository"
 
 // 100,000 microseconds = 100 ms = ~10 Hz, per PRD.md Section 8/11's target rate.
 private const val TARGET_SAMPLING_PERIOD_US = 100_000
@@ -109,6 +132,11 @@ class SensorRepository(context: Context) {
     private val barometer = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
     private val linearAccelerationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
     private val gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
+    // Round 2 addition (2026-09-03): NOT all devices expose this (some
+    // budget/older chipsets lack the low-power motion co-processor it
+    // needs) — optional, same as barometer/linear-acceleration/gravity
+    // above. See hasSignificantMotionSensor().
+    private val significantMotionSensor = sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
 
     private var handlerThread: HandlerThread? = null
 
@@ -270,12 +298,45 @@ class SensorRepository(context: Context) {
         override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) = Unit
     }
 
+    // TYPE_SIGNIFICANT_MOTION is a ONE-SHOT trigger sensor (android.hardware.TriggerEventListener,
+    // a different API from SensorEventListener above) — it fires once when
+    // it detects real device movement, then automatically disarms itself.
+    // [armSignificantMotionTrigger] re-registers after every firing so it
+    // keeps watching for the rest of the DR session, same "always armed
+    // while running" behavior as every other listener in this class.
+    private val significantMotionListener = object : TriggerEventListener() {
+        override fun onTrigger(event: TriggerEvent) {
+            _state.value = _state.value.copy(
+                significantMotionEventCount = _state.value.significantMotionEventCount + 1,
+            )
+            armSignificantMotionTrigger()
+        }
+    }
+
+    private fun armSignificantMotionTrigger() {
+        val sensor = significantMotionSensor ?: return
+        val armed = sensorManager.requestTriggerSensor(significantMotionListener, sensor)
+        if (!armed) {
+            Log.w(TAG, "requestTriggerSensor(TYPE_SIGNIFICANT_MOTION) failed to arm")
+        }
+    }
+
     /** Whether the device actually exposes all sensors this repository needs. */
     fun hasRequiredSensors(): Boolean =
         accelerometer != null && gyroscope != null && rotationVector != null
 
     /** (Round 2 addition, 2026-08-28) Not all devices have a barometer — callers (e.g. motion/FloorChangeRepository.kt) must degrade honestly, not assume it's present. */
     fun hasBarometer(): Boolean = barometer != null
+
+    /**
+     * (Round 2 addition, 2026-09-03) Callers (motion/StopEventClassifier.kt
+     * via dr/BaselineDeadReckoningRepository.kt and ml/MlVelocityRepository.kt)
+     * MUST check this before trusting [SensorUiState.significantMotionEventCount]
+     * as a "confirmed idle" signal — on a device without this sensor the
+     * count simply never changes, which would otherwise be indistinguishable
+     * from "hardware-confirmed no movement."
+     */
+    fun hasSignificantMotionSensor(): Boolean = significantMotionSensor != null
 
     fun start() {
         val thread = HandlerThread("SensorRepositoryThread").apply { start() }
@@ -300,10 +361,16 @@ class SensorRepository(context: Context) {
         gravitySensor?.let {
             sensorManager.registerListener(listener, it, TARGET_SAMPLING_PERIOD_US, bgHandler)
         }
+        // Trigger sensors (android.hardware.TriggerEventListener) use a
+        // separate request API from registerListener above, and don't take
+        // a Handler/sampling period — the platform wakes the app only on
+        // an actual trigger, by design (this is a low-power sensor).
+        armSignificantMotionTrigger()
     }
 
     fun stop() {
         sensorManager.unregisterListener(listener)
+        significantMotionSensor?.let { sensorManager.cancelTriggerSensor(significantMotionListener, it) }
         handlerThread?.quitSafely()
         handlerThread = null
         lastAccelTimestampNs = 0L

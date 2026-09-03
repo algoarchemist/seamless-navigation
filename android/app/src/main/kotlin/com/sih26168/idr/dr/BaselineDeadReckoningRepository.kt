@@ -329,6 +329,14 @@ class BaselineDeadReckoningRepository(
                     gyroMagnitudeRadPerSec = gyroMagnitudeRadPerSec.toFloat(),
                     currentSpeedEstimateMps = preZuptSpeedMps,
                     gnssSpeedMps = gnssSpeedForClassifier,
+                    // REAL BUG (2026-09-03, user report: "even my phone was
+                    // still it shows moving," reproduced in DEAD_RECKONING/
+                    // TRANSITION -- see StopEventClassifier's own doc for the
+                    // measured evidence this is NOT a threshold-tuning
+                    // problem): a hardware-level independent signal for
+                    // exactly the case above's GNSS speed can't help with.
+                    significantMotionSupported = sensorRepository.hasSignificantMotionSensor(),
+                    significantMotionEventCount = sensorUiState.significantMotionEventCount,
                 )
                 val stationary = classification.shouldApplyZupt
 
