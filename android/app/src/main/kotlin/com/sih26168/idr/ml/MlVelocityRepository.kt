@@ -174,6 +174,7 @@ class MlVelocityRepository(
         biasCalibrator.reset()
         velocityGuard.reset()
         stopEventClassifier.reset()
+        longitudinalMotionClassifier.reset()
         lastProcessedAccelTimestampNs = null
         lastLoggedContext = null
 
@@ -190,6 +191,11 @@ class MlVelocityRepository(
                     0.0 // first sample this run — no prior timestamp to diff against
                 }
                 lastProcessedAccelTimestampNs = accel.timestampNs
+                // Boot-time ms — computed once here (was previously computed
+                // later, just before stopEventClassifier.evaluate()) since
+                // longitudinalMotionClassifier.classify() below now also
+                // needs it for its own dwell/hysteresis tracking (2026-09-03).
+                val nowBootTimeMs = accel.timestampNs / 1_000_000L
 
                 val gnssState = gnssModeRepository.state.value
                 val fix = gnssState.latestFix
@@ -261,7 +267,7 @@ class MlVelocityRepository(
                 // vehicle-frame forward-acceleration feature the ONNX
                 // model itself consumes (see LongitudinalMotionClassifier's
                 // own doc for why this is ML-path-only).
-                val longitudinalClassification = longitudinalMotionClassifier.classify(accelForwardMps2)
+                val longitudinalClassification = longitudinalMotionClassifier.classify(nowBootTimeMs, accelForwardMps2)
 
                 // Yaw rate: rotate the RAW gyro vector into world frame the
                 // same way as accel (angular velocity transforms as a
@@ -338,7 +344,6 @@ class MlVelocityRepository(
                         gyro.yRadPerSec * gyro.yRadPerSec +
                         gyro.zRadPerSec * gyro.zRadPerSec,
                 )
-                val nowBootTimeMs = accel.timestampNs / 1_000_000L
 
                 // Same trustworthy-GNSS-speed preference as
                 // dr/BaselineDeadReckoningRepository.kt's own wiring — see

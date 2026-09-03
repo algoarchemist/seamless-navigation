@@ -650,13 +650,47 @@ Inputs: nowNs, azimuthRad (device WORLD-frame azimuth, per orientation tick).
 Outputs: Boolean (isTurning) — false on the first call (no previous
   sample to diff against) and on any sample below the threshold.
 Important functions/classes: evaluate() — stateful (tracks previous
-  azimuth/timestamp); reset() clears that history for a new DR session.
-  minYawRateForTurningRadPerSec defaults to 0.15 rad/s (~8.6 deg/s),
-  deliberately above AlignmentEstimator's own 0.1 rad/s "straight"
-  ceiling so there's a small dead zone between the two rather than them
-  touching exactly — engineering default, unvalidated against a real
-  outdoor test drive (CLAUDE.md Rule 13).
+  azimuth/timestamp, PLUS the confirmed-turning flag and dwell streaks —
+  see UPDATE below); reset() clears all of it for a new DR session.
+  enterYawRateRadPerSec defaults to 0.15 rad/s (~8.6 deg/s), deliberately
+  above AlignmentEstimator's own 0.1 rad/s "straight" ceiling so there's a
+  small dead zone between the two rather than them touching exactly —
+  engineering default, unvalidated against a real outdoor test drive
+  (CLAUDE.md Rule 13).
+UPDATE (2026-09-03, hysteresis — REAL BUG, found via on-device shake
+  test: hand-vibrating a STATIONARY phone flipped the Turning display
+  label every ~100ms tick): the original evaluate() had NO dwell at
+  all — one noisy yaw-rate sample above threshold flipped isTurning true
+  immediately, one sample below flipped it false immediately. This
+  affects more than the label — the SAME isTurning gates
+  dr/BaselineDeadReckoningRepository.kt's non-holonomic constraint
+  (CLAUDE.md Rule 16 requires hysteresis for exactly this kind of state,
+  which this detector never actually had). Now a proper two-threshold
+  hysteresis band, same shape dr/StationaryDetector.kt and
+  gnss/GnssOutageDetector.kt already use: renamed
+  minYawRateForTurningRadPerSec -> enterYawRateRadPerSec (unchanged
+  value, 0.15 rad/s) must sustain for >= enterDwellMs (200ms) before
+  isTurning flips true; once true, yaw rate must drop to/below the NEW,
+  lower exitYawRateRadPerSec (0.08 rad/s — roughly half of enter, opening
+  a dead zone so noise sitting near the boundary can't flap the flag) and
+  sustain there for >= exitDwellMs (300ms, matching StationaryDetector's
+  own dwell) before flipping back to false. Both dwell constants are
+  engineering defaults, not yet validated against a real drive
+  (CLAUDE.md Rule 13) — chosen short relative to a real turn's duration
+  (which comfortably exceeds them) but long enough that one noisy
+  ~100ms tick (this project's ~10 Hz sensor rate) can't flip the result
+  alone.
 Connected to: BaselineDeadReckoningRepository -> TurningDetector -> gates NonHolonomicConstraint's call site
+Unit tests: tests/.../motion/TurningDetectorTest.kt (10 cases) — first
+  sample never turning; slow drift below threshold not turning; a single
+  noisy tick above threshold does NOT trigger (must sustain the enter
+  dwell — the specific regression this fix targets); sustained fast
+  heading change across the enter dwell IS turning; negative-direction
+  turning detected the same way; +-pi wraparound not misread as a huge
+  turn; zero elapsed time not turning; a brief dip into the enter/exit
+  dead zone does not end a confirmed turn; turning ends only after the
+  exit dwell elapses at/below the exit threshold; reset() forgets
+  confirmed state and dwell history.
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/BaselineDeadReckoningRepository.kt
 Status: IMPLEMENTED
@@ -2840,18 +2874,47 @@ Purpose: A DETERMINISTIC stand-in for PRD.md Section 14's `Accelerating`/
   than reimplementing a separate vehicle-frame projection for the
   physics path (which has no alignment-corrected forward/lateral split
   at all).
-Inputs: accelForwardMps2 (Float).
+Inputs: nowMs (Long, added 2026-09-03 — see UPDATE below),
+  accelForwardMps2 (Float).
 Outputs: LongitudinalMotionClassification(isAccelerating, isBraking) —
   mutually exclusive (opposite-sign thresholds), both false in between.
-Important functions/classes: classify() — minLongitudinalAccelMps2
-  defaults to 1.0 m/s^2 (~0.1g), engineering default, unvalidated against
-  real labeled data (CLAUDE.md Rule 13). Stateless — no dwell/hysteresis,
-  unlike TurningDetector/PhoneMovedDetector, since this only drives a
-  display label (PRD.md Section 14: "context for the state machine...
-  and non-holonomic constraint"), not a correction that would misfire
-  badly on one noisy sample.
+Important functions/classes: classify() — enterAccelMps2 defaults to
+  1.0 m/s^2 (~0.1g), engineering default, unvalidated against real
+  labeled data (CLAUDE.md Rule 13).
+UPDATE (2026-09-03, hysteresis — REAL BUG, found via on-device shake
+  test: hand-vibrating a STATIONARY phone flipped the Accelerating/
+  Braking display label every ~100ms tick): this class used to be fully
+  STATELESS — a single sample's forward-accel crossing +-1.0 m/s^2
+  flipped the label immediately (the ORIGINAL doc here explicitly called
+  this out as deliberate: "no dwell/hysteresis... since this only drives
+  a display label, not a correction that would misfire badly on one
+  noisy sample" — but a label flickering every tick during ordinary
+  vibration was itself a bad user-visible symptom, so this was revisited).
+  Now a stateful three-way hysteresis (NEUTRAL/ACCELERATING/BRAKING), same
+  shape as motion/TurningDetector.kt's 2026-09-03 fix: enterAccelMps2
+  (unchanged value, 1.0 m/s^2) must sustain for >= enterDwellMs (200ms,
+  matches TurningDetector's own enter dwell) before flipping to
+  Accelerating/Braking; once in either state, forward-accel must fall
+  back inside +-exitAccelMps2 (0.5 m/s^2 — roughly half of enter, same
+  enter/exit ratio as TurningDetector) and sustain there for >=
+  exitDwellMs (300ms, matches TurningDetector's own exit dwell) before
+  returning to neutral. classify() gained a `nowMs` parameter to track
+  these dwells — callers (ml/MlVelocityRepository.kt) now compute
+  nowBootTimeMs once, earlier in the tick, and reuse it here AND for
+  motion/StopEventClassifier.kt's evaluate() call later in the same tick,
+  rather than computing it twice. reset() (NEW) clears the dwell/state
+  history — called from MlVelocityRepository.start(), same convention as
+  every other stateful detector's reset() in this codebase.
 Pure Kotlin, no Android dependency, unit-testable (CLAUDE.md Rule 19) —
-  see LongitudinalMotionClassifierTest.kt (6 cases).
+  see LongitudinalMotionClassifierTest.kt (10 cases) — a single noisy
+  tick above threshold does NOT trigger (must sustain the enter dwell —
+  the specific regression this fix targets); strong positive/negative
+  forward accel sustained across the enter dwell IS accelerating/braking
+  respectively; small/zero forward accel is neither; exactly-at-threshold
+  sustained across the enter dwell counts; a brief dip into the
+  enter/exit dead zone does not end confirmed Accelerating; Accelerating
+  ends only after the exit dwell elapses inside the exit band; reset()
+  forgets confirmed state and dwell history.
 Connected to: ml/MlVelocityRepository -> LongitudinalMotionClassifier ->
   MlVelocityUiState.isAccelerating/isBraking ->
   ui/screens/StatusOverlayContent.kt's motion label AND MainActivity's
