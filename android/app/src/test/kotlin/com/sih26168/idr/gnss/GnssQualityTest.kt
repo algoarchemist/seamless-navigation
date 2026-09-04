@@ -54,6 +54,16 @@ class GnssQualityTest {
     }
 
     @Test
+    fun `a fix at the real measured indoor refresh cadence is still good`() {
+        // docs/gnss-indoor-window-degradation.md: a real 135s indoor drive
+        // log measured fresh fixes arriving every ~6.2-6.5s near an open
+        // window (min=6219ms, median=6317ms, max=6539ms) -- comfortably
+        // under DEFAULT_MAX_FIX_AGE_MS now that it's 7000ms, so a real fix
+        // sitting at that age should not be treated as stale.
+        assertTrue(GnssQuality.isGood(fixAgeMs = 6_539L, accuracyM = 10.5f))
+    }
+
+    @Test
     fun `confidenceWeight is null-safe zero when no fix has ever been received`() {
         assertEquals(0f, GnssQuality.confidenceWeight(accuracyM = null), 0.0001f)
     }

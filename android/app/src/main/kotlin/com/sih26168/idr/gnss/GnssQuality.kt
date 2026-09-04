@@ -13,8 +13,41 @@ package com.sih26168.idr.gnss
  */
 object GnssQuality {
 
-    /** A fix older than this (no update received in this long) is treated as unavailable. */
-    const val DEFAULT_MAX_FIX_AGE_MS = 3_000L
+    /**
+     * A fix older than this (no update received in this long) is treated as
+     * unavailable.
+     *
+     * REAL BUG FIX (2026-09-04, docs/gnss-indoor-window-degradation.md,
+     * CLAUDE.md Rule 13's "capture real data, then tune" option): a user
+     * report of GNSS_AIDED flapping to DEAD_RECKONING near an open indoor
+     * window was ORIGINALLY suspected to be an accuracy/multipath problem
+     * (see git history / the doc above for that hypothesis). A real 135s
+     * drive log captured next to the window (`scripts/analyze_drive_log.py`'s
+     * `report_degraded_mode_accuracy`) disproved it: accuracy was excellent
+     * the whole time (3.5-10.5m, nowhere near the 25m bar). The actual
+     * cause was fix STALENESS — indoors near this window, the receiver only
+     * delivered a fresh fix every ~6.2-6.5s (21 fresh fixes over 135s;
+     * min=6219ms, median=6317ms, max=6539ms elapsed between them), well
+     * over double the previous 3000ms bar. Combined with
+     * GnssOutageDetector's dwell timers, that guaranteed the "good" window
+     * after each fresh fix (~2.8s before the OLD 3000ms bar tripped again)
+     * was too short to clear reacquisitionEnterDwellMs (2000ms) with enough
+     * runway left for reacquisitionDwellMs (1000ms) — REACQUISITION could
+     * never win the race back to GNSS_AIDED, so the phone oscillated
+     * between DEAD_RECKONING and REACQUISITION indefinitely.
+     *
+     * Raised to comfortably clear the measured worst case (6539ms) with a
+     * margin, not to some arbitrarily large number (Rule 13 — this is
+     * measured, not guessed). DISCLOSED TRADEOFF: a genuine total GNSS loss
+     * now takes up to ~7s (was ~3s) before a fix is even considered stale,
+     * so real-outage detection latency grows by the same amount — a real
+     * cost, accepted because the previous value made ANY indoor stretch
+     * with this fix cadence undemoable, which is the worse failure mode for
+     * this project. Still a single-drive, single-location measurement
+     * (Rule 13) — not validated across devices/locations/real outdoor
+     * outages yet.
+     */
+    const val DEFAULT_MAX_FIX_AGE_MS = 7_000L
 
     /** A fix less precise than this (Location.getAccuracy(), meters, 68% confidence radius)
      * is treated as too degraded to trust. */

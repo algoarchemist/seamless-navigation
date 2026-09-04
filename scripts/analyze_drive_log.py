@@ -50,7 +50,11 @@ CURRENT_ZUPT_MAX_ACCEL_MPS2 = 0.25
 CURRENT_ZUPT_MAX_GYRO_RADPS = 0.05
 CURRENT_ZUPT_MIN_DWELL_MS = 300
 CURRENT_GNSS_MAX_ACCURACY_M = 25.0
-CURRENT_GNSS_MAX_FIX_AGE_MS = 3000
+# Raised from 3000 to 7000 on 2026-09-04 - see GnssQuality.kt's own doc and
+# docs/gnss-indoor-window-degradation.md for the real drive log that found
+# fresh fixes only arriving every ~6.2-6.5s indoors, not the accuracy bar,
+# was the actual cause of GNSS_AIDED<->DEAD_RECKONING flapping near a window.
+CURRENT_GNSS_MAX_FIX_AGE_MS = 7000
 CURRENT_OUTAGE_ENTER_DWELL_MS = 2000
 CURRENT_TRANSITION_DWELL_MS = 1000
 CURRENT_REACQUISITION_ENTER_DWELL_MS = 2000
@@ -133,6 +137,97 @@ def report_gnss_quality(df: pd.DataFrame) -> None:
             f"  accuracyM: p50={acc.quantile(.50):.1f} p90={acc.quantile(.90):.1f} "
             f"p99={acc.quantile(.99):.1f} max={acc.max():.1f}",
         )
+    print()
+
+
+def fresh_fix_intervals_ms(df: pd.DataFrame) -> list[float]:
+    """Elapsed time between consecutive FRESH GNSS fixes, in order.
+
+    A "fresh fix" is detected the same way GnssOutageDetector experiences
+    one: gnssFixAgeMs otherwise climbs roughly in step with wall-clock time
+    between updates (no new data arrived), so a row where it DROPS versus
+    the previous row means a new fix just landed and reset the age counter.
+    This is the pure/testable half of report_fix_refresh_cadence below
+    (CLAUDE.md Rule 19) - it was this exact computation, run by hand against
+    docs/gnss-indoor-window-degradation.md's real drive log, that found the
+    ~6.2-6.5s indoor refresh cadence responsible for the flapping (not
+    accuracy - see GnssQuality.kt's DEFAULT_MAX_FIX_AGE_MS doc).
+    """
+    fresh_fix_rows = df[df["gnssFixAgeMs"].diff() < 0]
+    elapsed = fresh_fix_rows["elapsedMs"].tolist()
+    return [b - a for a, b in zip(elapsed, elapsed[1:])]
+
+
+def report_fix_refresh_cadence(df: pd.DataFrame) -> None:
+    print("=== Real fix refresh cadence (time between fresh GNSS fixes) ===")
+    print(f"(compare against GnssQuality.DEFAULT_MAX_FIX_AGE_MS={CURRENT_GNSS_MAX_FIX_AGE_MS}ms)")
+    intervals = fresh_fix_intervals_ms(df)
+    if len(intervals) < 2:
+        print(f"  Only {len(intervals)} fresh-fix interval(s) observed - not enough to characterize cadence.")
+        print()
+        return
+    s = pd.Series(intervals)
+    print(f"  n={len(s)} intervals: min={s.min():.0f}ms median={s.median():.0f}ms max={s.max():.0f}ms")
+    if s.max() >= CURRENT_GNSS_MAX_FIX_AGE_MS:
+        print(
+            f"  WARNING: observed max interval ({s.max():.0f}ms) meets or exceeds "
+            f"DEFAULT_MAX_FIX_AGE_MS ({CURRENT_GNSS_MAX_FIX_AGE_MS}ms) - a fix can go stale "
+            "before the next one arrives, which is exactly the flapping failure mode.",
+        )
+    else:
+        print(
+            f"  Observed max interval ({s.max():.0f}ms) stays under "
+            f"DEFAULT_MAX_FIX_AGE_MS ({CURRENT_GNSS_MAX_FIX_AGE_MS}ms) - a fix should not go "
+            "stale between updates at this drive's cadence.",
+        )
+    print()
+
+
+def report_degraded_mode_accuracy(df: pd.DataFrame) -> None:
+    # Added 2026-09-04 for docs/gnss-indoor-window-degradation.md (option A):
+    # report_gnss_quality above only looks at accuracy while ALREADY
+    # GNSS_AIDED - it can't tell us anything about the fixes GnssQuality
+    # rejected, which is exactly what decided TRANSITION/DEAD_RECKONING/
+    # REACQUISITION dwell time in the window-flapping case. This looks at
+    # the OTHER side: every row isGood() called "bad", split into "no fix
+    # at all" (accuracyM is null - genuinely nothing to work with) vs "a
+    # real fix that just missed the bar" (accuracyM present but >
+    # maxAccuracyM, e.g. multipath near a window) - only the second group
+    # is evidence FOR loosening DEFAULT_MAX_ACCURACY_M; a mostly-null
+    # degraded population would mean the accuracy bar isn't the problem.
+    degraded = df[df["gnssMode"] != "GNSS_AIDED"]
+    print("=== Fix quality during degraded modes (TRANSITION/DEAD_RECKONING/REACQUISITION) ===")
+    print(f"(compare against GnssQuality.DEFAULT_MAX_ACCURACY_M={CURRENT_GNSS_MAX_ACCURACY_M}m)")
+    if degraded.empty:
+        print("  No non-GNSS_AIDED rows this drive - GNSS never degraded.")
+        print()
+        return
+
+    no_fix = degraded[degraded["gnssFixAccuracyM"].isna()]
+    weak_fix = degraded[degraded["gnssFixAccuracyM"].notna()]
+    print(f"  Rows with no fix at all (accuracyM missing): {len(no_fix)}/{len(degraded)} "
+          f"({100 * len(no_fix) / len(degraded):.1f}%)")
+    print(f"  Rows with a real fix that missed the bar:    {len(weak_fix)}/{len(degraded)} "
+          f"({100 * len(weak_fix) / len(degraded):.1f}%)")
+
+    if weak_fix.empty:
+        print("  No 'weak but present' fixes this drive - nothing here would justify loosening "
+              "DEFAULT_MAX_ACCURACY_M; the degraded time was genuinely fix-less.")
+        print()
+        return
+
+    acc = weak_fix["gnssFixAccuracyM"]
+    print(f"  Weak-fix accuracyM: p50={acc.quantile(.50):.1f} p90={acc.quantile(.90):.1f} "
+          f"p99={acc.quantile(.99):.1f} max={acc.max():.1f}")
+
+    # How many degraded-mode rows would flip to "good" at each candidate
+    # looser bar, so a threshold choice is read off real data, not guessed
+    # (CLAUDE.md Rule 13) - mirrors sweep_zupt_thresholds' approach.
+    print("  If DEFAULT_MAX_ACCURACY_M were raised, rows that would newly pass:")
+    for candidate in [30.0, 35.0, 40.0, 50.0, 60.0, 75.0, 100.0]:
+        newly_good = (weak_fix["gnssFixAccuracyM"] <= candidate).sum()
+        print(f"    <= {candidate:>5.0f}m: {newly_good}/{len(degraded)} "
+              f"({100 * newly_good / len(degraded):.1f}% of all degraded-mode rows)")
     print()
 
 
@@ -327,6 +422,8 @@ def main() -> int:
     report_overview(df)
     report_mode_segments(df)
     report_gnss_quality(df)
+    report_fix_refresh_cadence(df)
+    report_degraded_mode_accuracy(df)
     report_zupt_validation(df)
     report_zupt_threshold_sweep(df)
     report_raw_vs_filtered(df)

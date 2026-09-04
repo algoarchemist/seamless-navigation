@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"
 
 from analyze_drive_log import (  # noqa: E402
     GNSS_STATIONARY_SPEED_EPSILON_MPS,
+    fresh_fix_intervals_ms,
     has_raw_columns,
     sweep_zupt_thresholds,
 )
@@ -99,6 +100,59 @@ class TestSweepZuptThresholds:
         # (0.0 vs 10.0 m/s) sits unambiguously on either side of the
         # module's own stationary/moving cutoff, not a coincidence.
         assert 0.0 < GNSS_STATIONARY_SPEED_EPSILON_MPS < 10.0
+
+
+class TestFreshFixIntervalsMs:
+    def test_detects_drop_as_a_fresh_fix(self):
+        # elapsedMs ticks every 100ms; fixAgeMs climbs with it (no new fix)
+        # until row 3, where it drops back near zero - a fresh fix landed.
+        df = pd.DataFrame(
+            {
+                "elapsedMs": [0, 100, 200, 300, 400, 500],
+                "gnssFixAgeMs": [2000, 2100, 2200, 50, 150, 250],
+            },
+        )
+        # Only one drop (row index 3) -> zero completed intervals between
+        # fresh fixes (need at least two fresh-fix events to form one).
+        assert fresh_fix_intervals_ms(df) == []
+
+    def test_two_fresh_fixes_yield_one_interval(self):
+        # Row 0 can never itself be detected as a "fresh fix" (diff() has no
+        # prior row to compare against) - it only establishes the baseline
+        # age that row 3's drop is measured against. So this has TWO
+        # detectable fresh-fix events (rows 3 and 6), yielding one interval
+        # between them.
+        df = pd.DataFrame(
+            {
+                "elapsedMs": [0, 100, 200, 6300, 6400, 6500, 12700, 12800],
+                "gnssFixAgeMs": [2000, 2100, 2200, 50, 150, 250, 60, 160],
+            },
+        )
+        assert fresh_fix_intervals_ms(df) == [6400]
+
+    def test_reproduces_the_real_window_drive_cadence(self):
+        # Regression check against docs/gnss-indoor-window-degradation.md's
+        # real capture: three fresh fixes ~6.3s apart, matching the
+        # measured indoor refresh cadence that motivated raising
+        # GnssQuality.DEFAULT_MAX_FIX_AGE_MS from 3000ms to 7000ms. Age
+        # climbs between each fresh fix so every one after the first is a
+        # genuine drop, not just a low value.
+        df = pd.DataFrame(
+            {
+                "elapsedMs": [0, 100, 3300, 6417, 9700, 12734],
+                "gnssFixAgeMs": [9999, 50, 3300, 50, 3383, 50],
+            },
+        )
+        assert fresh_fix_intervals_ms(df) == [6317, 6317]
+
+    def test_no_drops_yields_no_intervals(self):
+        df = pd.DataFrame(
+            {
+                "elapsedMs": [0, 100, 200],
+                "gnssFixAgeMs": [100, 200, 300],
+            },
+        )
+        assert fresh_fix_intervals_ms(df) == []
 
 
 class TestHasRawColumns:

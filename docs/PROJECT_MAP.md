@@ -851,7 +851,8 @@ Purpose: Pure function classifying whether a fix is "good enough to
   "is GNSS good this instant," the detector answers "given a history of
   that, what state are we in."
 Inputs: fixAgeMs, accuracyM (nullable — null means no fix ever
-  received), maxFixAgeMs (default 3000ms), maxAccuracyM (default 25m).
+  received), maxFixAgeMs (default 7000ms, see UPDATE below), maxAccuracyM
+  (default 25m).
 Outputs: Boolean.
 Important concepts/assumptions: thresholds are engineering defaults,
   not yet validated against a real outage test run (PRD.md Section 28)
@@ -867,6 +868,27 @@ Important concepts/assumptions: thresholds are engineering defaults,
   enough to (a) move the outage anchor or (b) be recorded as a measured
   drift result — isGood()'s own 25m bar for state-machine timing is
   unchanged, so reacquisition attempt cadence doesn't change.
+UPDATE (2026-09-04, REAL BUG FIX, docs/gnss-indoor-window-degradation.md
+  — option A, "capture real data then tune"): a user report of
+  GNSS_AIDED flapping to DEAD_RECKONING/REACQUISITION near an open
+  window was originally suspected to be an accuracy/multipath problem.
+  A real 135s drive log captured next to the window
+  (scripts/analyze_drive_log.py's new report_degraded_mode_accuracy)
+  disproved that: accuracy stayed excellent throughout (3.5-10.5m,
+  nowhere near the 25m bar). The real cause was fix STALENESS — fresh
+  fixes only arrived every ~6.2-6.5s indoors near this window (21 fresh
+  fixes over 135s; min=6219ms, median=6317ms, max=6539ms), more than
+  double the old 3000ms DEFAULT_MAX_FIX_AGE_MS, so the "good" window
+  after each fix was too short for GnssOutageDetector's dwell timers to
+  ever land back in GNSS_AIDED — REACQUISITION could never win the
+  race, producing an indefinite DEAD_RECKONING/REACQUISITION flap.
+  DEFAULT_MAX_FIX_AGE_MS raised 3000ms -> 7000ms, comfortably past the
+  measured 6539ms worst case. Disclosed tradeoff: real total-outage
+  detection latency grows from ~3s to ~7s before a fix is even
+  considered stale. New regression test in GnssQualityTest.kt pins the
+  measured 6539ms/10.5m case as still "good." Single-drive,
+  single-location measurement (Rule 13) — not yet validated across
+  other devices/locations or a real outdoor outage.
 Connected to: GnssModeRepository -> GnssQuality -> GnssOutageDetector;
   fusion/StateEstimator.kt -> GnssQuality.DEFAULT_MAX_ACCURACY_FOR_GROUND_TRUTH_M
   (anchor-setting and drift-recording ground-truth gate)

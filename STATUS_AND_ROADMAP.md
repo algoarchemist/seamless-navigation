@@ -252,6 +252,20 @@ drift number that can honestly be quoted (per CLAUDE.md Rule 13). The
 tooling to capture one already exists (`capture/DriveDataLogger.kt` +
 `scripts/analyze_drive_log.py`) — it just hasn't been run outdoors yet.
 
+**Real bug found + fixed indoors (2026-09-04):** a user report of
+GNSS_AIDED flapping to DEAD_RECKONING/REACQUISITION near an open indoor
+window was root-caused with a real 135s drive log next to that window
+(`docs/gnss-indoor-window-degradation.md`) — not an accuracy/multipath
+problem as first suspected, but fix STALENESS: fresh GPS fixes only
+arrived every ~6.2–6.5s indoors there, over double the old 3000ms
+`GnssQuality.DEFAULT_MAX_FIX_AGE_MS`, so the state machine's dwell timers
+could never land back in GNSS_AIDED before the fix went stale again.
+Raised to 7000ms (measured margin above the observed 6539ms worst case,
+not guessed). Disclosed tradeoff: real total-outage detection latency
+grows from ~3s to ~7s. Still one drive/one location — the outdoor test
+above remains the real validation this fix and the dwell constants both
+still need.
+
 ## 6. Real-time Navigation Interface — 🟡 marker animates + rotates, reacquired banner added (2026-08-31)
 
 **What exists and is genuinely real-time:** a live OpenStreetMap
