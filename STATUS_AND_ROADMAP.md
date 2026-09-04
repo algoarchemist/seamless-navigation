@@ -130,6 +130,23 @@ deterministic threshold stand-in, explicitly not the PRD §14 classifier,
 and every threshold used is an engineering default unvalidated against
 real labeled data.
 
+**Real bug found + fixed on the first real outdoor drive (2026-09-04):**
+`motion/StopEventClassifier.kt`'s `HARDWARE_CONFIRMED_IDLE` path (added
+2026-09-03, explicitly flagged then as "not yet on-device-validated")
+was latching true for nearly an entire ~25-minute outdoor drive and
+zeroing DR velocity through both real GNSS outages while the vehicle was
+genuinely moving — TYPE_SIGNIFICANT_MOTION only fires on a transition
+into motion, not continuously while already moving, so it went silent
+for the whole steady-driving stretch (measured: last real trigger at
+16:01:04, over 3 minutes before the first outage began at a
+GNSS-confirmed 8.46 m/s). ZUPT false-positive rate against GNSS ground
+truth this drive: 84.3%. Fixed by requiring the best available speed
+estimate to also read near-zero before hardware silence alone can
+declare idle — see `docs/PROJECT_MAP.md`'s `StopEventClassifier.kt`
+entry for the full evidence and fix. A fresh outdoor drive is still
+needed to confirm the fix closes the gap in practice, not just in the
+regression test.
+
 ## 3. Advanced Map-Matching & Kinematic Constraints — 🟡 MVP-level, implemented 2026-08-30
 
 - `map/MapConstraint.kt` now exists, at the PRD's own reduced-scope
@@ -161,6 +178,24 @@ real labeled data.
   needs `alignment/AlignmentEstimator.kt`'s yaw offset plumbed into the
   physics path, which stays a separate, larger change (Roadmap item #5
   below) rather than folded into this one.
+
+**Open investigation (2026-09-04, user report): "moving in a straight
+line the app shows i am turning."** No prior drive log carries enough
+data to root-cause this — `motion/TurningDetector.kt`'s yaw-rate math and
+angle-unwrapping already have unit-test coverage and look correct on
+inspection, and its 2026-09-03 hysteresis fix only addressed
+stationary-shake flicker, not this. Rather than guess at a threshold
+change (CLAUDE.md Rule 13), instrumented for the next real drive instead:
+`capture/DriveDataLogger.kt` now also logs `isTurning` and
+`gnssBearingDeg` (Android's own course-over-ground, independent of this
+app's device-orientation-derived yaw rate), and
+`scripts/analyze_drive_log.py`'s new `report_turning_validation` cross-
+checks them the same way `report_zupt_validation` already validates
+ZUPT — comparing the app's Turning flag against real GNSS bearing-rate-
+of-change. Installed on-device; needs one real straight-line-plus-turns
+drive to actually diagnose (mount vibration causing real device rotation
+independent of vehicle heading vs. the threshold itself being too low
+vs. something else).
 
 ## 4. GNSS+INS Fusion Engine — 🟡 AI-based adaptive blend + jitter smoothing, implemented 2026-09-02
 

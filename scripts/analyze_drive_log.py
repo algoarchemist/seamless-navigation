@@ -32,6 +32,7 @@ The CSV comes from the phone via:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -59,6 +60,10 @@ CURRENT_OUTAGE_ENTER_DWELL_MS = 2000
 CURRENT_TRANSITION_DWELL_MS = 1000
 CURRENT_REACQUISITION_ENTER_DWELL_MS = 2000
 CURRENT_REACQUISITION_DWELL_MS = 1000
+# motion/TurningDetector.DEFAULT_ENTER_YAW_RATE_RADPS (0.15 rad/s), converted
+# to deg/s to match gnssBearingDeg's own units - added 2026-09-04 for the
+# "moving straight but app shows Turning" user report.
+CURRENT_TURNING_ENTER_YAW_RATE_DEGPS = math.degrees(0.15)
 
 
 def load_log(csv_path: Path) -> pd.DataFrame:
@@ -79,6 +84,92 @@ def load_log(csv_path: Path) -> pd.DataFrame:
 # function that uses them must degrade gracefully, not crash.
 def has_raw_columns(df: pd.DataFrame) -> bool:
     return {"rawLinearAccelMagnitudeMps2", "rawGyroMagnitudeRadPerSec"}.issubset(df.columns)
+
+
+# isTurning/gnssBearingDeg were added 2026-09-04 (user report: "moving in a
+# straight line the app shows i am turning") - an older CSV won't have them,
+# same degrade-gracefully convention as has_raw_columns above.
+def has_turning_columns(df: pd.DataFrame) -> bool:
+    return {"isTurning", "gnssBearingDeg"}.issubset(df.columns)
+
+
+def gnss_bearing_rate_samples(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per pair of consecutive FRESH GNSS fixes that both report a
+    bearing: the signed heading-change rate (deg/s) between them, paired
+    with this app's own isTurning flag at the moment of the SECOND fix.
+
+    This is an INDEPENDENT ground truth for motion/TurningDetector.kt - the
+    same "cross-check against a GNSS-derived signal the app's own yaw-rate
+    math doesn't share" method fresh_fix_intervals_ms/report_zupt_validation
+    already use for fix cadence / ZUPT. "Fresh fix" is detected the same way
+    fresh_fix_intervals_ms does (a gnssFixAgeMs drop). Bearing is wrapped to
+    (-180, 180] before dividing by elapsed time, so a real turn crossing
+    e.g. 359deg -> 2deg reads as a small +3deg step, not a near-360deg spin.
+    """
+    if not has_turning_columns(df):
+        return pd.DataFrame(columns=["elapsedMs", "bearingRateDegPerSec", "isTurning"])
+
+    fresh = df[(df["gnssFixAgeMs"].diff() < 0) & df["gnssBearingDeg"].notna()]
+    rows = []
+    prev_elapsed_ms: float | None = None
+    prev_bearing_deg: float | None = None
+    for _, r in fresh.iterrows():
+        if prev_elapsed_ms is not None:
+            dt_s = (r["elapsedMs"] - prev_elapsed_ms) / 1000.0
+            if dt_s > 0:
+                delta_deg = ((r["gnssBearingDeg"] - prev_bearing_deg) + 180) % 360 - 180
+                rows.append(
+                    {
+                        "elapsedMs": r["elapsedMs"],
+                        "bearingRateDegPerSec": delta_deg / dt_s,
+                        "isTurning": bool(r["isTurning"]),
+                    },
+                )
+        prev_elapsed_ms = r["elapsedMs"]
+        prev_bearing_deg = r["gnssBearingDeg"]
+    return pd.DataFrame(rows)
+
+
+def report_turning_validation(df: pd.DataFrame) -> None:
+    print("=== Turning threshold check (ground truth: GNSS bearing rate of change) ===")
+    if not has_turning_columns(df):
+        print(
+            "  This log predates isTurning/gnssBearingDeg (added 2026-09-04) - cannot cross-check "
+            "TurningDetector against an independent ground truth from this log. Capture a new drive.",
+        )
+        print()
+        return
+
+    samples = gnss_bearing_rate_samples(df)
+    if samples.empty:
+        print(
+            "  No consecutive fresh-fix pairs with a real bearing this drive - GNSS never reported "
+            "a bearing (common at low speed, where course-over-ground is unreliable) or too few "
+            "fresh fixes to pair.",
+        )
+        print()
+        return
+
+    print(f"(compare against TurningDetector.DEFAULT_ENTER_YAW_RATE_RADPS={CURRENT_TURNING_ENTER_YAW_RATE_DEGPS:.2f} deg/s)")
+    truly_turning = samples[samples["bearingRateDegPerSec"].abs() >= CURRENT_TURNING_ENTER_YAW_RATE_DEGPS]
+    truly_straight = samples[samples["bearingRateDegPerSec"].abs() < CURRENT_TURNING_ENTER_YAW_RATE_DEGPS]
+    print(
+        f"  n={len(samples)} fresh-fix bearing-rate samples: {len(truly_turning)} truly turning, "
+        f"{len(truly_straight)} truly straight (by GNSS bearing rate)",
+    )
+    if not truly_straight.empty:
+        false_positives = truly_straight["isTurning"].sum()
+        print(
+            f"  False positives (truly straight, app says Turning): {false_positives}/{len(truly_straight)} "
+            f"({100 * false_positives / len(truly_straight):.1f}%)",
+        )
+    if not truly_turning.empty:
+        false_negatives = (~truly_turning["isTurning"]).sum()
+        print(
+            f"  False negatives (truly turning, app says NOT turning): {false_negatives}/{len(truly_turning)} "
+            f"({100 * false_negatives / len(truly_turning):.1f}%)",
+        )
+    print()
 
 
 def report_overview(df: pd.DataFrame) -> None:
@@ -427,6 +518,7 @@ def main() -> int:
     report_zupt_validation(df)
     report_zupt_threshold_sweep(df)
     report_raw_vs_filtered(df)
+    report_turning_validation(df)
 
     print("Reminder: these numbers describe ONE drive. Treat single-drive results as a first "
           "signal, not a final calibration - CLAUDE.md Rule 13 still applies to whatever you do "

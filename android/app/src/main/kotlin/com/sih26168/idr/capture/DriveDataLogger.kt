@@ -36,6 +36,26 @@ data class DriveLogEntry(
      */
     val rawLinearAccelMagnitudeMps2: Double,
     val rawGyroMagnitudeRadPerSec: Double,
+    /**
+     * UPDATE (2026-09-04, user report: "when i am moving in a straight
+     * line the app shows i am turning" — motion/TurningDetector.kt's
+     * DEFAULT_ENTER_YAW_RATE_RADPS/dwell, same "engineering default, not
+     * yet validated against a real outdoor drive" status every other
+     * threshold here carries): logged so a real drive can be cross-checked
+     * against an INDEPENDENT ground truth for actual heading change —
+     * [gnssBearingDeg] below — the same "GNSS as ground truth" method
+     * report_zupt_validation already uses for isStationary/ZUPT.
+     */
+    val isTurning: Boolean,
+    /**
+     * Android's Location.getBearing() (degrees, 0-360, true north) —
+     * course-over-ground from the GNSS receiver's own consecutive-fix
+     * tracking, independent of this app's device-orientation-derived yaw
+     * rate ([motion/TurningDetector.kt]). Null whenever the platform
+     * hasn't supplied a bearing this tick (Location.hasBearing() false —
+     * common at low speed, where course-over-ground is unreliable anyway).
+     */
+    val gnssBearingDeg: Float?,
 )
 
 /**
@@ -79,6 +99,8 @@ class DriveDataLogger {
         isStationary: Boolean,
         rawLinearAccelMagnitudeMps2: Double,
         rawGyroMagnitudeRadPerSec: Double,
+        isTurning: Boolean,
+        gnssBearingDeg: Float?,
     ) {
         val start = startTimestampNs ?: timestampNs.also { startTimestampNs = it }
         val elapsedMs = (timestampNs - start) / 1_000_000L
@@ -95,6 +117,8 @@ class DriveDataLogger {
             isStationary = isStationary,
             rawLinearAccelMagnitudeMps2 = rawLinearAccelMagnitudeMps2,
             rawGyroMagnitudeRadPerSec = rawGyroMagnitudeRadPerSec,
+            isTurning = isTurning,
+            gnssBearingDeg = gnssBearingDeg,
         )
     }
 
@@ -107,7 +131,7 @@ class DriveDataLogger {
         val sb = StringBuilder()
         sb.append("elapsedMs,gnssMode,gnssFixAccuracyM,gnssFixAgeMs,gnssSpeedMps,")
         sb.append("drVelocityEastMps,drVelocityNorthMps,linearAccelMagnitudeMps2,gyroMagnitudeRadPerSec,isStationary,")
-        sb.append("rawLinearAccelMagnitudeMps2,rawGyroMagnitudeRadPerSec\n")
+        sb.append("rawLinearAccelMagnitudeMps2,rawGyroMagnitudeRadPerSec,isTurning,gnssBearingDeg\n")
         entries.forEach { e ->
             sb.append(e.elapsedMs).append(',')
             sb.append(e.gnssMode).append(',')
@@ -120,7 +144,9 @@ class DriveDataLogger {
             sb.append(e.gyroMagnitudeRadPerSec).append(',')
             sb.append(e.isStationary).append(',')
             sb.append(e.rawLinearAccelMagnitudeMps2).append(',')
-            sb.append(e.rawGyroMagnitudeRadPerSec)
+            sb.append(e.rawGyroMagnitudeRadPerSec).append(',')
+            sb.append(e.isTurning).append(',')
+            sb.append(e.gnssBearingDeg?.toString() ?: "")
             sb.append('\n')
         }
         return sb.toString()

@@ -152,6 +152,41 @@ data class StopClassification(
  * [DEFAULT_HARDWARE_IDLE_CONFIRM_MS] as a disclosed engineering default
  * pending a real re-test, same status every other threshold in this
  * class already carries.
+ *
+ * REAL BUG FOUND + FIXED (2026-09-04, first real outdoor drive,
+ * `drive_log_1788518525138.csv` analyzed via `scripts/analyze_drive_log.py`):
+ * that "real re-test" above found [HARDWARE_CONFIRMED_IDLE] was latching
+ * true for nearly the ENTIRE ~25-minute drive and freezing DR velocity to
+ * (0,0) through both real GNSS outages, while the vehicle was genuinely
+ * moving. Root cause: TYPE_SIGNIFICANT_MOTION is a one-shot "transition
+ * INTO motion" signal, not a continuous "still moving" heartbeat (Android's
+ * own semantics) — `adb shell dumpsys sensorservice` showed only 20 real
+ * triggers all clustered in the first ~19 minutes (last one at 16:01:04
+ * wall-clock), then complete silence for the rest of the drive, including
+ * through both outages (first one entered ~16:04, GNSS-confirmed 8.46 m/s
+ * moments before). The OLD condition below only checked "no trigger for
+ * >= [hardwareIdleConfirmMs]" — it never checked whether there was any
+ * actual evidence of a stop, contradicting this class's OWN doc two
+ * paragraphs up ("...and no GNSS speed available to corroborate a stop").
+ * Measured impact: 1502 DEAD_RECKONING-mode rows this drive, ZUPT false-
+ * positive against GNSS ground truth in 84.3% of truly-moving rows
+ * (`report_zupt_validation`); the two real outage segments read
+ * isStationary=true for 100% and 86.6% of their ticks despite entering at
+ * 8.46 m/s and 5.14 m/s respectively.
+ *
+ * Fix: added a `referenceSpeedMps <= nearZeroSpeedMps` requirement to
+ * [HARDWARE_CONFIRMED_IDLE] below, reusing the same speed and threshold
+ * already computed for the near-zero/[StationaryContext.SUDDEN_STOP] check
+ * a few lines above it (no new constant). `referenceSpeedMps` is GNSS
+ * speed when trustworthy, else this system's own DR/ML speed estimate —
+ * same honest-limitation caveat as before applies mid-outage (it's not
+ * independent ground truth there), but this closes the specific failure
+ * mode measured above: hardware silence ALONE, with no corroborating
+ * near-zero speed evidence at all, can no longer declare idle. Every
+ * existing unit test in `StopEventClassifierTest.kt` that expects
+ * [HARDWARE_CONFIRMED_IDLE] to fire already passed `currentSpeedEstimateMps
+ * = 0.0f` at that point — this fix makes the code match what those tests
+ * already assumed.
  */
 class StopEventClassifier(
     private val stationaryDetector: StationaryDetector = StationaryDetector(),
@@ -305,7 +340,14 @@ class StopEventClassifier(
         // evidence of idle.
         val hardwareConfirmedIdle = significantMotionSupported &&
             lastSignificantMotionAtMs != null &&
-            nowMs - lastSignificantMotionAtMs!! >= hardwareIdleConfirmMs
+            nowMs - lastSignificantMotionAtMs!! >= hardwareIdleConfirmMs &&
+            // REAL BUG FIX (2026-09-04, see class doc) — hardware silence
+            // alone is not evidence of a stop; it also means "already
+            // moving smoothly with nothing NEW to report." Requiring the
+            // best available speed evidence to already read near-zero
+            // stops a genuinely moving vehicle from being ZUPT'd just
+            // because the trigger sensor has gone quiet.
+            referenceSpeedMps <= nearZeroSpeedMps
 
         val context: StationaryContext = when {
             cameFromMeaningfulSpeed && nearZeroConfirmed -> {

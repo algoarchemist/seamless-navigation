@@ -7,13 +7,16 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
 
 from analyze_drive_log import (  # noqa: E402
     GNSS_STATIONARY_SPEED_EPSILON_MPS,
     fresh_fix_intervals_ms,
+    gnss_bearing_rate_samples,
     has_raw_columns,
+    has_turning_columns,
     sweep_zupt_thresholds,
 )
 
@@ -153,6 +156,79 @@ class TestFreshFixIntervalsMs:
             },
         )
         assert fresh_fix_intervals_ms(df) == []
+
+
+class TestGnssBearingRateSamples:
+    def test_missing_turning_columns_returns_empty(self):
+        df = pd.DataFrame({"elapsedMs": [0, 100], "gnssFixAgeMs": [100, 50]})
+        result = gnss_bearing_rate_samples(df)
+        assert result.empty
+        assert list(result.columns) == ["elapsedMs", "bearingRateDegPerSec", "isTurning"]
+
+    def test_bearing_wraparound_reads_as_a_small_step_not_a_360deg_spin(self):
+        # Regression test for the "moving in a straight line the app shows
+        # i am turning" user report: bearing crossing 359deg -> 2deg is a
+        # real (tiny) +3deg heading change, not the -357deg a naive
+        # subtraction would compute. Two fresh-fix pairs, both near-zero
+        # real turning rate, matching a genuinely straight drive.
+        df = pd.DataFrame(
+            {
+                "elapsedMs": [0, 100, 3300, 5200, 8300, 10200],
+                "gnssFixAgeMs": [9999, 50, 3300, 50, 3383, 50],
+                "gnssBearingDeg": [None, 359.0, None, 2.0, None, 359.0],
+                "isTurning": [False, False, False, True, False, False],
+            },
+        )
+        samples = gnss_bearing_rate_samples(df)
+        assert len(samples) == 2
+        # elapsed 100 -> 5200 (5.1s): 359 -> 2 is +3deg, not -357deg.
+        assert samples.iloc[0]["bearingRateDegPerSec"] == pytest.approx(3.0 / 5.1, abs=1e-6)
+        assert bool(samples.iloc[0]["isTurning"]) is True  # paired with the SECOND fix (elapsed=5200)
+        # elapsed 5200 -> 10200 (5.0s): 2 -> 359 is -3deg, not +357deg.
+        assert samples.iloc[1]["bearingRateDegPerSec"] == pytest.approx(-3.0 / 5.0, abs=1e-6)
+        assert bool(samples.iloc[1]["isTurning"]) is False
+
+    def test_a_real_turn_produces_a_large_rate(self):
+        df = pd.DataFrame(
+            {
+                "elapsedMs": [0, 100, 2100],
+                "gnssFixAgeMs": [9999, 100, 50],
+                "gnssBearingDeg": [None, 10.0, 55.0],
+                "isTurning": [False, False, True],
+            },
+        )
+        samples = gnss_bearing_rate_samples(df)
+        assert len(samples) == 1
+        # 45deg over 2.0s = 22.5 deg/s, well above TurningDetector's ~8.6 deg/s bar.
+        assert samples.iloc[0]["bearingRateDegPerSec"] == pytest.approx(22.5, abs=1e-6)
+        assert bool(samples.iloc[0]["isTurning"]) is True
+
+    def test_fresh_fixes_without_a_bearing_are_skipped(self):
+        # Bearing is commonly absent at low speed (Location.hasBearing()
+        # false) - those fresh fixes must not be paired at all, not treated
+        # as a 0deg/s sample.
+        df = pd.DataFrame(
+            {
+                "elapsedMs": [0, 100, 5100, 10100],
+                "gnssFixAgeMs": [9999, 50, 3300, 50],
+                "gnssBearingDeg": [None, 10.0, None, 15.0],
+                "isTurning": [False, False, False, False],
+            },
+        )
+        samples = gnss_bearing_rate_samples(df)
+        # Only the (elapsed=100, elapsed=10100) pair both have a real bearing.
+        assert len(samples) == 1
+        assert samples.iloc[0]["elapsedMs"] == 10100
+
+
+class TestHasTurningColumns:
+    def test_true_when_both_columns_present(self):
+        df = pd.DataFrame({"isTurning": [True], "gnssBearingDeg": [10.0]})
+        assert has_turning_columns(df) is True
+
+    def test_false_on_a_pre_2026_09_04_log_missing_turning_columns(self):
+        df = pd.DataFrame({"elapsedMs": [0], "gnssFixAgeMs": [100]})
+        assert has_turning_columns(df) is False
 
 
 class TestHasRawColumns:

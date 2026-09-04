@@ -577,12 +577,39 @@ UPDATE (2026-09-03, HARDWARE_CONFIRMED_IDLE — REAL BUG: user report "even
   written) — unit-tested against synthetic trigger-count sequences only;
   treat DEFAULT_HARDWARE_IDLE_CONFIRM_MS as disclosed-pending-re-test,
   same status every other threshold here carries (CLAUDE.md Rule 13/18).
+UPDATE (2026-09-04, REAL BUG FOUND + FIXED — the "real re-test" the
+  paragraph above was pending): the project's FIRST real outdoor drive
+  (`drive_log_1788518525138.csv`, ~25 minutes, analyzed via
+  `scripts/analyze_drive_log.py`) found HARDWARE_CONFIRMED_IDLE latching
+  true for nearly the entire drive and zeroing DR velocity through both
+  real GNSS outages while the vehicle was genuinely moving. Root cause:
+  TYPE_SIGNIFICANT_MOTION fires on a TRANSITION into motion, not
+  continuously while already moving (Android's own semantics) —
+  `adb shell dumpsys sensorservice` showed only 20 real triggers, all in
+  the drive's first ~19 minutes, last one at 16:01:04 wall-clock; the
+  first real outage began ~16:04 at a GNSS-confirmed 8.46 m/s, over 3
+  minutes after the sensor went silent. The old condition only checked
+  "no trigger for >= hardwareIdleConfirmMs" — never any evidence a stop
+  was plausible, contradicting this class's own doc ("no GNSS speed
+  available to corroborate A STOP"). Measured impact: ZUPT false-positive
+  in 84.3% of GNSS-confirmed truly-moving rows this drive
+  (`report_zupt_validation`); the two real outage segments read
+  isStationary=true for 100% and 86.6% of their ticks. Fix: added
+  `referenceSpeedMps <= nearZeroSpeedMps` to the HARDWARE_CONFIRMED_IDLE
+  condition — reuses the speed/threshold already computed for the
+  SUDDEN_STOP check a few lines above (no new constant). Every existing
+  unit test that expected HARDWARE_CONFIRMED_IDLE to fire already passed
+  currentSpeedEstimateMps=0.0f at that point, so this fix makes the code
+  match what those tests already assumed — none needed to change. New
+  regression test added (see below) reproducing the real drive's shape:
+  hardware silent for far longer than hardwareIdleConfirmMs while GNSS
+  speed stays at 8.5 m/s must read MOVING, not any stationary context.
 Connected to: dr/BaselineDeadReckoningRepository.kt, ml/MlVelocityRepository.kt
   -> StopEventClassifier -> StationaryDetector (wrapped);
   sensors/SensorRepository.kt (hasSignificantMotionSensor(),
   SensorUiState.significantMotionEventCount) feeds the new
   HARDWARE_CONFIRMED_IDLE path.
-Unit tests: tests/.../motion/StopEventClassifierTest.kt (15 cases) — long
+Unit tests: tests/.../motion/StopEventClassifierTest.kt (16 cases) — long
   idle after sustained no-prior-motion quiet; a brief stop stays
   BRIEF_STOP under the idle bound; sudden stop after high-speed movement
   fires before the accel/gyro dwell alone would; stop after low-speed
@@ -597,7 +624,9 @@ Unit tests: tests/.../motion/StopEventClassifierTest.kt (15 cases) — long
   significant motion stops triggering; a new trigger resets the
   hardware-idle clock; hardware idle never fires before any real trigger
   has been observed even after a long silent launch; the signal is
-  ignored entirely when the device has no significant-motion sensor.
+  ignored entirely when the device has no significant-motion sensor;
+  (2026-09-04) hardware silence alone, with GNSS speed staying at 8.5 m/s
+  the whole time, must not ZUPT a genuinely still-moving vehicle.
 
 android/app/src/main/kotlin/com/sih26168/idr/dr/NonHolonomicConstraint.kt
 Status: IMPLEMENTED
@@ -1184,7 +1213,15 @@ Purpose: A minimal, one-off data-capture tool (CLAUDE.md Rule 18), same
   CSV (not JSON) specifically so scripts/analyze_drive_log.py can load it
   with `pandas.read_csv` directly.
 Inputs: record() takes one tick's GNSS mode/accuracy/fixAge/speed + DR
-  velocity/accel-magnitude/gyro-magnitude/isStationary.
+  velocity/accel-magnitude/gyro-magnitude/isStationary. UPDATE
+  (2026-09-04, user report "moving in a straight line the app shows i am
+  turning" — motion/TurningDetector.kt): also takes isTurning
+  (DeadReckoningState's own flag) and gnssBearingDeg (Location.getBearing(),
+  an INDEPENDENT ground truth for actual heading change, same "GNSS as
+  ground truth" method already used for isStationary/ZUPT) — logged, not
+  yet analyzed, since no drive captured with these columns exists yet;
+  the next real drive can be cross-checked the same way
+  report_zupt_validation already cross-checks ZUPT.
 Outputs: toCsv() — hand-written CSV (no new dependency, CLAUDE.md Rule 2).
 Connected to: MainActivity (Start/Stop drive log button on the debug
   screen, own deadReckoningRepository.state collector reading
@@ -1257,10 +1294,12 @@ Inputs: one positional csv_path (a drive_log_<ts>.csv pulled via
   `adb pull` from the app's Start/Stop debug-screen logger).
 Outputs: stdout report only — overview (tick count/duration/observed
   Hz), real GNSS-mode segment durations, GNSS fix-quality percentiles,
-  a ZUPT false-positive/false-negative confusion check against GNSS
-  speed as independent ground truth, a ZUPT threshold grid-sweep, and a
-  raw-vs-filtered accel/gyro comparison. Exit 1 if the CSV doesn't exist
-  or is missing a required column.
+  real fix-refresh cadence, degraded-mode fix-quality breakdown, a ZUPT
+  false-positive/false-negative confusion check against GNSS speed as
+  independent ground truth, a ZUPT threshold grid-sweep, a
+  raw-vs-filtered accel/gyro comparison, and a Turning false-positive/
+  false-negative check against GNSS bearing rate as independent ground
+  truth. Exit 1 if the CSV doesn't exist or is missing a required column.
 Important functions: load_log (schema check), report_mode_segments
   (groups consecutive same-mode rows into real dwell segments),
   report_zupt_validation (GNSS speed < 0.3 m/s while GNSS_AIDED as
@@ -1277,16 +1316,36 @@ Important functions: load_log (schema check), report_mode_segments
   has both — lets LowPassFilter's cutoffHz be tuned from a future log,
   not just the StationaryDetector threshold; degrades gracefully via
   has_raw_columns on older logs that predate these fields).
-Unit tests: tests/scripts/test_analyze_drive_log.py (6 cases, added
-  2026-09-01, synthetic data only — CLAUDE.md Rule 19) — sweep finds a
-  zero-error threshold when classes are perfectly separable; sweep
-  correctly finds NO zero-error threshold when classes fully overlap
-  (proves the sweep can detect "not separable," not just always find a
-  win); DEAD_RECKONING-mode rows (no independent ground truth) are
-  excluded from the sweep; has_raw_columns true/false on logs with/
-  without the 2026-09-01 raw fields. `python -m pytest
-  tests/scripts/test_analyze_drive_log.py` — 6/6 pass; full suite
-  (`python -m pytest tests/`) — 43/43 pass, no regressions.
+  fresh_fix_intervals_ms/report_fix_refresh_cadence (added 2026-09-04,
+  docs/gnss-indoor-window-degradation.md — the function that actually
+  found the real fix-staleness bug: elapsed time between consecutive
+  fresh GNSS fixes, detected via a gnssFixAgeMs drop). 
+  report_degraded_mode_accuracy (added 2026-09-04, same investigation —
+  checked and ruled out the original accuracy/multipath hypothesis for
+  that bug). gnss_bearing_rate_samples/report_turning_validation (added
+  2026-09-04, "moving in a straight line the app shows i am turning"
+  user report — pairs consecutive fresh-fix GNSS bearings into a signed
+  heading-change rate in deg/s, angle-unwrapped so e.g. 359deg->2deg
+  reads as +3deg not -357deg, and cross-checks against isTurning at the
+  second fix; degrades gracefully via has_turning_columns on logs that
+  predate isTurning/gnssBearingDeg — no drive has these columns yet, so
+  this can only run against a NEW capture).
+Unit tests: tests/scripts/test_analyze_drive_log.py (16 cases) —
+  sweep finds a zero-error threshold when classes are perfectly
+  separable; sweep correctly finds NO zero-error threshold when classes
+  fully overlap (proves the sweep can detect "not separable," not just
+  always find a win); DEAD_RECKONING-mode rows (no independent ground
+  truth) are excluded from the sweep; has_raw_columns true/false on logs
+  with/without the 2026-09-01 raw fields; fresh_fix_intervals_ms detects
+  a fixAgeMs drop as a fresh fix, pairs two fresh fixes into one
+  interval, reproduces the real window-drive's measured 6317ms cadence,
+  and returns no intervals when nothing drops; gnss_bearing_rate_samples
+  returns empty on a log missing isTurning/gnssBearingDeg, unwraps a
+  359deg->2deg bearing crossing into a small +3deg step (not -357deg), a
+  real 45deg/2s turn reads as 22.5 deg/s, and a fresh fix with no
+  reported bearing is skipped rather than treated as 0deg/s;
+  has_turning_columns true/false. `python -m pytest tests/` — all pass,
+  no regressions.
 
 android/app/src/test/kotlin/com/sih26168/idr/sensors/SampleRateTest.kt
 Status: IMPLEMENTED

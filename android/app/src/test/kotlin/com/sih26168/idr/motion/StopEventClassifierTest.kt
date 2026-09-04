@@ -368,6 +368,56 @@ class StopEventClassifierTest {
     }
 
     @Test
+    fun `hardware silence alone must not ZUPT a vehicle that is genuinely still moving`() {
+        // Regression test for the REAL BUG found on the first real outdoor
+        // drive (2026-09-04, see class doc): TYPE_SIGNIFICANT_MOTION only
+        // fires on a transition INTO motion, not continuously while already
+        // moving -- a long, smooth highway stretch can go minutes without a
+        // new trigger while the vehicle is demonstrably still moving. The
+        // real drive log showed hardwareIdleConfirmMs elapsing ~3 minutes
+        // before a real GNSS outage entered at 8.46 m/s, then DR velocity
+        // was zeroed for 100% of that 16s outage. GNSS speed here plays
+        // the same "known still moving" role that drive's ground truth did.
+        val classifier = newClassifier()
+        classifier.evaluate(
+            0L,
+            linearAccelMagnitudeMps2 = 1.0f,
+            gyroMagnitudeRadPerSec = 0.05f,
+            currentSpeedEstimateMps = 8.5f,
+            gnssSpeedMps = 8.5f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 0,
+        )
+        classifier.evaluate(
+            50L,
+            linearAccelMagnitudeMps2 = 1.0f,
+            gyroMagnitudeRadPerSec = 0.05f,
+            currentSpeedEstimateMps = 8.5f,
+            gnssSpeedMps = 8.5f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 1,
+        )
+        // Long past hardwareIdleConfirmMs with no new trigger, but the
+        // vehicle is still genuinely moving at highway speed the whole time
+        // (mirrors the real drive's ~3-minute silent gap before an outage).
+        val result = classifier.evaluate(
+            50L + HARDWARE_IDLE_MS * 100,
+            linearAccelMagnitudeMps2 = 1.0f,
+            gyroMagnitudeRadPerSec = 0.05f,
+            currentSpeedEstimateMps = 8.5f,
+            gnssSpeedMps = 8.5f,
+            significantMotionSupported = true,
+            significantMotionEventCount = 1,
+        )
+        assertEquals(
+            "must not read as any stationary context while GNSS confirms real ongoing motion",
+            StationaryContext.MOVING,
+            result.context,
+        )
+        assertFalse(result.shouldApplyZupt)
+    }
+
+    @Test
     fun `hardware idle signal is ignored when the device has no significant-motion sensor`() {
         val classifier = newClassifier()
         classifier.evaluate(

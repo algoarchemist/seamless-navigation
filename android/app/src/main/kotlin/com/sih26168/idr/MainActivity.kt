@@ -513,6 +513,8 @@ class MainActivity : ComponentActivity() {
                     isStationary = dr.isStationary,
                     rawLinearAccelMagnitudeMps2 = dr.rawLinearAccelMagnitudeMps2,
                     rawGyroMagnitudeRadPerSec = dr.rawGyroMagnitudeRadPerSec,
+                    isTurning = dr.isTurning,
+                    gnssBearingDeg = gnss.latestFix?.bearingDeg,
                 )
                 _driveLogState.value = _driveLogState.value.copy(recordedCount = driveDataLogger.recordedCount)
             }
