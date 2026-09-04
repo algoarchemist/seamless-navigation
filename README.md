@@ -203,4 +203,4 @@ Every one of these is tracked with the same specificity in
 
 ## Team
 
-Built by **algoarchemist** for Smart India Hackathon, Problem Statement 26168 (ISRO).
+Built by **Nithin** and **Charangeet** of team **HexaCore** for Smart India Hackathon, Problem Statement 26168 (ISRO).
