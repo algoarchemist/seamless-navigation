@@ -18,10 +18,37 @@ import kotlin.math.sin
  * `alignment/AlignmentEstimator.kt` already uses for its circular mean)
  * — a plain linear lerp between e.g. 179 deg and -179 deg would spin the
  * map the LONG way around instead of the correct 2-degree short way.
+ *
+ * REAL BUG FIX (2026-09-04, bugs.jpeg code review): [reacquisitionBlendMs]
+ * used to be a constructor-only `val`, permanently fixed at
+ * [PositionFusion.DEFAULT_REACQUISITION_BLEND_MS] — but
+ * `fusion/StateEstimator.kt` calls [PositionFusion.setReacquisitionBlendMs]
+ * with an ADAPTIVE, per-outage duration (500-3000ms, from
+ * [PositionFusion.blendDurationForDriftMs]'s ML-predicted-drift formula)
+ * and never told this class about it. On a high-predicted-drift
+ * reacquisition, position would blend smoothly over the full adaptive
+ * window while heading kept finishing at the old fixed default —
+ * whichever was shorter — producing a visible desync where the map's
+ * heading/rotation already shows the new true heading while the position
+ * marker is still gliding in from the old DR estimate. [setReacquisitionBlendMs]
+ * below gives this class the same capability, called from the SAME site
+ * with the SAME computed duration so both blends stay in sync.
  */
 class HeadingFusion(
-    private val reacquisitionBlendMs: Long = PositionFusion.DEFAULT_REACQUISITION_BLEND_MS,
+    private var reacquisitionBlendMs: Long = PositionFusion.DEFAULT_REACQUISITION_BLEND_MS,
 ) {
+    /**
+     * Sets the REACQUISITION blend duration for the NEXT outage this
+     * instance handles — same calling convention as
+     * [PositionFusion.setReacquisitionBlendMs] (must be called before the
+     * first REACQUISITION-mode [update] call for that outage), and meant
+     * to be called with the SAME duration so heading and position finish
+     * blending together.
+     */
+    fun setReacquisitionBlendMs(blendMs: Long) {
+        reacquisitionBlendMs = blendMs
+    }
+
     private var lastMode: GnssMode? = null
     private var modeEnteredAtMs: Long = 0L
     private var frozenHeadingDeg = 0f
@@ -90,5 +117,6 @@ class HeadingFusion(
         modeEnteredAtMs = 0L
         frozenHeadingDeg = 0f
         reacquisitionStartHeadingDeg = 0f
+        reacquisitionBlendMs = PositionFusion.DEFAULT_REACQUISITION_BLEND_MS
     }
 }

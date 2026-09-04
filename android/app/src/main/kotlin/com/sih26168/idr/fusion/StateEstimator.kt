@@ -330,13 +330,6 @@ class StateEstimator(
                 // fixAgeMs/accuracyM this fix was already classified with
                 // upstream) closes that gap: only a fix that is ACTUALLY good
                 // right now can move the anchor.
-                // (2026-09-02, PRD.md Section 17's jitter-smoothing half —
-                // see this class's own doc for the full reasoning) Computed
-                // in the SAME "is this fix actually trustworthy right now"
-                // branch as the outage anchor above, but into a completely
-                // separate, FIXED local frame — never written back into
-                // outageAnchorLatDeg/LonDeg/AccuracyM, so the reacquisition/
-                // drift-measurement logic above is untouched by this.
                 var gnssJitterOffsetEastM = 0.0
                 var gnssJitterOffsetNorthM = 0.0
 
@@ -350,6 +343,65 @@ class StateEstimator(
                         tripOriginLatDeg = fix.latitudeDeg
                         tripOriginLonDeg = fix.longitudeDeg
                     }
+                } else if (outageAnchorLatDeg == null) {
+                    // REAL BUG (2026-08-26, user report: "no feature to track
+                    // my position on the map"): without ANY anchor,
+                    // ui/screens/MapScreen.kt has no lat/lon to project the
+                    // fused DR position onto, so it draws NO marker at all --
+                    // even while this class is correctly fusing real
+                    // physics/ML position underneath. That happens whenever
+                    // the FIRST fix this run isn't good enough to pass
+                    // GnssQuality (e.g. MapScreen.kt's own documented real
+                    // case: an 8.8s-old/29.7m-accuracy indoor fix near a
+                    // window) -- mode never reaches GNSS_AIDED, so the strict
+                    // branch above never fires. A PROVISIONAL anchor from the
+                    // very first fix ever seen (any quality) fixes this: it's
+                    // the same small, bounded approximation
+                    // BaselineDeadReckoningRepository's own integrator already
+                    // makes by not resetting until GNSS_AIDED either (its
+                    // zero-point is really "wherever the phone was at app
+                    // launch," which is a few seconds/meters from this first
+                    // fix, not a new source of error). Once a fix that is
+                    // BOTH in GNSS_AIDED mode AND passes GnssQuality.isGood()
+                    // arrives, the strict branch above overwrites this with
+                    // the accurate point -- a one-time visual snap-to-fix,
+                    // same as any nav app's behavior when GPS lock improves,
+                    // not silently kept wrong forever.
+                    outageAnchorLatDeg = fix.latitudeDeg
+                    outageAnchorLonDeg = fix.longitudeDeg
+                }
+
+                // (2026-09-02, PRD.md Section 17's jitter-smoothing half —
+                // see this class's own doc for the full reasoning) Computed
+                // into a completely separate, FIXED local frame — never
+                // written back into outageAnchorLatDeg/LonDeg/AccuracyM, so
+                // the reacquisition/drift-measurement logic above is
+                // untouched by this.
+                //
+                // REAL BUG FIX (2026-09-04, bugs.jpeg code review): this
+                // used to run INSIDE the strict isGood() branch above, so a
+                // momentary quality dip (tree cover, a brief urban-canyon
+                // reflection) that isn't sustained long enough to trip
+                // GnssOutageDetector's own outageEnterDwellMs (2s) hysteresis
+                // silently froze the DISPLAYED position at the last good
+                // anchor for up to that same 2s -- with gnssState.mode still
+                // reporting GNSS_AIDED the whole time, no visible indication
+                // anything had stalled. GnssJitterFilter already has its own
+                // graceful degradation via GnssQuality.confidenceWeight (a
+                // marginal fix pulls the prediction only slightly, not a
+                // hard on/off), so gating it on the SAME strict isGood() bar
+                // as the anchor update wasn't needed and threw that away.
+                // Anchor/tripOrigin establishment above stays STRICTLY
+                // isGood()-gated (unchanged, preserves the 2026-08-26
+                // drift-measurement-anchor fix) -- only the smoothing
+                // CONTINUATION now runs whenever mode == GNSS_AIDED,
+                // regardless of THIS tick's own fix quality, using whatever
+                // anchor/tripOrigin the strict branch above has most
+                // recently established. Expressed relative to the CURRENT
+                // anchor (not assumed to equal this tick's raw fix, since
+                // that's only true when isGood() also just passed this same
+                // tick) so this stays correct in both cases.
+                if (gnssState.mode == GnssMode.GNSS_AIDED) {
                     // GNSS was NOT trusted last tick (a fresh outage just
                     // ended, or this is the very first tick this run) —
                     // reset so the filter's next prediction step doesn't
@@ -360,7 +412,9 @@ class StateEstimator(
                     }
                     val originLat = tripOriginLatDeg
                     val originLon = tripOriginLonDeg
-                    if (originLat != null && originLon != null) {
+                    val anchorLat = outageAnchorLatDeg
+                    val anchorLon = outageAnchorLonDeg
+                    if (originLat != null && originLon != null && anchorLat != null && anchorLon != null) {
                         val (rawFixEastM, rawFixNorthM) = GeoProjection.toLocalMeters(
                             latDeg = fix.latitudeDeg,
                             lonDeg = fix.longitudeDeg,
@@ -447,41 +501,21 @@ class StateEstimator(
                             velocityNorthMps = gnssVelocityNorthMps,
                             confidenceWeight = GnssQuality.confidenceWeight(fix.accuracyM),
                         )
-                        // The SMOOTHED position minus THIS tick's raw fix —
-                        // since the outage anchor above is set FROM this
-                        // same raw fix, "meters from anchor" (what
-                        // PositionFusion's GNSS_AIDED branch reports) is
-                        // exactly this small correction, not a hard-coded
-                        // zero.
-                        gnssJitterOffsetEastM = smoothedEastM - rawFixEastM
-                        gnssJitterOffsetNorthM = smoothedNorthM - rawFixNorthM
+                        // The SMOOTHED position minus the CURRENT anchor —
+                        // not necessarily this tick's own raw fix, see this
+                        // block's own doc above — so "meters from anchor"
+                        // (what PositionFusion's GNSS_AIDED branch reports)
+                        // stays correct whether or not THIS tick's fix was
+                        // itself good enough to move the anchor.
+                        val (anchorEastM, anchorNorthM) = GeoProjection.toLocalMeters(
+                            latDeg = anchorLat,
+                            lonDeg = anchorLon,
+                            refLatDeg = originLat,
+                            refLonDeg = originLon,
+                        )
+                        gnssJitterOffsetEastM = smoothedEastM - anchorEastM
+                        gnssJitterOffsetNorthM = smoothedNorthM - anchorNorthM
                     }
-                } else if (outageAnchorLatDeg == null) {
-                    // REAL BUG (2026-08-26, user report: "no feature to track
-                    // my position on the map"): without ANY anchor,
-                    // ui/screens/MapScreen.kt has no lat/lon to project the
-                    // fused DR position onto, so it draws NO marker at all --
-                    // even while this class is correctly fusing real
-                    // physics/ML position underneath. That happens whenever
-                    // the FIRST fix this run isn't good enough to pass
-                    // GnssQuality (e.g. MapScreen.kt's own documented real
-                    // case: an 8.8s-old/29.7m-accuracy indoor fix near a
-                    // window) -- mode never reaches GNSS_AIDED, so the strict
-                    // branch above never fires. A PROVISIONAL anchor from the
-                    // very first fix ever seen (any quality) fixes this: it's
-                    // the same small, bounded approximation
-                    // BaselineDeadReckoningRepository's own integrator already
-                    // makes by not resetting until GNSS_AIDED either (its
-                    // zero-point is really "wherever the phone was at app
-                    // launch," which is a few seconds/meters from this first
-                    // fix, not a new source of error). Once a fix that is
-                    // BOTH in GNSS_AIDED mode AND passes GnssQuality.isGood()
-                    // arrives, the strict branch above overwrites this with
-                    // the accurate point -- a one-time visual snap-to-fix,
-                    // same as any nav app's behavior when GPS lock improves,
-                    // not silently kept wrong forever.
-                    outageAnchorLatDeg = fix.latitudeDeg
-                    outageAnchorLonDeg = fix.longitudeDeg
                 }
 
                 val mlState = mlVelocityRepository?.state?.value
@@ -606,7 +640,14 @@ class StateEstimator(
                         predictedSpeedStdMps = outageSpeedStats.populationStdDev().toFloat(),
                     )
                     if (predictedDriftM != null) {
-                        positionFusion.setReacquisitionBlendMs(PositionFusion.blendDurationForDriftMs(predictedDriftM))
+                        // REAL BUG FIX (2026-09-04, bugs.jpeg code review):
+                        // headingFusion now gets the SAME adaptive duration
+                        // as positionFusion — see HeadingFusion's own doc
+                        // for the visible heading/position desync this
+                        // closes.
+                        val blendMs = PositionFusion.blendDurationForDriftMs(predictedDriftM)
+                        positionFusion.setReacquisitionBlendMs(blendMs)
+                        headingFusion.setReacquisitionBlendMs(blendMs)
                         Log.i(TAG, "Outage #${driftHistory.size} predicted drift: ${predictedDriftM}m (adaptive blend set)")
                     }
                 }
@@ -652,13 +693,33 @@ class StateEstimator(
                 // road-snap "correction" — GNSS_AIDED's `fused` position IS
                 // the real fix, see PositionFusion) AND an active route +
                 // anchor exist to snap against.
+                //
+                // REAL BUG FIX (2026-09-04, bugs.jpeg code review): this
+                // used to just check `mode != GNSS_AIDED`, which ALSO
+                // includes TRANSITION — but PositionFusion's TRANSITION
+                // branch freezes `fused.eastM/northM` at whatever the DR
+                // position was the instant TRANSITION was entered (see
+                // that class's own doc), while the headingRad computed
+                // below comes from LIVE, continuously-updating physics
+                // velocity, completely unrelated to the frozen position.
+                // Feeding a frozen point + a jittering heading into
+                // MapConstraint.snapToRoad's heading-compatibility check
+                // could pick a DIFFERENT nearby road segment tick to tick
+                // even though the (frozen) position never actually moved —
+                // a visible snap flip during the one window that's
+                // supposed to hold the display stable. Restricted to the
+                // two modes where the fused position is actually live
+                // (DEAD_RECKONING's DR passthrough, REACQUISITION's blend)
+                // — TRANSITION now correctly skips road-snap entirely for
+                // its own short (~1s) freeze window.
                 var roadSnapEastM: Double? = null
                 var roadSnapNorthM: Double? = null
                 var roadDistanceM: Double? = null
                 val anchorLatForSnap = outageAnchorLatDeg
                 val anchorLonForSnap = outageAnchorLonDeg
                 val routeGeometry = activeRouteGeometryLatLon
-                if (gnssState.mode != GnssMode.GNSS_AIDED &&
+                if (
+                    (gnssState.mode == GnssMode.DEAD_RECKONING || gnssState.mode == GnssMode.REACQUISITION) &&
                     anchorLatForSnap != null &&
                     anchorLonForSnap != null &&
                     routeGeometry != null &&

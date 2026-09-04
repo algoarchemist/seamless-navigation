@@ -328,6 +328,69 @@ outdoors (CLAUDE.md Rule 13) — no confirmed-correct on-device screenshot
 or video exists yet showing the arrow pointing the right way while
 actually driving/turning.
 
+## Eight real bugs found + fixed via code review (2026-09-04, `bugs.jpeg`)
+
+A code-review pass (screenshotted findings, `bugs.jpeg`) flagged 8
+suspected correctness/consistency bugs across the map, fusion, and ZUPT
+paths. Each was independently re-derived and verified against the
+current source (not taken on faith) before fixing — full evidence and
+reasoning lives in each file's own `docs/PROJECT_MAP.md` entry (search
+for "2026-09-04, bugs.jpeg"). All 8 confirmed real; all 8 fixed.
+
+1. **`StreetMapView.kt` marker rotation double-applying map orientation**
+   — the directional arrow displayed at the raw compass heading instead
+   of heading-relative-to-map-orientation, so it could point sideways/
+   backward during heading-up navigation. Fixed; still on-device
+   unverified (geometric analysis, not a live test).
+2. **`MlVelocityRepository.kt` ZUPT "still moving" override structurally
+   blind during fast-path stops** — `MotionStateClassifier.classify()`
+   forces `isCruising` false whenever dwell confirmation is false, which
+   is exactly when `StopEventClassifier`'s SUDDEN_STOP/HARDWARE_CONFIRMED_IDLE
+   fire — reopening the false-ZUPT bug class those paths exist to fix.
+   Fixed via a new `predictsRealMotion()` that skips the gate.
+3. **`MapScreen.kt` marker reading the raw GNSS fix, bypassing
+   `GnssJitterFilter`'s smoothing entirely** — the jitter filter (built
+   2026-09-02) was computed and unit-tested correctly but never reached
+   the rendered map. Fixed to prefer the jitter-smoothed position.
+4. **`AlignmentRepository.kt` reading GNSS fixes with no mode/quality
+   gate** — unlike every other GNSS consumer in this codebase, so a
+   stale pre-outage fix could keep poisoning the yaw calibration for the
+   duration of an outage. Fixed to match the established gating pattern.
+5. **`StateEstimator.kt` road-snap heading/position frame mismatch during
+   TRANSITION** — the frozen position and a live, jittering heading were
+   fed into the same snap decision, risking a visible segment flip during
+   the window meant to hold the display stable. Fixed by excluding
+   TRANSITION from road-snap eligibility.
+6. **`StatusOverlayContent.kt` GNSS_AIDED speed trusted unconditionally**
+   — missing the `GnssQuality.isGood()` check the other two "trust GNSS
+   speed" call sites already have, so the debug overlay could disagree
+   with the app's own real ZUPT/DR gating for up to the 2s hysteresis
+   window. Fixed to match.
+7. **`StateEstimator.kt` silent position freeze on an ordinary GNSS
+   quality dip** — jitter smoothing shared the same strict
+   `isGood()`-gated branch as the drift-measurement anchor update, so a
+   momentary quality dip (tree cover) froze the displayed position for
+   up to 2s with the UI still showing "GNSS_AIDED," no visible sign
+   anything had stalled. Fixed by decoupling smoothing continuation from
+   the (unchanged, still strict) anchor-update gate — the higher-risk fix
+   of the 8, since `StateEstimator.kt` has no dedicated unit test file;
+   verified by careful manual re-derivation, not an automated test.
+8. **`HeadingFusion.kt` missing the adaptive reacquisition-blend duration
+   `PositionFusion` already has** — heading always finished blending at
+   the fixed 1000ms default even when position's own blend had been set
+   much longer (500-3000ms, ML-predicted-drift-based), producing a
+   visible heading/position desync on a high-drift reacquisition. Fixed
+   by adding the same `setReacquisitionBlendMs` capability, called from
+   the same site with the same duration.
+
+Full Kotlin test suite passes (clean rebuild) with 2 new tests added
+(`StopEventClassifierTest`, `HeadingFusionTest`, `MotionStateClassifierTest`
+each gained cases) and one pre-existing test updated
+(`StatusOverlayContentTest`, whose old assertion encoded bug #6). Rebuilt
+and reinstalled on-device. **None of these 8 have been re-verified with a
+fresh real drive yet** — same disclosed status every other fix from
+today's session carries (CLAUDE.md Rule 13).
+
 ## Explicitly out of scope — do not build these
 
 Per `PRD.md` §7/§34 and `CLAUDE.md`'s "What Not To Build" list, the

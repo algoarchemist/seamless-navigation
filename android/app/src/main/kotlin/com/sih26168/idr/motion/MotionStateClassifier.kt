@@ -63,4 +63,30 @@ class MotionStateClassifier(
         val cruising = rawPredictedVelocityMps >= minCruisingSpeedMps
         return MotionClassification(isStationary = !cruising, isCruising = cruising)
     }
+
+    /**
+     * Unconditional "does the raw model think we're still really moving"
+     * check — the SAME threshold [classify] uses, but WITHOUT its
+     * `physicallyStill` gate.
+     *
+     * REAL BUG FIX (2026-09-04, bugs.jpeg code review,
+     * ml/MlVelocityRepository.kt's ZUPT gate): [classify] is deliberately
+     * scoped to answer "given that StationaryDetector says the phone LOOKS
+     * physically still, is it actually stationary or cruising" — a
+     * narrower question than what the ZUPT override at that call site
+     * actually needs. `motion/StopEventClassifier.kt`'s SUDDEN_STOP and
+     * HARDWARE_CONFIRMED_IDLE fast paths can both set `shouldApplyZupt =
+     * true` precisely when `dwellConfirmedStationary` (the `physicallyStill`
+     * input) is FALSE — that's the whole point of those paths, catching
+     * real stops the plain accel/gyro dwell check misses. But
+     * [classify]`(physicallyStill = false, ...)` unconditionally returns
+     * `isCruising = false`, regardless of what the raw model predicts —
+     * so the ZUPT gate's "don't ZUPT if the model still predicts real
+     * speed" safety net silently never engaged in exactly the two contexts
+     * StopEventClassifier was built to widen ZUPT into. This method
+     * restores that check, independent of dwell confirmation, so the
+     * override can still fire during a fast-path ZUPT decision.
+     */
+    fun predictsRealMotion(rawPredictedVelocityMps: Float): Boolean =
+        rawPredictedVelocityMps >= minCruisingSpeedMps
 }

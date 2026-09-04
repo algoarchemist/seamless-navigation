@@ -142,16 +142,31 @@ private class CurrentPositionOverlay : Overlay() {
     /**
      * Screen-space clockwise-degrees rotation to draw the directional
      * arrow marker at, or null to fall back to the plain (non-directional)
-     * dot. This is NOT the same number as device heading — it's already
-     * had the map's own current rotation (`MapView.setMapOrientation`)
-     * subtracted out by the caller (see StreetMapView's `update` block,
-     * where it's computed), because osmdroid pre-rotates the canvas this
-     * `draw()` receives by that same amount before invoking any overlay
-     * (CLAUDE.md Rule 14 — stating the frame at the boundary): drawing the
-     * arrow at the raw device heading on an ALREADY-rotated canvas would
-     * double-apply the map's rotation. UNVERIFIED ON A REAL DEVICE
-     * (CLAUDE.md Rule 13), same caveat StreetMapView's own headingDeg
-     * param already carries for the map-rotation half of this.
+     * dot. This IS the raw real-world heading (device/travel bearing,
+     * degrees clockwise from north) — NOT map-orientation-adjusted.
+     *
+     * REAL BUG FIX (2026-09-04, bugs.jpeg code review): this used to have
+     * the map's own current rotation (`mapOrientationDeg`) SUBTRACTED out
+     * by the caller before being set here, on the theory that osmdroid
+     * pre-rotates the canvas this `draw()` receives, so drawing at the raw
+     * heading would "double-apply" the map's rotation. That reasoning had
+     * the composition backwards: `draw()`'s own `canvas.rotate(rotationDeg,
+     * ...)` call composes ADDITIVELY with the canvas's existing
+     * pre-rotation — the final on-screen angle is `mapOrientationDeg +
+     * rotationDeg`, not `rotationDeg` alone. Subtracting `mapOrientationDeg`
+     * from the input therefore always cancelled it back out, making the
+     * final on-screen rotation equal the raw heading UNCONDITIONALLY,
+     * regardless of the map's own orientation — correct only by
+     * coincidence when the map is north-up (`mapOrientationDeg == 0`), but
+     * wrong during heading-up navigation: the arrow displayed at the raw
+     * compass heading instead of at the heading RELATIVE to the map's
+     * current forward direction, so it could point sideways/backward while
+     * the vehicle drove straight in the direction the map was oriented
+     * for. Passing the raw heading straight through here (no subtraction)
+     * gives the correct total in both modes: 0 (straight up) when the
+     * device heading matches the map's own heading-up orientation, and the
+     * raw heading itself when the map is north-up (`mapOrientationDeg ==
+     * 0`, so the two formulas coincide).
      */
     var iconRotationDeg: Float? = null
 
@@ -439,14 +454,16 @@ fun StreetMapView(
             // the old per-tick call used, just now fed a smoothed value.
             val mapOrientationDeg = -smoothedHeadingDeg
             mapView.setMapOrientation(mapOrientationDeg)
-            // Subtract the map's own rotation back out so the directional
-            // arrow always points at the REAL travel direction on screen —
-            // see CurrentPositionOverlay.iconRotationDeg's own doc for why
-            // this subtraction is needed (osmdroid pre-rotates the canvas
-            // this overlay draws into by mapOrientationDeg). UNVERIFIED ON
-            // A REAL DEVICE (CLAUDE.md Rule 13), same caveat as the map's
-            // own rotation direction above.
-            overlay.iconRotationDeg = targetMarkerHeadingDeg.value?.let { it - mapOrientationDeg }
+            // Pass the raw heading straight through — do NOT subtract
+            // mapOrientationDeg here. See CurrentPositionOverlay
+            // .iconRotationDeg's own doc for the real bug this fixes
+            // (2026-09-04, bugs.jpeg): osmdroid's canvas pre-rotation and
+            // this overlay's own canvas.rotate() compose ADDITIVELY, so
+            // subtracting mapOrientationDeg here always cancelled it back
+            // out and made the arrow ignore the map's own orientation
+            // entirely. UNVERIFIED ON A REAL DEVICE (CLAUDE.md Rule 13),
+            // same caveat as the map's own rotation direction above.
+            overlay.iconRotationDeg = targetMarkerHeadingDeg.value
             mapView.invalidate()
         }
     }

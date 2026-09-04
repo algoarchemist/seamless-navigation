@@ -1,7 +1,9 @@
 package com.sih26168.idr.alignment
 
 import android.util.Log
+import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeRepository
+import com.sih26168.idr.gnss.GnssQuality
 import com.sih26168.idr.motion.PhoneMovedDetector
 import com.sih26168.idr.sensors.SensorRepository
 import kotlinx.coroutines.CoroutineScope
@@ -88,7 +90,38 @@ class AlignmentRepository(
         collectJob = scope.launch {
             sensorRepository.state.collect { sensorUiState ->
                 val orientation = sensorUiState.latestOrientation ?: return@collect
-                val fix = gnssModeRepository.state.value.latestFix
+                // REAL BUG FIX (2026-09-04, bugs.jpeg code review): this
+                // used to read gnssModeRepository.state.value.latestFix
+                // unconditionally — unlike every other GNSS-fix consumer in
+                // this codebase (dr/BaselineDeadReckoningRepository.kt's
+                // gnssSpeedForClassifier, ml/MlVelocityRepository.kt's own
+                // copy, ui/screens/StatusOverlayContent.kt's
+                // estimateSpeedMps()), which all gate on mode ==
+                // GNSS_AIDED/REACQUISITION + GnssQuality.isGood() before
+                // trusting a fix. Without that gate, a STALE fix from
+                // before a GNSS outage began (mode/quality having since
+                // moved on) kept being read every tick during the outage —
+                // AlignmentEstimator.evaluate() below compares this
+                // (possibly stale) gnssBearingDeg against the LIVE, still-
+                // updating device azimuth every tick, so a frozen bearing
+                // could keep contributing new (wrong) samples to the yaw
+                // circular mean for as long as the frozen gnssSpeedMps
+                // still happened to clear the >=5m/s straight-line gate —
+                // silently poisoning the device-to-vehicle heading
+                // calibration during exactly the outages where a correct
+                // heading matters most. Gated the same way every other
+                // consumer already is.
+                val gnssState = gnssModeRepository.state.value
+                val latestFix = gnssState.latestFix
+                val fix = if (
+                    gnssState.mode == GnssMode.GNSS_AIDED &&
+                    latestFix != null &&
+                    GnssQuality.isGood(gnssState.fixAgeMs, latestFix.accuracyM)
+                ) {
+                    latestFix
+                } else {
+                    null
+                }
                 // Boot-time ms (not wall-clock) — same relative-duration-only
                 // clock convention dr/StationaryDetector.kt's own caller
                 // already uses (CLAUDE.md Rule 9/14).

@@ -1846,6 +1846,20 @@ Outputs: AlignmentUiState(yawOffsetRad, sampleCount, isAligned,
   isPitchRollAligned, reducedConfidenceDueToRoll) — same fields
   AlignmentEstimate now has (the last five added 2026-09-02), republished
   as this repository's own StateFlow.
+REAL BUG FIX (2026-09-04, bugs.jpeg code review): used to read
+  gnssModeRepository.state.value.latestFix unconditionally — unlike
+  every other GNSS-fix consumer in this codebase (all gate on mode ==
+  GNSS_AIDED/REACQUISITION + GnssQuality.isGood()). A stale fix from
+  before an outage began kept feeding AlignmentEstimator.evaluate()'s
+  gnssBearingDeg/gnssSpeedMps every tick during the outage — since that
+  bearing is compared against the LIVE, still-updating device azimuth
+  each tick, a frozen bearing could keep contributing new (wrong)
+  samples to the yaw circular mean for as long as the frozen
+  gnssSpeedMps still cleared the >=5m/s straight-line gate, silently
+  poisoning the heading calibration during exactly the outages where a
+  correct heading matters most. Now gated the same way every other
+  consumer already is (mode == GNSS_AIDED && GnssQuality.isGood()) —
+  fix is null (not the stale value) otherwise.
 Connected to: SensorRepository, GnssModeRepository -> AlignmentRepository ->
   dr/BaselineDeadReckoningRepository (vehicle-heading correction for
   NonHolonomicConstraint) AND ml/MlVelocityRepository (unchanged feature-
@@ -2433,12 +2447,27 @@ Important functions/classes: update() (per-mode logic, mirrors
   10 deg would produce a -340-degree spin the LONG way around instead of
   the correct +20-degree short way; directly unit-tested for this exact
   case (HeadingFusionTest's wrap-boundary test).
+REAL BUG FIX (2026-09-04, bugs.jpeg code review): reacquisitionBlendMs
+  used to be a constructor-only `val`, permanently fixed at
+  PositionFusion.DEFAULT_REACQUISITION_BLEND_MS — but
+  fusion/StateEstimator.kt calls PositionFusion.setReacquisitionBlendMs
+  with an ADAPTIVE, per-outage duration (500-3000ms, from
+  PositionFusion.blendDurationForDriftMs's ML-predicted-drift formula)
+  and never told this class. On a high-predicted-drift reacquisition,
+  position blended smoothly over the full adaptive window while heading
+  kept finishing at the old fixed default, producing a visible desync
+  (map heading already showing the new true heading while the position
+  marker was still gliding in). Added setReacquisitionBlendMs (same
+  calling convention as PositionFusion's), called from the SAME
+  StateEstimator site with the SAME computed duration so both blends
+  finish together.
 Connected to: fusion/StateEstimator -> HeadingFusion -> FusedPositionUiState.fusedHeadingDeg
   -> ui/screens/MapScreen.kt (StreetMapView's headingDeg param)
 Unit tests: tests/.../fusion/HeadingFusionTest.kt — per-mode behavior
   mirrors PositionFusionTest's coverage (freeze/passthrough/blend/
-  reset), plus a dedicated 350deg->10deg wrap-boundary case verifying
-  the short-way interpolation.
+  reset), a dedicated 350deg->10deg wrap-boundary case verifying the
+  short-way interpolation, plus (2026-09-04) setReacquisitionBlendMs
+  changes convergence speed and reset() restores the default.
 
 fusion/RunningStats.kt
 Status: IMPLEMENTED (2026-08-30)
@@ -2629,9 +2658,10 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   The road-geometry-to-local-meters projection is cached against the
   anchor it was computed with, and only re-projected when the route or
   the anchor changes, not every ~10Hz tick. Only attempted while
-  gnssState.mode != GNSS_AIDED (a real GPS fix needs no road-snap
-  "correction"), an anchor + active route exist, and DR speed is above
-  0.5 m/s (below that, the physics-velocity-vector heading used for the
+  gnssState.mode is DEAD_RECKONING or REACQUISITION (see the 2026-09-04
+  UPDATE below for why TRANSITION is deliberately excluded — a real GPS
+  fix needs no road-snap "correction" either), an anchor + active route
+  exist, and DR speed is above 0.5 m/s (below that, the physics-velocity-vector heading used for the
   compatibility check is noise, not signal — same floor
   ui/screens/MapScreen.kt's own heading-up map rotation fallback
   already uses). `FusedPositionUiState.roadSnapped`/`distanceToRoadM`
@@ -2706,6 +2736,41 @@ Purpose: The Android/coroutine glue that turns PositionFusion's pure
   fix's own Doppler speedMps/bearingDeg (converted to East/North the same
   way ml/MlPositionIntegrator.kt does) instead of the physics velocity —
   see fusion/GnssJitterFilter.kt's own UPDATE note for the full reasoning.
+  UPDATE (2026-09-04, REAL BUG FIX, bugs.jpeg code review — road-snap
+  heading/position mismatch): the road-snap block above used to run
+  whenever `mode != GNSS_AIDED`, which ALSO includes TRANSITION — but
+  PositionFusion's TRANSITION branch freezes `fused.eastM/northM` at
+  whatever the DR position was the instant TRANSITION was entered, while
+  the heading fed into `MapConstraint.snapToRoad` comes from LIVE,
+  continuously-updating physics velocity, unrelated to the frozen
+  position. Feeding a frozen point + a jittering heading into the
+  heading-compatibility check could pick a DIFFERENT nearby road segment
+  tick to tick even though the (frozen) position never actually moved —
+  a visible snap flip during the one window meant to hold the display
+  stable. Restricted to DEAD_RECKONING/REACQUISITION, where the fused
+  position is actually live; TRANSITION now skips road-snap entirely.
+  UPDATE (2026-09-04, REAL BUG FIX, bugs.jpeg code review — silent
+  position freeze on ordinary quality dips): the jitter-smoothing block
+  (2026-09-02 UPDATE above) used to run INSIDE the same strict
+  `mode == GNSS_AIDED && GnssQuality.isGood()` branch as the outage-
+  anchor update. That meant a momentary quality dip (tree cover, a brief
+  urban-canyon reflection) not sustained long enough to trip
+  GnssOutageDetector's own outageEnterDwellMs (2s) hysteresis silently
+  froze the DISPLAYED position at the last good anchor for up to that
+  same 2s, with gnssState.mode still reporting GNSS_AIDED throughout —
+  no visible indication anything had stalled. GnssJitterFilter already
+  degrades gracefully via GnssQuality.confidenceWeight (a marginal fix
+  pulls the prediction only slightly, not a hard on/off), so gating it
+  on the same strict isGood() bar as the anchor update wasn't needed.
+  Anchor/tripOrigin establishment stays STRICTLY isGood()-gated
+  (unchanged, preserves the 2026-08-26 drift-measurement-anchor fix) —
+  the jitter-smoothing CONTINUATION now runs in its own block whenever
+  mode == GNSS_AIDED regardless of THIS tick's own fix quality, using
+  whatever anchor/tripOrigin the strict branch has most recently
+  established, and is now expressed relative to the CURRENT anchor
+  (reprojected via GeoProjection.toLocalMeters each tick) rather than
+  assuming the anchor equals this tick's own raw fix — that assumption
+  only held when isGood() had also just passed the same tick.
 Connected to: GnssModeRepository, BaselineDeadReckoningRepository,
   MlVelocityRepository -> StateEstimator -> MainActivity (Compose UI);
   fusion/DriftSummary -> StateEstimator.driftSummary -> ui/components/DriftSummaryCard (Slice 8);
@@ -2758,10 +2823,25 @@ Important functions/classes: classify() — physicallyStill=false -> both
   false; physicallyStill=true and rawPredictedVelocityMps below
   minCruisingSpeedMps (default 1.0 m/s, engineering default, unvalidated
   per CLAUDE.md Rule 13) -> isStationary; at/above the threshold ->
-  isCruising (ZUPT override).
+  isCruising (ZUPT override). predictsRealMotion() (added 2026-09-04,
+  bugs.jpeg code review) — the SAME threshold check, WITHOUT classify()'s
+  physicallyStill gate. REAL BUG FIX this exists for: MlVelocityRepository's
+  ZUPT gate used to check `!motionClassification.isCruising`, but
+  classify() forces isCruising FALSE whenever physicallyStill is false —
+  exactly the case for motion/StopEventClassifier.kt's SUDDEN_STOP/
+  HARDWARE_CONFIRMED_IDLE fast paths (they exist specifically for stops
+  the accel/gyro dwell check does NOT confirm). So the "don't ZUPT if the
+  raw model still predicts real speed" override could never fire in
+  exactly the two contexts StopEventClassifier was built to widen ZUPT
+  into — reopening the false-ZUPT bug class that class itself was built
+  to fix. predictsRealMotion() restores that check independent of dwell
+  confirmation; classify()'s own contract (and the published UI isCruising
+  field) is untouched.
 Connected to: ml/MlVelocityRepository -> MotionStateClassifier -> ml/MlPositionIntegrator
   (ML-side ONLY — see MlVelocityRepository's entry for why the physics
-  baseline deliberately does NOT get this signal, CLAUDE.md Rule 3)
+  baseline deliberately does NOT get this signal, CLAUDE.md Rule 3);
+  ml/MlVelocityRepository's ZUPT gate now also calls
+  MotionStateClassifier.predictsRealMotion() directly (2026-09-04)
 
 motion/PotholeShockDetector.kt
 Status: IMPLEMENTED (2026-08-25)
@@ -3288,7 +3368,10 @@ UPDATE (STATUS_AND_ROADMAP.md Tier-1 item #1): a `markerHeadingDeg:
   loop just applied, not a value computed synchronously in `update`,
   since the map's actual on-screen rotation lags the raw target by
   design. UNVERIFIED ON A REAL DEVICE (CLAUDE.md Rule 13), same caveat
-  the pre-existing map-rotation `headingDeg` param already carried.
+  the pre-existing map-rotation `headingDeg` param already carried. SEE
+  THE 2026-09-04 UPDATE BELOW: the `markerHeadingDeg - mapOrientationDeg`
+  subtraction described in this paragraph was itself a real bug, since
+  corrected — kept here unedited as the original (superseded) reasoning.
 UPDATE (Round 2, 2026-08-28, user report: "glitchy buffer... large pixel
   tiles of some random places" after pressing Go, needing a manual
   recenter tap to fix): REAL BUG — the `LaunchedEffect(routeGeometry)`
@@ -3323,6 +3406,30 @@ MERGE NOTE (2026-08-30): the two Round 2 branches independently built
   folded in; running both would have left two writers fighting over
   `overlay.position` every frame. The tween's `LaunchedEffect` and the
   now-unused `MARKER_ANIMATION_DURATION_MS` constant were deleted.
+UPDATE (2026-09-04, REAL BUG FIX, bugs.jpeg code review): the marker
+  rotation formula (`markerHeadingDeg - mapOrientationDeg`, described in
+  the STATUS_AND_ROADMAP.md Tier-1 item #1 UPDATE above) had the canvas-
+  rotation composition backwards. osmdroid pre-rotates the canvas
+  `CurrentPositionOverlay.draw()` receives by `mapOrientationDeg`, and
+  that overlay's own `canvas.rotate(rotationDeg, ...)` call composes
+  ADDITIVELY with it — final on-screen angle is `mapOrientationDeg +
+  rotationDeg`, not `rotationDeg` alone. Subtracting `mapOrientationDeg`
+  from the input therefore always cancelled it back out, making the
+  final on-screen rotation equal the raw heading UNCONDITIONALLY — correct
+  only by coincidence when the map is north-up (`mapOrientationDeg == 0`,
+  MapScreen's idle/non-navigating state), wrong during heading-up
+  navigation: the arrow displayed at the raw compass heading instead of
+  the heading RELATIVE to the map's current forward direction, so it
+  could point sideways/backward while the vehicle drove straight in the
+  direction the map was oriented for. Fixed by passing the raw heading
+  straight through with no subtraction (`overlay.iconRotationDeg =
+  targetMarkerHeadingDeg.value`) — gives the correct total in both
+  modes: 0 (straight up) when device heading matches the map's own
+  heading-up orientation, and the raw heading itself when the map is
+  north-up (the two formulas coincide there). STILL UNVERIFIED ON A REAL
+  DEVICE (CLAUDE.md Rule 13) — this was found via geometric analysis of
+  the canvas-rotation composition, not an on-device test; a live
+  heading-up-navigation screenshot/video is still needed to confirm.
 Connected to: ui/screens/MapScreen.kt (currentLatDeg/currentLonDeg,
   headingDeg, markerHeadingDeg) -> StreetMapView -> CurrentPositionOverlay;
   ui/map/PositionSmoother -> StreetMapView.kt
@@ -3487,6 +3594,23 @@ REAL CRASH FOUND + FIXED (2026-08-29, user report: "if i start the
   computing the same route succeeds end-to-end (ActiveRouteCard renders
   a real distance/duration/steps) with the process still alive and the
   crash buffer empty.
+UPDATE (2026-09-04, REAL BUG FIX, bugs.jpeg code review — jitter-filtered
+  position never reaching the map): the currentLatDeg/currentLonDeg
+  `remember` block used to prefer the RAW GNSS fix over the
+  anchor+fusedEastM/fusedNorthM projection while GNSS_AIDED, reasoning
+  ("most accurate, no projection error") that predates
+  fusion/GnssJitterFilter.kt (added 2026-09-02, PRD.md Section 17's
+  "smooth short GNSS gaps/jitter"). Since then, fusedEastM/fusedNorthM
+  while GNSS_AIDED IS the jitter-SMOOTHED position — computed relative to
+  the SAME anchor this screen already projects against for every other
+  mode, so no frame mismatch — but this screen kept reading the raw fix
+  directly, meaning the jitter filter's entire correction was computed
+  and unit-tested correctly but never actually reached the rendered map;
+  the marker still jittered with every raw fix exactly as before that
+  feature was built. Now prefers the anchor+fused projection whenever an
+  anchor exists (true on essentially every GNSS_AIDED tick), falling
+  back to the raw fix only in the brief window before any anchor has
+  ever been established this run.
 Connected to: routing/GeocodingRepository, routing/RoutingRepository,
   routing/OfflineRouteCache, fusion/GeoProjection, ui/screens/SearchScreen
   (new, opened on demand) -> ui/components/ActiveRouteCard/

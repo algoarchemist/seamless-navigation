@@ -85,6 +85,35 @@ class HeadingFusionTest {
     }
 
     @Test
+    fun `setReacquisitionBlendMs changes how fast REACQUISITION converges`() {
+        // Regression test for bugs.jpeg's HeadingFusion.kt finding: this
+        // capability didn't exist at all before the fix, so heading always
+        // finished blending at the fixed 1000ms default even when
+        // PositionFusion's own blend had been set much longer, desyncing
+        // the two on a high-predicted-drift reacquisition.
+        val fusion = HeadingFusion()
+        fusion.setReacquisitionBlendMs(2000L)
+        fusion.update(0L, GnssMode.REACQUISITION, drHeadingDeg = 350f, newFixHeadingDeg = 10f)
+        // At the OLD 1000ms default this would already be fully converged
+        // to 10deg; at the new 2000ms blend, t=1000ms is only the midpoint
+        // of the short +20deg arc (350 -> 360/0 -> 10), i.e. 0deg.
+        val midpoint = fusion.update(1000L, GnssMode.REACQUISITION, drHeadingDeg = 350f, newFixHeadingDeg = 10f)
+        val normalized = if (midpoint > 180f) midpoint - 360f else midpoint
+        assertEquals(0f, normalized, 1f)
+    }
+
+    @Test
+    fun `reset restores the default reacquisition blend duration`() {
+        val fusion = HeadingFusion()
+        fusion.setReacquisitionBlendMs(3000L)
+        fusion.reset()
+        fusion.update(0L, GnssMode.REACQUISITION, drHeadingDeg = 10f, newFixHeadingDeg = 90f)
+        // Back to the 1000ms default -- fully converged by t=1000ms.
+        val atOneSecond = fusion.update(1000L, GnssMode.REACQUISITION, drHeadingDeg = 10f, newFixHeadingDeg = 90f)
+        assertEquals(90f, atOneSecond, 0.01f)
+    }
+
+    @Test
     fun `reset clears mode tracking so the next mode change re-anchors correctly`() {
         val fusion = HeadingFusion()
         fusion.update(0L, GnssMode.TRANSITION, drHeadingDeg = 45f, newFixHeadingDeg = null)

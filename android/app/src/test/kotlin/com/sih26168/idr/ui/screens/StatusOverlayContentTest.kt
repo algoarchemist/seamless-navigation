@@ -23,13 +23,37 @@ class StatusOverlayContentTest {
 
     @Test
     fun `GNSS_AIDED speed is trusted when it agrees the phone is moving`() {
+        // REAL BUG FIX (2026-09-04, bugs.jpeg code review): estimateSpeedMps
+        // now requires GnssQuality.isGood() for the GNSS_AIDED branch too
+        // (previously only required for REACQUISITION) -- fixAgeMs must be
+        // real/fresh, not GnssModeUiState's Long.MAX_VALUE "no fix age
+        // known" default, or this fix is correctly no longer trusted.
         val speed = estimateSpeedMps(
             drState = DeadReckoningState(velocityEastMps = 2.0, velocityNorthMps = 0.0),
             mlState = MlVelocityUiState(),
-            gnssState = GnssModeUiState(mode = GnssMode.GNSS_AIDED, latestFix = fix(speedMps = 2.1f)),
+            gnssState = GnssModeUiState(mode = GnssMode.GNSS_AIDED, latestFix = fix(speedMps = 2.1f), fixAgeMs = 100L),
             fusedState = FusedPositionUiState(),
         )
         assertEquals(2.1f, speed)
+    }
+
+    @Test
+    fun `GNSS_AIDED speed is NOT trusted when the fix is stale, even mid-hysteresis-window`() {
+        // REAL BUG FIX (2026-09-04, bugs.jpeg code review): mode stays
+        // GNSS_AIDED for up to outageEnterDwellMs (2s) after quality
+        // actually degrades (CLAUDE.md Rule 16 hysteresis) -- this used to
+        // trust gnssSpeed unconditionally whenever mode == GNSS_AIDED,
+        // disagreeing with dr/BaselineDeadReckoningRepository.kt's and
+        // ml/MlVelocityRepository.kt's own gating, which both already
+        // required isGood(). A stale fixAgeMs must fall through to the
+        // physics/ML speed instead, matching those two call sites.
+        val speed = estimateSpeedMps(
+            drState = DeadReckoningState(velocityEastMps = 0.0, velocityNorthMps = 0.0),
+            mlState = MlVelocityUiState(),
+            gnssState = GnssModeUiState(mode = GnssMode.GNSS_AIDED, latestFix = fix(speedMps = 12.0f), fixAgeMs = 9_000L),
+            fusedState = FusedPositionUiState(),
+        )
+        assertEquals(0f, speed)
     }
 
     @Test

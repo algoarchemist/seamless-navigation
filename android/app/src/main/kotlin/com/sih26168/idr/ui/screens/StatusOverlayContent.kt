@@ -338,12 +338,23 @@ internal fun estimateSpeedMps(
     // REACQUISITION, gated on GnssQuality.isGood() the same way the other
     // two fixed call sites are (REACQUISITION alone doesn't guarantee THIS
     // tick's fix is good, only that it recently has been).
+    //
+    // REAL BUG FIX (2026-09-04, bugs.jpeg code review): the isGood() gate
+    // above was only ever applied to the REACQUISITION branch — the
+    // GNSS_AIDED branch trusted gnssSpeed unconditionally, off mode alone.
+    // dr/BaselineDeadReckoningRepository.kt's gnssSpeedForClassifier and
+    // ml/MlVelocityRepository.kt's own copy both require isGood() for
+    // EITHER mode (mode defaults to/stays GNSS_AIDED for up to
+    // outageEnterDwellMs=2000ms after quality actually degrades, per
+    // CLAUDE.md Rule 16 hysteresis — see fusion/StateEstimator.kt's own
+    // 2026-08-26 note on this exact pitfall) — so this debug/status
+    // overlay could show a trusted speed for up to 2s that the app's own
+    // DR/ZUPT gating was already correctly rejecting. Now requires
+    // isGood() for both modes, matching the other two call sites exactly.
     val gnssAccuracyM = gnssState.latestFix?.accuracyM
     val gnssSpeedTrustedThisTick = gnssSpeed != null &&
-        (
-            gnssState.mode == GnssMode.GNSS_AIDED ||
-                (gnssState.mode == GnssMode.REACQUISITION && GnssQuality.isGood(gnssState.fixAgeMs, gnssAccuracyM))
-            )
+        (gnssState.mode == GnssMode.GNSS_AIDED || gnssState.mode == GnssMode.REACQUISITION) &&
+        GnssQuality.isGood(gnssState.fixAgeMs, gnssAccuracyM)
     return when {
         gnssSpeedTrustedThisTick && gnssSpeed != null && !gnssSpeedContradictsStationaryPhysics ->
             gnssSpeed

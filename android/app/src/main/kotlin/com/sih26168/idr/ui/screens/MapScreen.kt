@@ -140,6 +140,25 @@ fun MapScreen(
     // snapshots it from drEastM/drNorthM and the newly-reacquired GNSS fix
     // BEFORE PositionFusion.update()/MapConstraint ever run that tick —
     // see StateEstimator.kt's own doc.
+    //
+    // REAL BUG FOUND AND FIXED (2026-09-04, bugs.jpeg code review): while
+    // GNSS_AIDED, this used to prefer the RAW fix (fix.latitudeDeg/
+    // longitudeDeg) over the anchor+fusedEastM/fusedNorthM projection,
+    // reasoning that the raw fix was "most accurate, no projection error."
+    // That was true before fusion/GnssJitterFilter.kt existed (added
+    // 2026-09-02, PRD.md Section 17's "smooth short GNSS gaps/jitter") —
+    // since then, fusedEastM/fusedNorthM while GNSS_AIDED IS the
+    // jitter-SMOOTHED position (see StateEstimator's own doc: the offset
+    // is computed relative to THIS SAME anchor, so the projection below is
+    // safe — no frame mismatch), but this screen kept reading the raw fix
+    // directly, meaning the jitter filter's entire correction was computed
+    // and unit-tested correctly but never actually reached the rendered
+    // map — the marker still jittered with every raw fix exactly as
+    // before that feature was built. Now prefers the anchor+fused
+    // projection whenever an anchor exists (true on essentially every
+    // GNSS_AIDED tick — see StateEstimator's anchor-update branch), falling
+    // back to the raw fix ONLY in the brief window before any anchor has
+    // ever been established this run (no fused position to project yet).
     val (currentLatDeg, currentLonDeg) = remember(
         gnssState.mode,
         gnssState.latestFix,
@@ -152,7 +171,6 @@ fun MapScreen(
         val anchorLat = fusedState.anchorLatDeg
         val anchorLon = fusedState.anchorLonDeg
         when {
-            gnssState.mode == GnssMode.GNSS_AIDED && fix != null -> fix.latitudeDeg to fix.longitudeDeg
             anchorLat != null && anchorLon != null -> {
                 GeoProjection.toLatLon(
                     eastM = fusedState.fusedEastM,
@@ -161,6 +179,7 @@ fun MapScreen(
                     refLonDeg = anchorLon,
                 )
             }
+            gnssState.mode == GnssMode.GNSS_AIDED && fix != null -> fix.latitudeDeg to fix.longitudeDeg
             else -> null to null
         }
     }

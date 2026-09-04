@@ -49,4 +49,26 @@ class MotionStateClassifierTest {
         assertTrue(result.isStationary)
         assertFalse(result.isCruising)
     }
+
+    @Test
+    fun `predictsRealMotion ignores dwell confirmation entirely, unlike classify`() {
+        // Regression test for bugs.jpeg's ml/MlVelocityRepository.kt
+        // finding: classify(physicallyStill = false, ...) always returns
+        // isCruising = false regardless of the raw prediction (see the
+        // test above) -- predictsRealMotion must NOT share that gate, since
+        // it exists specifically for callers whose ZUPT decision can
+        // already be true from a fast path that never confirmed
+        // "physically still" (StopEventClassifier's SUDDEN_STOP/
+        // HARDWARE_CONFIRMED_IDLE).
+        val classifier = MotionStateClassifier(minCruisingSpeedMps = 1.0f)
+        assertTrue(classifier.predictsRealMotion(5.0f))
+        assertFalse(classifier.predictsRealMotion(0.2f))
+    }
+
+    @Test
+    fun `predictsRealMotion uses the same boundary as classify`() {
+        val classifier = MotionStateClassifier(minCruisingSpeedMps = 1.0f)
+        assertTrue(classifier.predictsRealMotion(1.0f))
+        assertFalse(classifier.predictsRealMotion(0.999f))
+    }
 }

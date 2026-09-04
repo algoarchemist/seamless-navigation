@@ -404,12 +404,27 @@ class MlVelocityRepository(
 
                 // The actual ZUPT gate: StopEventClassifier's context-aware
                 // decision (catches real post-motion stops the old
-                // accel/gyro-only signal missed), still overridable by
-                // MotionStateClassifier's existing cruising signal (the raw
-                // model still predicts real speed despite a quiet/near-zero
-                // reading) — preserves that existing protective behavior
-                // exactly as before.
-                val shouldZupt = classification.shouldApplyZupt && !motionClassification.isCruising
+                // accel/gyro-only signal missed), still overridable
+                // whenever the raw model still predicts real speed despite
+                // a quiet/near-zero reading.
+                //
+                // REAL BUG FIX (2026-09-04, bugs.jpeg code review): this
+                // used to check `!motionClassification.isCruising` — but
+                // MotionStateClassifier.classify() forces isCruising FALSE
+                // whenever dwellConfirmedStationary is false, which is
+                // exactly the case for StopEventClassifier's SUDDEN_STOP/
+                // HARDWARE_CONFIRMED_IDLE fast paths (they exist specifically
+                // for stops the accel/gyro dwell check does NOT confirm).
+                // So the override could never fire in exactly the contexts
+                // it exists to protect, reopening the false-ZUPT bug class
+                // StopEventClassifier itself was built to fix. Using
+                // predictsRealMotion() here checks the SAME raw-model
+                // threshold unconditionally, independent of dwell
+                // confirmation — motionClassification.isCruising (still
+                // computed above) is untouched and keeps its original
+                // meaning for the published UI state below.
+                val shouldZupt = classification.shouldApplyZupt &&
+                    !motionStateClassifier.predictsRealMotion(rawPredictedVelocityMps)
 
                 val positionState = positionIntegrator.update(
                     dtSeconds = dtSeconds,
