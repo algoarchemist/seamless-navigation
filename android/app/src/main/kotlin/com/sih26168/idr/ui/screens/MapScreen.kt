@@ -246,6 +246,32 @@ fun MapScreen(
         }
     }
 
+    // REAL BUG FOUND on-device (2026-09-04/05, user report: "entered
+    // indoors and another current location arrow was duplicated, one
+    // stationary and one moving"): the comment at this screen's
+    // ActiveGuidanceScreen call site below claims StreetMapView's own
+    // MapView "keeps running underneath, unseen" once the full-screen
+    // guidance overlay is showing — true for ordinary Compose content,
+    // but FALSE for two live Mapbox MapViews stacked in the same tree.
+    // Each MapView owns its own GPU-composited surface (TextureView/
+    // SurfaceView), and those don't reliably respect Compose's z-order —
+    // both can render simultaneously. StreetMapView's marker keeps
+    // tracking this app's own DR-fused position (still moving indoors),
+    // while ActiveGuidanceScreen's separate Mapbox-SDK location puck
+    // tracks raw/enhanced GPS (frozen the moment GNSS is lost indoors) —
+    // exactly the "one stationary, one moving" duplicate the user saw.
+    // Fix: actually hide the underlying MapView (Android View visibility,
+    // not Compose composition) while the overlay is up, rather than
+    // relying on draw order — state (camera position, annotations) is
+    // preserved since the MapView itself is never disposed.
+    LaunchedEffect(isNavigating, isFreeDriving, mapViewRef) {
+        mapViewRef?.visibility = if (isNavigating || isFreeDriving) {
+            android.view.View.GONE
+        } else {
+            android.view.View.VISIBLE
+        }
+    }
+
     // Back from the full-page search screen returns to the map, same
     // priority convention MainActivity's own BackHandler already uses for
     // tab switching — this one is added later/deeper in the composition so
@@ -518,8 +544,13 @@ fun MapScreen(
         // 2026-09-05 amendment) — drawn LAST so it covers the entire screen,
         // same "full-page replacement, not a layered dropdown" pattern
         // showSearchScreen above already uses. Its own MapView, separate
-        // from ui/map/StreetMapView.kt above (which keeps running
-        // underneath, unseen, so state isn't lost when this overlay closes).
+        // from ui/map/StreetMapView.kt above, which keeps RUNNING
+        // underneath (so its state isn't lost when this overlay closes)
+        // but is explicitly hidden (View.GONE, see the visibility
+        // LaunchedEffect above) — two live Mapbox MapViews stacked in the
+        // same tree both render regardless of Compose z-order, which
+        // caused a real duplicate-marker bug; see that LaunchedEffect's
+        // doc for the full on-device finding.
         if (isNavigating || isFreeDriving) {
             ActiveGuidanceScreen(
                 isFreeDrive = isFreeDriving,

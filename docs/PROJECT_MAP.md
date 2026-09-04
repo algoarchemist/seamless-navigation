@@ -3432,6 +3432,29 @@ UPDATE (2026-09-05, PRD.md Section 7 amendment, Mapbox Navigation SDK,
   driving the ETA text in `ActiveGuidanceScreen.kt`) is GNSS-only, same
   as any standard nav app. The route PREVIEW state (before tapping "Go")
   is completely unaffected by any of this.
+REAL BUG FOUND + FIXED (2026-09-04, user report: "the moment I entered
+  indoors another current location arrow was duplicated and was
+  stationary while the other was moving"): the 2026-09-05 update above
+  assumed `ui/map/StreetMapView.kt`'s own `MapView` "keeps running
+  underneath, unseen" once `ActiveGuidanceScreen`'s full-screen overlay
+  is showing — true for ordinary Compose content, but FALSE for two live
+  Mapbox `MapView`s stacked in the same composition tree. Each owns its
+  own GPU-composited surface (TextureView/SurfaceView), and those don't
+  reliably respect Compose's z-order — both were rendering
+  simultaneously. StreetMapView's marker kept tracking this app's own
+  DR-fused position (still moving indoors, GNSS outage or not), while
+  ActiveGuidanceScreen's separate Mapbox-SDK location puck tracks raw/
+  enhanced GPS (frozen the instant GNSS is lost indoors) — exactly the
+  "one stationary, one moving" duplicate reported. Fixed with a
+  `LaunchedEffect(isNavigating, isFreeDriving, mapViewRef)` that sets the
+  underlying `mapViewRef`'s Android View `visibility` to `GONE`/`VISIBLE`
+  directly, rather than relying on Compose draw order — the `MapView`
+  itself is never disposed, so its camera position/annotations survive
+  the overlay opening and closing exactly as the original "keep it
+  running underneath" intent wanted. NOT YET VERIFIED on-device after
+  this specific fix (CLAUDE.md Rule 13) — the original duplicate-marker
+  report was from a real on-device indoor test; this fix needs the same
+  before being called done.
 Connected to: routing/GeocodingRepository, routing/RoutingRepository,
   routing/OfflineRouteCache, fusion/GeoProjection, ui/screens/SearchScreen
   (new, opened on demand) -> ui/components/ActiveRouteCard;
