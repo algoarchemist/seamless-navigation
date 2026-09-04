@@ -56,6 +56,7 @@ import com.sih26168.idr.ui.components.BottomNavBar
 import com.sih26168.idr.ui.components.VehicleMode
 import com.sih26168.idr.ui.screens.HistoryScreen
 import com.sih26168.idr.ui.screens.MapScreen
+import com.sih26168.idr.ui.screens.MapVerificationScreen
 import com.sih26168.idr.ui.theme.IdrTheme
 import java.io.File
 import kotlin.math.sqrt
@@ -202,6 +203,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Mapbox Navigation SDK's Drop-In UI (ui/screens/DropInNavigationScreen.kt,
+    // PRD.md Section 7 2026-09-05 amendment) runs active guidance as a
+    // foreground service with a persistent notification — POST_NOTIFICATIONS
+    // is a runtime (not just manifest) permission on API 33+; without this
+    // request the notification silently never shows, though guidance itself
+    // still works. No-op on API < 33 (the permission doesn't exist there).
+    private val requestNotificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // A real outdoor test drive runs minutes at a time with the phone
@@ -210,6 +221,19 @@ class MainActivity : ComponentActivity() {
         // thing being tested) goes unobserved. Demo/test-only convenience,
         // not a claimed behavior of the shipped navigation logic itself.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Mapbox Navigation SDK setup (PRD.md Section 7 2026-09-05
+        // amendment, developer-requested) — MapboxNavigationApp is a
+        // process-wide singleton per the SDK's own design (one native
+        // navigator per app), so this runs once here rather than per-screen.
+        // MapboxOptions.accessToken is set explicitly first (not assumed
+        // already set by ui/map/StreetMapView.kt's lazy `remember` block,
+        // which may not have run yet) since MapboxNavigationApp.setup needs
+        // it immediately.
+        com.mapbox.common.MapboxOptions.accessToken = com.sih26168.idr.BuildConfig.MAPBOX_PUBLIC_TOKEN
+        com.mapbox.navigation.core.lifecycle.MapboxNavigationApp
+            .setup(com.mapbox.navigation.base.options.NavigationOptions.Builder(applicationContext).build())
+            .attach(this)
+        com.sih26168.idr.nav.NavigationSessionRepository.initIfNeeded(applicationContext)
         sensorRepository = SensorRepository(applicationContext)
         // Round 2 (2026-08-28 — PRD.md FR12): independent of GNSS/DR
         // entirely (see FloorChangeRepository's doc), so it only needs
@@ -296,10 +320,15 @@ class MainActivity : ComponentActivity() {
             val recState by recordingState.collectAsState()
             val driveLogUiState by driveLogState.collectAsState()
             var showDebugScreen by remember { mutableStateOf(false) }
+            // TEST TOOLING ONLY (CLAUDE.md Android Rule 8 / PRD.md Section
+            // 32) — reachable only from the debug screen below, see
+            // ui/screens/MapVerificationScreen.kt's own header doc.
+            var showMapVerificationScreen by remember { mutableStateOf(false) }
             var selectedTab by remember { mutableStateOf(AppTab.MAP) }
             var isDarkTheme by remember { mutableStateOf(true) }
             var vehicleMode by remember { mutableStateOf<VehicleMode?>(null) }
-            BackHandler(enabled = showDebugScreen) { showDebugScreen = false }
+            BackHandler(enabled = showMapVerificationScreen) { showMapVerificationScreen = false }
+            BackHandler(enabled = showDebugScreen && !showMapVerificationScreen) { showDebugScreen = false }
             // User-reported bug (2026-08-26): with no BackHandler at all on
             // the normal Map/History tabs, the system back button fell
             // straight through to ComponentActivity's default behavior
@@ -327,7 +356,9 @@ class MainActivity : ComponentActivity() {
             }
 
             IdrTheme(darkTheme = isDarkTheme) {
-                if (showDebugScreen) {
+                if (showMapVerificationScreen) {
+                    MapVerificationScreen(onExit = { showMapVerificationScreen = false })
+                } else if (showDebugScreen) {
                     IdrSensorScreen(
                         uiState, drState, gnssState, mlState, fusedState, floorState, mlError, recState,
                         sensorRepository.hasRequiredSensors(),
@@ -340,6 +371,7 @@ class MainActivity : ComponentActivity() {
                         isPhoneMovedActive = isPhoneMovedActive,
                         onMarkPothole = ::markPothole,
                         onTogglePhoneMoved = ::togglePhoneMoved,
+                        onShowMapVerification = { showMapVerificationScreen = true },
                     )
                 } else {
                     // Slice 8b: two tabs (Map/History) share the SAME live
@@ -403,6 +435,9 @@ class MainActivity : ComponentActivity() {
             locationRepository.start()
         } else {
             requestLocationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         // Before deadReckoningRepository/mlVelocityRepository — both read
         // alignmentRepository.state.value synchronously each tick, so it
@@ -618,6 +653,7 @@ private fun IdrSensorScreen(
     isPhoneMovedActive: Boolean,
     onMarkPothole: () -> Unit,
     onTogglePhoneMoved: () -> Unit,
+    onShowMapVerification: () -> Unit,
 ) {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
@@ -671,6 +707,16 @@ private fun IdrSensorScreen(
                 // scripts/analyze_drive_log.py against it.
                 Button(onClick = if (driveLogState.isLogging) onStopDriveLog else onStartDriveLog) {
                     Text(text = if (driveLogState.isLogging) "Stop drive log" else "Start drive log")
+                }
+
+                // TEST TOOLING ONLY (CLAUDE.md Android Rule 8 / PRD.md
+                // Section 32) — opens ui/screens/MapVerificationScreen.kt,
+                // which exercises the Mapbox map (marker, route line,
+                // outage-anchor line, heading-up rotation, follow/recenter)
+                // with simulated data, for verifying it on-device without
+                // waiting on a real GNSS fix or outdoor drive.
+                Button(onClick = onShowMapVerification) {
+                    Text(text = "Verify Mapbox UI (simulated)")
                 }
                 Text(
                     text = if (driveLogState.isLogging) {

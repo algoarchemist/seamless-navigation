@@ -55,7 +55,30 @@ per Round 2's own timebox, not assumed just because more days exist.
    smallest practical stack wins. (Pre-approved Round 2 exception: the
    Google Maps SDK, to replace `osmdroid`/OSM tiles once a GCP
    project/API key exists — already discussed, not yet implemented;
-   `osmdroid` stays in place and fully functional until then.)
+   `osmdroid` stays in place and fully functional until then. **Amended
+   2026-09-04**: Mapbox is now an additional pre-approved alternative for
+   the same `osmdroid` replacement — see `PRD.md` Section 7's dated
+   amendment for the reasoning (OSM-derived basemap geometry stays
+   consistent with the existing OSRM-based routing/map-snap logic, unlike
+   Google's own road graph). **UPDATE, same day**: the actual UI migration
+   has now landed — `ui/map/StreetMapView.kt` renders via the Mapbox Maps
+   SDK, not `osmdroid`. Compiled, full debug APK assembles, and existing
+   unit tests pass, but this has NOT yet been installed/run on a real
+   device (CLAUDE.md Rule 13/"How Claude Should Work" #3 — do not treat a
+   clean build as equivalent to on-device verification).
+   **UPDATE, same session**: now installed and verified on the real S24
+   FE test device. Marker, directional-arrow rotation, route line,
+   destination pin, outage-anchor line, heading-up camera rotation, and
+   follow/recenter all confirmed working, after finding and fixing three
+   real on-device bugs (a style-load race that silently wiped custom
+   layers; marker rotation not compensating for map bearing; an
+   unguarded per-frame camera update fighting the recenter button — see
+   `docs/PROJECT_MAP.md`'s `ui/map/StreetMapView.kt` entry for the full
+   writeup). `:app:testDebugUnitTest` and `:app:assembleDebug` both pass;
+   empty crash buffer on a fresh install. The preserved, unmodified
+   osmdroid+OSRM version still lives in the sibling
+   `C:\projects\26168-osmdroid` folder as a working fallback/comparison,
+   currently the more battle-tested of the two.)
 3. Never replace a simple deterministic solution with ML unless ML
    provides measurable value (a real comparison against the physics
    baseline, not an assumption).

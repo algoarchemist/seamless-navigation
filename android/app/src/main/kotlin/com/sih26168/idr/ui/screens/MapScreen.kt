@@ -39,12 +39,9 @@ import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.ml.MlVelocityUiState
 import com.sih26168.idr.routing.GeocodeResult
 import com.sih26168.idr.routing.OfflineRouteCache
-import com.sih26168.idr.routing.RouteProgress
 import com.sih26168.idr.routing.RouteResult
 import com.sih26168.idr.routing.RoutingRepository
 import com.sih26168.idr.ui.components.ActiveRouteCard
-import com.sih26168.idr.ui.components.NavigationEtaBar
-import com.sih26168.idr.ui.components.NavigationInstructionCard
 import com.sih26168.idr.ui.components.VehicleMode
 import com.sih26168.idr.ui.map.StreetMapView
 import com.sih26168.idr.ui.theme.CtaRed
@@ -53,7 +50,8 @@ import com.sih26168.idr.ui.theme.GlassSurface
 import com.sih26168.idr.ui.theme.TextPrimary
 import com.sih26168.idr.ui.theme.TextSecondary
 import kotlinx.coroutines.launch
-import org.osmdroid.views.MapView
+import com.mapbox.maps.CameraOptions
+import com.mapbox.maps.MapView
 
 /**
  * The REAL street-map screen — real OpenStreetMap tiles
@@ -208,6 +206,10 @@ fun MapScreen(
     // mode, Google Maps-like)": a third state past route-active, entered
     // via ActiveRouteCard's new "Go" button.
     var isNavigating by remember { mutableStateOf(false) }
+    // PRD.md Section 7 2026-09-05 amendment (Mapbox Navigation SDK,
+    // developer-requested): isNavigating=true now means the FULL-SCREEN
+    // ActiveGuidanceScreen overlay is showing (drawn last, below).
+    var isFreeDriving by remember { mutableStateOf(false) }
 
     // Pushes the active route's geometry (or null, once it ends) down to
     // fusion/StateEstimator.kt for road-snapping — see
@@ -216,34 +218,6 @@ fun MapScreen(
     // lower layer stays free of a map-library dependency.
     LaunchedEffect(activeRoute) {
         onActiveRouteGeometryChanged(activeRoute?.geometry?.map { it.latitude to it.longitude })
-    }
-
-    // Live route progress — projects the route geometry into the SAME
-    // local East/North frame fusion/StateEstimator.kt's anchor already
-    // defines, then compares it against the SAME fusedEastM/fusedNorthM
-    // position the rest of the app (including the DRIVE tab) already
-    // falls back to during a GNSS outage. This is what makes "next turn in
-    // X m" keep counting down through an outage using physics/ML dead
-    // reckoning, not just live GNSS. Null whenever there's no route or no
-    // anchor yet (see fusion/StateEstimator.kt's anchor doc) — NavigationBanner
-    // falls back to the route's own static totals in that case.
-    val anchorLat = fusedState.anchorLatDeg
-    val anchorLon = fusedState.anchorLonDeg
-    val routeProgress = remember(activeRoute, anchorLat, anchorLon, fusedState.fusedEastM, fusedState.fusedNorthM) {
-        val route = activeRoute
-        if (route == null || anchorLat == null || anchorLon == null) {
-            null
-        } else {
-            val routeLocalMeters = route.geometry.map { point ->
-                GeoProjection.toLocalMeters(point.latitude, point.longitude, anchorLat, anchorLon)
-            }
-            RouteProgress.compute(
-                routeLocalMeters = routeLocalMeters,
-                stepDistancesMeters = route.steps.map { it.distanceMeters },
-                currentEastM = fusedState.fusedEastM,
-                currentNorthM = fusedState.fusedNorthM,
-            )
-        }
     }
 
     // Live heading for the navigation screen's "heading-up" map rotation
@@ -268,7 +242,7 @@ fun MapScreen(
     // every tick's animateTo(point) in StreetMapView.kt's update block.
     LaunchedEffect(isNavigating) {
         if (isNavigating) {
-            mapViewRef?.controller?.setZoom(19.0)
+            mapViewRef?.mapboxMap?.setCamera(CameraOptions.Builder().zoom(19.0).build())
         }
     }
 
@@ -359,6 +333,22 @@ fun MapScreen(
                         modifier = Modifier.padding(start = 12.dp),
                     )
                 }
+                // Free-drive mode (PRD.md Section 7 2026-09-05 amendment,
+                // developer-requested): no destination needed — a Mapbox
+                // Navigation SDK trip session with no route set, map-matching
+                // the live position to the road network. Separate from the
+                // existing GNSS/DR pipeline (that keeps running underneath;
+                // this is purely the Mapbox map-matched view layered over it
+                // via the full-screen ActiveGuidanceScreen overlay below).
+                Button(
+                    onClick = {
+                        com.sih26168.idr.nav.NavigationSessionRepository.startFreeDrive()
+                        isFreeDriving = true
+                    },
+                    modifier = Modifier.padding(top = 8.dp),
+                ) {
+                    Text(text = "Free Drive")
+                }
                 if (selectedDestination != null) {
                     Button(
                         onClick = {
@@ -398,17 +388,20 @@ fun MapScreen(
                                     // OfflineRouteCache.prefetchLiveZoomTiles's
                                     // own doc for the data-usage tradeoff
                                     // this was deliberately scoped against).
-                                    // Best-effort: mapViewRef should already
-                                    // be set (the user is looking at the map
-                                    // to have reached this button), but a
-                                    // null skips silently rather than crash —
-                                    // this is an optimization, not a
-                                    // guarantee, same as the function's own
-                                    // silent-failure behavior on a genuine
-                                    // network/cache error.
-                                    mapViewRef?.let { mapView ->
-                                        OfflineRouteCache.prefetchLiveZoomTiles(context, mapView, route.geometry)
-                                    }
+                                    // Mapbox migration (PRD.md Section 7,
+                                    // 2026-09-04): this silent tile-prefetch
+                                    // was built against osmdroid's
+                                    // CacheManager and was ALREADY a
+                                    // permanent no-op there (see
+                                    // OfflineRouteCache.kt's own dated
+                                    // comment on MAPNIK's FLAG_NO_BULK).
+                                    // Mapbox's own offline system
+                                    // (OfflineManager/TileStore) is a
+                                    // genuinely different, separately-scoped
+                                    // feature, not ported in this UI-only
+                                    // migration — dropped here rather than
+                                    // calling a function that can only ever
+                                    // silently fail.
                                 }
                             }
                         },
@@ -421,25 +414,6 @@ fun MapScreen(
                 if (routingError != null) {
                     Text(text = routingError!!, style = MaterialTheme.typography.labelMedium, color = CtaRed)
                 }
-            }
-        } else if (isNavigating) {
-            // Live turn-by-turn — top instruction card, bottom ETA/Exit bar,
-            // same top/bottom split the idle/route-preview states above use.
-            // Same 300dp clearance fix as the idle-state Column above.
-            Column(modifier = Modifier.fillMaxWidth().padding(top = 300.dp, start = 16.dp, end = 16.dp)) {
-                NavigationInstructionCard(route = activeRoute!!, progress = routeProgress)
-            }
-            Box(modifier = Modifier.fillMaxSize().padding(bottom = 24.dp, start = 16.dp, end = 16.dp)) {
-                NavigationEtaBar(
-                    route = activeRoute!!,
-                    progress = routeProgress,
-                    onExit = {
-                        isNavigating = false
-                        activeRoute = null
-                        downloadStatus = null
-                    },
-                    modifier = Modifier.align(Alignment.BottomCenter),
-                )
             }
         } else {
             // REAL BUG FOUND on-device (2026-08-26, testing the "Go" button):
@@ -460,35 +434,58 @@ fun MapScreen(
                 Box(modifier = Modifier.fillMaxSize().padding(bottom = 170.dp, start = 16.dp, end = 16.dp)) {
                     ActiveRouteCard(
                         route = activeRoute!!,
-                        onStartNavigation = { isNavigating = true },
+                        onStartNavigation = {
+                            // Mapbox migration (PRD.md Section 7,
+                            // 2026-09-05 amendment): active guidance needs
+                            // a route from Mapbox's own Directions API (for
+                            // voice/banner/lane instruction text — see
+                            // nav/NavigationSessionRepository.kt's header
+                            // doc), not the OSRM preview route already
+                            // computed above. Requests a NEW route rather
+                            // than reusing activeRoute's OSRM geometry.
+                            val route = activeRoute
+                            val destPoint = route?.geometry?.lastOrNull()
+                            val originLat = routingOriginLatDeg
+                            val originLon = routingOriginLonDeg
+                            if (destPoint == null || originLat == null || originLon == null) {
+                                routingError = "Need a current position and destination to start guidance."
+                                return@ActiveRouteCard
+                            }
+                            downloadStatus = "Requesting turn-by-turn route…"
+                            com.sih26168.idr.nav.NavigationSessionRepository.requestRoute(
+                                originLatDeg = originLat,
+                                originLonDeg = originLon,
+                                destLatDeg = destPoint.latitude,
+                                destLonDeg = destPoint.longitude,
+                                onReady = { routes ->
+                                    downloadStatus = null
+                                    com.sih26168.idr.nav.NavigationSessionRepository.startActiveGuidance(routes)
+                                    isNavigating = true
+                                },
+                                onFailed = {
+                                    downloadStatus = null
+                                    routingError = "Could not start guidance (Mapbox routing request failed)."
+                                },
+                            )
+                        },
                         downloadStatus = downloadStatus,
                         onDownloadOffline = {
-                            val mapView = mapViewRef ?: return@ActiveRouteCard
                             val route = activeRoute ?: return@ActiveRouteCard
-                            downloadStatus = "Downloading tiles for this trip…"
+                            // Mapbox migration (PRD.md Section 7, 2026-09-04):
+                            // the tile-download half of this button was
+                            // osmdroid-CacheManager-specific and was ALREADY
+                            // a permanent, always-fails no-op before this
+                            // migration (see the removed onFailed message
+                            // this replaced, and OfflineRouteCache.kt's own
+                            // dated comment). Mapbox's own offline system is
+                            // a genuinely different, separately-scoped
+                            // feature — says so honestly (CLAUDE.md Rule 13)
+                            // rather than calling a function built for a
+                            // platform MapView type this screen no longer
+                            // has. Route geometry/steps JSON persistence
+                            // (no tiles involved) still works unchanged.
                             OfflineRouteCache.saveRoute(context, route)
-                            OfflineRouteCache.downloadRouteTiles(
-                                context = context,
-                                mapView = mapView,
-                                routeGeometry = route.geometry,
-                                onProgress = { downloaded, total -> downloadStatus = "Downloading… $downloaded/$total tiles" },
-                                onComplete = { downloadStatus = "Saved for offline use." },
-                                // REAL FINDING (2026-08-29, from the crash
-                                // fix in OfflineRouteCache.kt): this will
-                                // currently ALWAYS fail, every time, not
-                                // just on a bad connection — the live tile
-                                // source (osmdroid's MAPNIK) permanently
-                                // refuses bulk downloads by policy (honoring
-                                // OpenStreetMap's own "no bulk downloading"
-                                // tile usage terms), so "check network"
-                                // would be a misleading, retriable-sounding
-                                // message for a non-retriable cause. Says so
-                                // honestly instead (CLAUDE.md Rule 13) —
-                                // whether this button should be reworked or
-                                // removed given it can't currently succeed
-                                // at all is a separate, larger decision.
-                                onFailed = { downloadStatus = "Offline download isn't available for this map source right now." },
-                            )
+                            downloadStatus = "Offline tile download isn't implemented for the Mapbox map yet."
                         },
                         onEnd = {
                             activeRoute = null
@@ -513,6 +510,29 @@ fun MapScreen(
                     searchQuery = result.displayName
                     routingError = null
                     showSearchScreen = false
+                },
+            )
+        }
+
+        // Mapbox Navigation SDK active-guidance/free-drive (PRD.md Section 7
+        // 2026-09-05 amendment) — drawn LAST so it covers the entire screen,
+        // same "full-page replacement, not a layered dropdown" pattern
+        // showSearchScreen above already uses. Its own MapView, separate
+        // from ui/map/StreetMapView.kt above (which keeps running
+        // underneath, unseen, so state isn't lost when this overlay closes).
+        if (isNavigating || isFreeDriving) {
+            ActiveGuidanceScreen(
+                isFreeDrive = isFreeDriving,
+                drState = drState,
+                gnssState = gnssState,
+                mlState = mlState,
+                fusedState = fusedState,
+                onExit = {
+                    com.sih26168.idr.nav.NavigationSessionRepository.stop()
+                    isNavigating = false
+                    isFreeDriving = false
+                    activeRoute = null
+                    downloadStatus = null
                 },
             )
         }

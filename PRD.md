@@ -129,6 +129,150 @@ OSM/Nominatim/OSRM services. See `docs/PROJECT_MAP.md`'s 2026-08-26
 split) for the full reasoning. This is a permanent scope amendment, not
 a one-off exception — the remaining items above still stand.
 
+**Amended (2026-09-04)**: basemap vendor decision revisited by developer
+request. `android/app/build.gradle.kts`'s `osmdroid` dependency originally
+carried a comment explaining it was chosen over Google Maps Compose/Mapbox
+specifically to avoid an API key/billing dependency. That tradeoff no
+longer holds as stated: `osmdroid`'s MAPNIK tile source structurally
+cannot support bulk/offline tile download (`TileSourcePolicy` flags
+permanently set `FLAG_NO_BULK` — see `summary.txt`'s dated entry on the
+`CacheManager.downloadAreaAsync` crash), and Mapbox's basemap, unlike
+Google Maps, is itself OSM-derived — so it stays geometrically consistent
+with the OSM/OSRM road data `routing/RoutingRepository.kt` and Section 19's
+map-snap logic already depend on, where Google's own proprietary road
+graph would not. **Mapbox is now the approved basemap replacement for
+`osmdroid`**, alongside the existing pre-approved Google Maps SDK option
+(CLAUDE.md Rule 2) — whichever actually gets implemented first stays the
+one in use; this amendment does not mandate migrating both.
+A Mapbox account (billing configured, usage notifications set at 1,000
+monthly active users as a $0-spend guard — Mapbox has no hard spending
+cap, only usage alerts, confirmed on its own billing/notifications page)
+and two scoped access tokens (a public runtime token, and a secret
+`DOWNLOADS:READ` token for Gradle to authenticate against Mapbox's
+private Maven repo) were created for this. The Gradle dependency +
+credential plumbing landed first (`settings.gradle.kts`,
+`app/build.gradle.kts`, git-ignored `local.properties`), verified by a
+real dependency resolution + compile before any UI code was written.
+
+**UPDATE, same day**: the actual UI migration also landed —
+`ui/map/StreetMapView.kt` now renders via the Mapbox Maps SDK (annotation
+plugin for the current-position marker/anchor point/destination pin,
+raw GeoJsonSource+LineLayer for the route line and dashed outage-anchor
+line, matching CLAUDE.md Rule 9's "name every coordinate transform"
+requirement at the one GeoPoint→Mapbox-Point conversion point). The
+public composable signature is unchanged; `ui/screens/MapScreen.kt`'s two
+call sites that touched the raw platform `MapView` type directly (camera
+zoom-in on navigation start, offline tile download) were updated
+accordingly. **Scoped out, not silently dropped (Rule 13)**:
+`routing/OfflineRouteCache.kt`'s bulk tile pre-fetch/download
+(`downloadRouteTiles`/`prefetchLiveZoomTiles`) was osmdroid-CacheManager-
+specific and was ALREADY a permanent no-op there (MAPNIK's
+`FLAG_NO_BULK`, Section 19/`summary.txt`'s own dated finding) — Mapbox's
+own offline system (`OfflineManager`/`TileStore`) is a genuinely
+different, separately-scoped feature, not ported here. MapScreen.kt now
+shows an honest "not available in this build" status instead of calling
+a function built for a platform type this screen no longer has. Route
+geometry/steps JSON persistence (`saveRoute`/`loadSavedRoute`, no tiles
+involved) is unaffected.
+
+**Verification status (Rule 13)**: `:app:assembleDebug` succeeds and
+existing unit tests pass. Installed and launched on the project's real
+S24 FE test device (2026-09-04). A real bug WAS found this way, not
+missed: the position marker and route line didn't render (user report:
+"I cant see the current location indicator ... the path does not show
+orange line") — root cause was two competing `loadStyle` calls racing on
+first composition, one of them bare and silently wiping the other's
+custom layers/annotation manager (see `docs/PROJECT_MAP.md`'s
+`ui/map/StreetMapView.kt` entry for the full root-cause writeup). Fixed
+and re-verified live: the marker now renders, and a real OSRM route
+(search -> destination -> route, the user's own exact flow) draws as a
+correctly road-following line through Puzhuthivakkam/Adambakkam/Alandur.
+Empty crash buffer, no FATAL EXCEPTION. `ui/screens/MapVerificationScreen.kt`
+(new test-tooling file, CLAUDE.md Android Rule 8) simulates a moving
+position without needing a real GNSS outage or drive, and was used to
+close out the remaining gap in the same session: the outage-anchor
+dashed line, heading-up camera rotation, and follow/recenter gesture
+logic are now all confirmed working, after finding and fixing two more
+real bugs (marker-arrow rotation not compensating for map bearing; an
+unguarded per-frame camera update fighting the recenter button — full
+root-cause writeup in `docs/PROJECT_MAP.md`'s `ui/map/StreetMapView.kt`
+entry) and ruling out a third suspected bug as a testing-methodology
+error, not a code defect. `:app:testDebugUnitTest` and
+`:app:assembleDebug` both pass; final build installed fresh with an
+empty crash buffer. The previous, unmodified osmdroid+OSRM build is
+preserved intact in a sibling folder (`C:\projects\26168-osmdroid`,
+independently buildable, no Mapbox credentials required) as a working
+fallback/comparison.
+
+**Amended (2026-09-05)**: full Mapbox Navigation SDK turn-by-turn —
+voice guidance, banner + lane instructions, automatic rerouting on
+off-route, free-drive mode — added by explicit developer override,
+requested with the words "disregard claude.md" (CLAUDE.md Rule 2/4's
+normal discussion-first process was skipped at the developer's direct
+instruction, not silently bypassed). Before implementing, the tradeoffs
+were surfaced and the developer confirmed proceeding anyway: this is a
+SEPARATE Mapbox product from the Maps SDK already integrated (its own
+6-module dependency footprint, its own billing SKUs — Navigation SDK
+Core Framework and Active Guidance Trips specifically, metered per
+trip/session, NOT covered by the Maps-SDK-scoped usage alert set up in
+the earlier amendment above), and it is explicitly the kind of "general
+maps competitor" capability Section 7's original list named — this
+amendment is that override, on the record, same convention the
+2026-08-26 OSRM routing amendment above already established.
+
+REAL ROUTING-BACKEND SPLIT (see `nav/NavigationSessionRepository.kt`'s
+own header doc for the full reasoning): voice/banner/lane instruction
+TEXT is generated server-side by Mapbox's own Directions API and does
+not exist in a plain OSRM response, so ACTIVE GUIDANCE now requests its
+route from Mapbox directly — the OSRM-based route PREVIEW (search,
+distance/duration estimate, `ActiveRouteCard`) is UNCHANGED and still
+OSRM; only the moment "Go" is tapped switches backends. Free-drive mode
+is a Mapbox trip session with no route set, map-matching the live
+position to the road network — a new, separate entry point (not gated
+behind having a destination).
+
+Two new files: `nav/NavigationSessionRepository.kt` (owns the
+`MapboxNavigation` session — route requests, trip session start/stop,
+voice/banner/reroute observers) and `ui/screens/ActiveGuidanceScreen.kt`
+(the full-screen overlay: Mapbox's own map + location puck +
+`MapboxManeuverView` for banner/lane + ETA text + Exit). Deliberately
+NOT built on Mapbox's older "Drop-In UI" (a single pre-built widget from
+Navigation SDK v2) — that class doesn't exist in the current SDK
+generation (`com.mapbox.navigationcore` v3.30.0, confirmed by
+decompiling the actual downloaded modules rather than trusting an older
+doc page that turned out to describe a different major version); v3's
+real architecture is individual components (`MapboxManeuverView`, the
+core `MapboxNavigation` session) assembled by the app, which is what was
+actually built.
+
+REAL BUG FOUND + FIXED before first successful install (2026-09-05):
+`MapboxVoiceInstructionsPlayer`'s second constructor parameter is a
+LANGUAGE CODE, not an access token — copied from `MapboxSpeechApi`'s
+constructor shape (where the second param really is a token) without
+checking the difference, and it crashed on every launch trying to parse
+the Mapbox token string as a `Locale` inside Android's own
+`TextToSpeech.isLanguageAvailable`. Fixed by passing `"en"` instead.
+
+VERIFIED ON A REAL DEVICE, same session: free-drive mode confirmed
+working (real Mapbox location puck, compass control, map-matched
+position, clean Exit back to the app's normal GNSS/DR pipeline with no
+side effects). Full active guidance confirmed working end-to-end on a
+real destination (Voltas Colony, Chennai): a real Mapbox Directions API
+route request succeeded, `MapboxManeuverView` rendered a real "Turn
+right, 100 ft" banner instruction with the correct turn icon, live ETA
+text updated from Mapbox's own `RouteProgress` (3834 m / 14 min), clean
+Exit. `:app:testDebugUnitTest` and `:app:assembleDebug` both pass; empty
+crash buffer on the final build. NOT independently verified: voice
+instructions actually being audible (the crash that would have proven
+they weren't wired at all is fixed, and the same observer-registration
+pattern that verifiably drives the banner/ETA UI also drives voice, but
+no announcement happened to fire audibly during this session's stationary
+testing) and automatic rerouting actually triggering a real reroute (the
+SDK's default `MapboxRerouteController` is confirmed enabled via
+`setRerouteEnabled(true)`, but exercising a genuine off-route deviation
+needs real movement, not something this session's stationary/simulated
+testing could trigger).
+
 ## 8. Functional Requirements
 
 FR1. App shall sample accelerometer, gyroscope, and location at ~10 Hz

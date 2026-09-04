@@ -45,3 +45,10 @@ android/app/src/main/assets/*.onnx
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Stray credential downloads (2026-09-04: Mapbox's token-creation page
+# auto-downloads a copy of any secret token as a .env.txt file, and
+# Chrome's default download location on this machine resolves into the
+# repo root -- so this is a defense-in-depth net against ever committing
+# one by accident, not evidence one is expected to exist).
+*.env.txt

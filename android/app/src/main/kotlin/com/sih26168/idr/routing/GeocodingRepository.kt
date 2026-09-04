@@ -5,6 +5,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 
@@ -57,16 +58,46 @@ object GeocodingRepository {
     // docs: "<left_lon>,<top_lat>,<right_lon>,<bottom_lat>".
     private const val CHENNAI_VIEWBOX = "79.6,13.3,80.5,12.7"
 
-    /** @return real matching places (Success) or a real, logged failure reason (Failure) — never a silent empty list. */
+    /**
+     * @return real matching places (Success) or a real, logged failure reason (Failure) — never a silent empty list.
+     *
+     * FALLBACK (2026-09-03, user report: Nominatim search for "Lake View Road
+     * Madipakkam" — a real Chennai road, confirmed to exist and be
+     * car-routable via Overpass/OSRM's own `/nearest` — returns zero
+     * results): root cause isn't a missing road. Nominatim's free-text
+     * matcher requires every query token to match something in a
+     * candidate's indexed name/address, and "Madipakkam" exists in OSM
+     * only as a lone `place=suburb` point (no boundary polygon) about 1km
+     * from this road — so no candidate's address chain contains both
+     * "Lake View Road" and "Madipakkam", and the whole query is rejected.
+     * When the full query comes back empty, retry with the last word
+     * dropped, repeating until a match is found or only one word remains.
+     * This recovers the real match once the unmatchable locality word is
+     * gone, without ever fabricating a result — an empty [performSearch]
+     * always stays possible and is still surfaced honestly.
+     */
     suspend fun search(query: String): GeocodeSearchOutcome = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext GeocodeSearchOutcome.Success(emptyList())
+
+        var outcome = performSearch(query)
+        var words = query.trim().split(Regex("\\s+"))
+        while (outcome is GeocodeSearchOutcome.Success && outcome.results.isEmpty() && words.size > 1) {
+            words = words.dropLast(1)
+            // Nominatim's usage policy caps public requests at ~1/sec — space out retries.
+            delay(1_100)
+            outcome = performSearch(words.joinToString(" "))
+        }
+        outcome
+    }
+
+    private suspend fun performSearch(query: String): GeocodeSearchOutcome {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val url = URL(
             "https://nominatim.openstreetmap.org/search?q=$encoded&format=json&limit=8" +
                 "&countrycodes=in&viewbox=$CHENNAI_VIEWBOX",
         )
         val connection = url.openConnection() as HttpURLConnection
-        try {
+        return try {
             connection.requestMethod = "GET"
             connection.setRequestProperty("User-Agent", USER_AGENT)
             connection.connectTimeout = 8_000
@@ -74,11 +105,11 @@ object GeocodingRepository {
             val responseCode = connection.responseCode
             if (responseCode != HttpURLConnection.HTTP_OK) {
                 Log.w(TAG, "Nominatim returned HTTP $responseCode for query \"$query\"")
-                return@withContext GeocodeSearchOutcome.Failure("Search failed (HTTP $responseCode) — try again")
+                GeocodeSearchOutcome.Failure("Search failed (HTTP $responseCode) — try again")
+            } else {
+                val body = connection.inputStream.bufferedReader().use { it.readText() }
+                GeocodeSearchOutcome.Success(parseResults(JSONArray(body)))
             }
-
-            val body = connection.inputStream.bufferedReader().use { it.readText() }
-            GeocodeSearchOutcome.Success(parseResults(JSONArray(body)))
         } catch (e: Exception) {
             // Network failure, timeout, malformed JSON, etc. — logged (same
             // resilience+visibility pattern RoutingRepository already uses

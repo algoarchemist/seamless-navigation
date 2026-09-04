@@ -1,9 +1,9 @@
 package com.sih26168.idr.ui.map
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import androidx.compose.foundation.layout.Box
@@ -24,247 +24,211 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.mapbox.geojson.LineString
+import com.mapbox.geojson.Point
+import com.mapbox.common.MapboxOptions
+import com.mapbox.maps.CameraOptions
+import com.mapbox.maps.MapView
+import com.mapbox.maps.Style
+import com.mapbox.maps.extension.style.layers.addLayer
+import com.mapbox.maps.extension.style.layers.generated.LineLayer
+import com.mapbox.maps.extension.style.layers.getLayer
+import com.mapbox.maps.extension.style.layers.properties.generated.IconAnchor
+import com.mapbox.maps.extension.style.layers.properties.generated.LineCap
+import com.mapbox.maps.extension.style.layers.properties.generated.LineJoin
+import com.mapbox.maps.extension.style.sources.addSource
+import com.mapbox.maps.extension.style.sources.generated.GeoJsonSource
+import com.mapbox.maps.extension.style.sources.getSource
+import com.mapbox.maps.plugin.animation.MapAnimationOptions
+import com.mapbox.maps.plugin.animation.camera
+import com.mapbox.maps.plugin.annotation.annotations
+import com.mapbox.maps.plugin.annotation.generated.PointAnnotation
+import com.mapbox.maps.plugin.annotation.generated.PointAnnotationManager
+import com.mapbox.maps.plugin.annotation.generated.PointAnnotationOptions
+import com.mapbox.maps.plugin.annotation.generated.createPointAnnotationManager
+import com.mapbox.maps.plugin.gestures.OnMoveListener
+import com.mapbox.maps.plugin.gestures.gestures
+import com.sih26168.idr.BuildConfig
 import com.sih26168.idr.R
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.ui.components.FloatingIconButton
 import com.sih26168.idr.ui.theme.AccentBlue
 import com.sih26168.idr.ui.theme.AccentBlueLight
 import com.sih26168.idr.ui.theme.CtaRed
-import org.osmdroid.config.Configuration
-import org.osmdroid.events.MapListener
-import org.osmdroid.events.ScrollEvent
-import org.osmdroid.events.ZoomEvent
-import org.osmdroid.tileprovider.tilesource.TileSourceFactory
-import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
-import org.osmdroid.views.MapView
-import org.osmdroid.views.Projection
-import org.osmdroid.views.overlay.Overlay
-import org.osmdroid.views.overlay.Polyline
-import org.osmdroid.views.overlay.TilesOverlay
 
 /**
- * The real street-map base layer (Slice 8b — added when the user
- * explicitly asked to bring in a real map dependency, CLAUDE.md Rule 2
- * discussed and overridden for this decision). osmdroid, not Google Maps
- * Compose/Mapbox, specifically because it needs no API key or billing
- * account to show real tiles — nothing here blocks on a credential this
- * project doesn't have.
+ * The real street-map base layer. Migrated from osmdroid to the Mapbox Maps
+ * SDK (PRD.md Section 7's 2026-09-04 amendment; see that amendment and
+ * CLAUDE.md Rule 2 for the reasoning — Mapbox's basemap is OSM-derived,
+ * unlike Google's own proprietary road graph, so it stays geometrically
+ * consistent with the OSM/OSRM route geometry `routing/RoutingRepository.kt`
+ * already produces and this file already renders). The public API
+ * (composable name, every parameter) is UNCHANGED from the osmdroid version
+ * on purpose, so every caller (`ui/screens/MapScreen.kt`) needed no changes
+ * beyond the two spots that touch the raw platform [MapView] type directly
+ * (camera zoom, offline tile download — see MapScreen.kt's own comments).
  *
- * This file draws real OpenStreetMap street geometry underneath the
- * current-position marker language (halo/ring/dot,
- * [com.sih26168.idr.ui.theme.AccentBlue]) and outage-anchor dashed line
- * established from the Figma extraction — an abstract local-East/North-
- * meter grid base layer (ui/map/TrackCanvas.kt) originally established
- * this same marker styling before it was removed as redundant once this
- * real map existed.
+ * COORDINATE-FRAME NOTE (CLAUDE.md Rule 9/14): every incoming coordinate
+ * here is WORLD-frame WGS84 lat/lon degrees. [org.osmdroid.util.GeoPoint]
+ * (still used as the shared waypoint type across the routing layer — see
+ * `routing/RouteModels.kt` — since swapping it out repo-wide was out of
+ * scope for this UI-only migration) stores `(lat, lon)`; Mapbox's
+ * [com.mapbox.geojson.Point] stores `(lon, lat)` — [toMapboxPoint] below is
+ * the one, explicitly-named place that reordering happens.
  *
- * HONEST GAP (CLAUDE.md Rule 13): the standard OSM tile server is
- * rate-limited and meant for light/demo traffic, not production load —
- * acceptable for this MVP demo, not a claim this scales.
- *
- * UPDATE (2026-08-26, real bug found + fixed): the CARTO dark_all/light_all
- * tile source this used to point at (basemaps.cartocdn.com) started
- * returning an HTTP 200 "API KEY REQUIRED" WATERMARK IMAGE in place of
- * real tiles — confirmed by fetching a tile directly with curl and
- * inspecting the PNG, not assumed from a log message, since a 200 status
- * gives osmdroid no error to detect or log. CARTO's anonymous free-tier
- * basemap access was evidently locked down after this file was first
- * written (see the removed DARK/LIGHT XYTileSource entries this replaced).
- * Rather than replace one paid/key-gated provider with another, this now
- * points at osmdroid's own [TileSourceFactory.MAPNIK] — the standard
- * openstreetmap.org tile server, free with no account/key, the same
- * "no new credential" principle this file's doc comment already commits
- * to. Since Mapnik ships only one (light) style, dark mode is now
- * simulated with osmdroid's built-in [TilesOverlay.INVERT_COLORS] color
- * filter instead of a second tile source — this also sidesteps the
- * tile-interruption bug documented below (`setTileSource` mid-fetch),
- * since toggling a color filter doesn't rebuild the tile-provider modules
- * the way switching tile sources does.
+ * WHAT DIDN'T CARRY OVER (scoped out of this migration, not silently
+ * dropped — CLAUDE.md Rule 13): `routing/OfflineRouteCache.kt`'s bulk tile
+ * pre-fetch/download (`downloadRouteTiles`/`prefetchLiveZoomTiles`) was
+ * built against osmdroid's `CacheManager` and was ALREADY a permanent,
+ * documented no-op there (MAPNIK's `FLAG_NO_BULK` — see that file's own
+ * dated comment) before this migration. Mapbox has its own, genuinely
+ * different offline system (`OfflineManager`/`TileStore`) that would be a
+ * real, separately-scoped feature to build, not a drop-in swap — MapScreen.kt
+ * now shows an honest "not available in this build" status instead of
+ * silently doing nothing. `saveRoute`/`loadSavedRoute` (the route
+ * geometry/steps JSON, no tiles involved) still work unchanged.
  */
-private val STREET_TILE_SOURCE = TileSourceFactory.MAPNIK
-
-// Engineering default (CLAUDE.md Rule 13) — not measured against a
-// specific tile-loading benchmark, just picked well under one tile's
-// real-world width at the zoom levels this screen uses (a zoom-18 tile
-// is roughly 150m wide near the equator, smaller nearer the poles) so a
-// genuine several-meter walk still re-centers promptly.
 private const val MIN_RECENTER_DISTANCE_M = 3.0
 
+// Bitmap canvas size for the generated marker icons below — picked to give
+// the halo/ring/dot geometry (same radii the old osmdroid Overlay drew)
+// enough padding on every side once Mapbox rotates/scales the icon.
+private const val MARKER_BITMAP_SIZE_PX = 140
+private const val PIN_BITMAP_SIZE_PX = 100
+
+private const val SOURCE_ID_ANCHOR_LINE = "idr-anchor-line-source"
+private const val LAYER_ID_ANCHOR_LINE = "idr-anchor-line-layer"
+private const val SOURCE_ID_ROUTE_LINE = "idr-route-line-source"
+private const val LAYER_ID_ROUTE_LINE = "idr-route-line-layer"
+
+/** `GeoPoint` is `(lat, lon)`; Mapbox's `Point.fromLngLat` wants `(lon, lat)` — see this file's header doc. */
+private fun GeoPoint.toMapboxPoint(): Point = Point.fromLngLat(longitude, latitude)
+
 /**
- * One-time osmdroid setup (tile cache location + required user-agent —
- * OSM's tile usage policy blocks requests with no/default user agent).
- * Idempotent; safe to call from every StreetMapView composition.
+ * One-time Mapbox SDK setup (public access token). Idempotent (re-assigning
+ * the same value is harmless); safe to call from every StreetMapView
+ * composition, same convention the osmdroid version's `configureOsmdroid`
+ * used.
  */
-private fun configureOsmdroid(context: Context) {
-    val config = Configuration.getInstance()
-    config.userAgentValue = context.packageName
-    // Explicit base/tile-cache paths derived directly from the CONTEXT WE
-    // WERE GIVEN — osmdroid's own default-path auto-resolution
-    // (DefaultConfigurationProvider.getOsmdroidBasePath) reaches for a
-    // separate internal Context reference that is only populated by
-    // Configuration.getInstance().load(context, prefs), which this app
-    // never calls. Left unset, that internal reference is null and
-    // MapView's constructor throws (caught internally by osmdroid, logged
-    // as "Unable to create base path at null") before ever reaching the
-    // network tile fetch — setting both paths explicitly here sidesteps
-    // that auto-resolution entirely rather than papering over its NPE.
-    val basePath = context.filesDir.resolve("osmdroid")
-    config.osmdroidBasePath = basePath
-    config.osmdroidTileCache = basePath.resolve("tiles")
+private fun configureMapbox() {
+    MapboxOptions.accessToken = BuildConfig.MAPBOX_PUBLIC_TOKEN
 }
 
-// Verified once with Configuration.isDebugMode/isDebugTileProviders (both
-// temporarily set true) + a direct curl check against
-// a.basemaps.cartocdn.com (200 OK) while diagnosing an initial blank-map
-// appearance — that appearance turned out to be the CORRECT dark-tile
-// rendering for open ocean near (0,0) (no GNSS fix yet = default map
-// center), not a broken fetch. Re-add those two Configuration lines
-// temporarily if a future tile issue needs re-diagnosing.
-
 /**
- * Draws the halo/ring/dot current-position marker at a real [GeoPoint]
- * on osmdroid's tile canvas, per this file's own doc comment.
- *
- * Plain mutable fields rather than `View.setTag(int, Any)` — osmdroid's
- * `MapView` (like any Android `View`) requires int tag keys to be real
- * app resource IDs, not arbitrary constants; a private mutable holder
- * the [AndroidView] `update` block writes into avoids that pitfall
- * entirely.
+ * Renders the halo+ring+dot current-position marker (non-directional
+ * fallback) into a bitmap. Mapbox's annotation/style layers need a raster
+ * icon rather than the arbitrary `Canvas.draw*` calls the old osmdroid
+ * `Overlay.draw()` used directly — same Paint objects/radii as that
+ * version, just drawn once into an offscreen bitmap instead of every
+ * frame, since Mapbox's renderer composites/positions/rotates the bitmap
+ * on the GPU rather than needing it redrawn per frame.
  */
-private class CurrentPositionOverlay : Overlay() {
-    var position: GeoPoint? = null
-    var anchor: GeoPoint? = null
-    var mode: GnssMode = GnssMode.GNSS_AIDED
-    /** (Round 2 addition, 2026-08-28, user report: "line terminating vaguely") The active route's destination — null clears the pin. */
-    var destination: GeoPoint? = null
-
-    /**
-     * Screen-space clockwise-degrees rotation to draw the directional
-     * arrow marker at, or null to fall back to the plain (non-directional)
-     * dot. This is NOT the same number as device heading — it's already
-     * had the map's own current rotation (`MapView.setMapOrientation`)
-     * subtracted out by the caller (see StreetMapView's `update` block,
-     * where it's computed), because osmdroid pre-rotates the canvas this
-     * `draw()` receives by that same amount before invoking any overlay
-     * (CLAUDE.md Rule 14 — stating the frame at the boundary): drawing the
-     * arrow at the raw device heading on an ALREADY-rotated canvas would
-     * double-apply the map's rotation. UNVERIFIED ON A REAL DEVICE
-     * (CLAUDE.md Rule 13), same caveat StreetMapView's own headingDeg
-     * param already carries for the map-rotation half of this.
-     */
-    var iconRotationDeg: Float? = null
-
-    private val haloPaint = Paint().apply { color = AccentBlue.copy(alpha = 0.18f).toArgb(); isAntiAlias = true }
-    private val ringPaint = Paint().apply {
+private fun renderDotMarkerBitmap(): Bitmap {
+    val bitmap = Bitmap.createBitmap(MARKER_BITMAP_SIZE_PX, MARKER_BITMAP_SIZE_PX, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    val cx = MARKER_BITMAP_SIZE_PX / 2f
+    val cy = MARKER_BITMAP_SIZE_PX / 2f
+    val haloPaint = Paint().apply { color = AccentBlue.copy(alpha = 0.18f).toArgb(); isAntiAlias = true }
+    val ringPaint = Paint().apply {
         color = AccentBlue.toArgb()
         isAntiAlias = true
         style = Paint.Style.STROKE
         strokeWidth = 6f
     }
-    private val dotPaint = Paint().apply { color = AccentBlueLight.toArgb(); isAntiAlias = true }
-    private val arrowFillPaint = Paint().apply { color = AccentBlueLight.toArgb(); isAntiAlias = true; style = Paint.Style.FILL }
-    private val arrowOutlinePaint = Paint().apply {
-        color = android.graphics.Color.WHITE
+    val dotPaint = Paint().apply { color = AccentBlueLight.toArgb(); isAntiAlias = true }
+    canvas.drawCircle(cx, cy, 44f, haloPaint)
+    canvas.drawCircle(cx, cy, 16f, ringPaint)
+    canvas.drawCircle(cx, cy, 11f, dotPaint)
+    return bitmap
+}
+
+/**
+ * Same halo+ring, but with the directional chevron in place of the plain
+ * dot — drawn pointing "up" (0 degrees) at generation time; Mapbox's
+ * `iconRotate` layout property rotates the whole bitmap live from there,
+ * so unlike the osmdroid version this does NOT need to be redrawn per
+ * frame to change heading — a real simplification the GPU-composited
+ * annotation model gives for free.
+ */
+private fun renderArrowMarkerBitmap(): Bitmap {
+    val bitmap = Bitmap.createBitmap(MARKER_BITMAP_SIZE_PX, MARKER_BITMAP_SIZE_PX, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    val cx = MARKER_BITMAP_SIZE_PX / 2f
+    val cy = MARKER_BITMAP_SIZE_PX / 2f
+    val haloPaint = Paint().apply { color = AccentBlue.copy(alpha = 0.18f).toArgb(); isAntiAlias = true }
+    val ringPaint = Paint().apply {
+        color = AccentBlue.toArgb()
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 6f
+    }
+    val arrowFillPaint = Paint().apply { color = AccentBlueLight.toArgb(); isAntiAlias = true; style = Paint.Style.FILL }
+    val arrowOutlinePaint = Paint().apply {
+        color = Color.WHITE
         isAntiAlias = true
         style = Paint.Style.STROKE
         strokeWidth = 3f
     }
-    private val anchorPaint = Paint().apply { color = CtaRed.toArgb(); isAntiAlias = true }
-    private val linePaint = Paint().apply {
-        color = CtaRed.toArgb()
-        isAntiAlias = true
-        style = Paint.Style.STROKE
-        strokeWidth = 6f
-        pathEffect = DashPathEffect(floatArrayOf(24f, 16f), 0f)
-    }
-
-    // Destination pin paints — same CtaRed accent the route polyline and
-    // outage-anchor marker already use (Figma's own route-related color),
-    // so the pin reads as "belongs to the route," not a competing accent.
-    private val pinFillPaint = Paint().apply { color = CtaRed.toArgb(); isAntiAlias = true; style = Paint.Style.FILL }
-    private val pinOutlinePaint = Paint().apply {
-        color = Color.WHITE
-        isAntiAlias = true
-        style = Paint.Style.STROKE
-        strokeWidth = 4f
-    }
-    private val pinHolePaint = Paint().apply { color = Color.WHITE; isAntiAlias = true }
-
-    override fun draw(canvas: Canvas, projection: Projection) {
-        val currentPosition = position ?: return
-        val point = projection.toPixels(currentPosition, null)
-
-        if (mode == GnssMode.DEAD_RECKONING || mode == GnssMode.REACQUISITION) {
-            anchor?.let { anchorPoint ->
-                val anchorPixel = projection.toPixels(anchorPoint, null)
-                canvas.drawLine(
-                    anchorPixel.x.toFloat(),
-                    anchorPixel.y.toFloat(),
-                    point.x.toFloat(),
-                    point.y.toFloat(),
-                    linePaint,
-                )
-                canvas.drawCircle(anchorPixel.x.toFloat(), anchorPixel.y.toFloat(), 10f, anchorPaint)
-            }
-        }
-
-        destination?.let { destinationPoint ->
-            val destPixel = projection.toPixels(destinationPoint, null)
-            drawPin(canvas, destPixel.x.toFloat(), destPixel.y.toFloat())
-        }
-
-        canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 44f, haloPaint)
-        canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 16f, ringPaint)
-
-        val rotationDeg = iconRotationDeg
-        if (rotationDeg != null) {
-            // Directional chevron in place of the plain dot — only drawn
-            // once a real heading exists (see StreetMapView's
-            // markerHeadingDeg param doc for when that is/isn't the case).
-            canvas.save()
-            canvas.rotate(rotationDeg, point.x.toFloat(), point.y.toFloat())
-            val arrowPath = buildArrowPath(point.x.toFloat(), point.y.toFloat())
-            canvas.drawPath(arrowPath, arrowFillPaint)
-            canvas.drawPath(arrowPath, arrowOutlinePaint)
-            canvas.restore()
-        } else {
-            canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 11f, dotPaint)
-        }
-    }
-
-    /** A small "up"-pointing chevron centered at ([cx],[cy]) — rotated by the caller, not here. */
-    private fun buildArrowPath(cx: Float, cy: Float): Path = Path().apply {
+    canvas.drawCircle(cx, cy, 44f, haloPaint)
+    canvas.drawCircle(cx, cy, 16f, ringPaint)
+    val arrowPath = Path().apply {
         moveTo(cx, cy - 12f)
         lineTo(cx - 9f, cy + 8f)
         lineTo(cx, cy + 3f)
         lineTo(cx + 9f, cy + 8f)
         close()
     }
+    canvas.drawPath(arrowPath, arrowFillPaint)
+    canvas.drawPath(arrowPath, arrowOutlinePaint)
+    return bitmap
+}
 
-    /**
-     * Classic map-pin silhouette (circular head + a triangular tail
-     * pointing down) — drawn with Canvas primitives, same approach the
-     * halo/ring/dot marker above already uses, no new drawable asset
-     * needed. The tail's point (NOT the head's center) lands exactly on
-     * [tipX]/[tipY] — the actual destination coordinate — matching how
-     * every real map app anchors a pin at its pointed tip, not its head.
-     */
-    private fun drawPin(canvas: Canvas, tipX: Float, tipY: Float) {
-        val headRadius = 22f
-        val headCenterY = tipY - headRadius * 2.2f
+/** Small filled circle for the outage-anchor point — same [CtaRed] accent as the dashed line drawn back to it. */
+private fun renderAnchorDotBitmap(): Bitmap {
+    val size = 32
+    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    val anchorPaint = Paint().apply { color = CtaRed.toArgb(); isAntiAlias = true }
+    canvas.drawCircle(size / 2f, size / 2f, 10f, anchorPaint)
+    return bitmap
+}
 
-        val tail = Path().apply {
-            moveTo(tipX - headRadius * 0.55f, headCenterY + headRadius * 0.85f)
-            lineTo(tipX + headRadius * 0.55f, headCenterY + headRadius * 0.85f)
-            lineTo(tipX, tipY)
-            close()
-        }
-        canvas.drawPath(tail, pinFillPaint)
-        canvas.drawCircle(tipX, headCenterY, headRadius, pinFillPaint)
-        canvas.drawCircle(tipX, headCenterY, headRadius, pinOutlinePaint)
-        canvas.drawCircle(tipX, headCenterY, headRadius * 0.32f, pinHolePaint)
+/**
+ * Classic map-pin silhouette (circular head + triangular tail), same shape
+ * the osmdroid version's `drawPin` drew with Canvas primitives — the tail's
+ * point, not the head's center, is the bitmap's own anchor point (set via
+ * [PointAnnotationOptions.withIconAnchor] at the call site), matching how
+ * every real map app anchors a pin at its pointed tip.
+ */
+private fun renderDestinationPinBitmap(): Bitmap {
+    val bitmap = Bitmap.createBitmap(PIN_BITMAP_SIZE_PX, PIN_BITMAP_SIZE_PX, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    val pinFillPaint = Paint().apply { color = CtaRed.toArgb(); isAntiAlias = true; style = Paint.Style.FILL }
+    val pinOutlinePaint = Paint().apply {
+        color = Color.WHITE
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
     }
+    val pinHolePaint = Paint().apply { color = Color.WHITE; isAntiAlias = true }
+
+    val tipX = PIN_BITMAP_SIZE_PX / 2f
+    val tipY = PIN_BITMAP_SIZE_PX - 4f
+    val headRadius = 22f
+    val headCenterY = tipY - headRadius * 2.2f
+
+    val tail = Path().apply {
+        moveTo(tipX - headRadius * 0.55f, headCenterY + headRadius * 0.85f)
+        lineTo(tipX + headRadius * 0.55f, headCenterY + headRadius * 0.85f)
+        lineTo(tipX, tipY)
+        close()
+    }
+    canvas.drawPath(tail, pinFillPaint)
+    canvas.drawCircle(tipX, headCenterY, headRadius, pinFillPaint)
+    canvas.drawCircle(tipX, headCenterY, headRadius, pinOutlinePaint)
+    canvas.drawCircle(tipX, headCenterY, headRadius * 0.32f, pinHolePaint)
+    return bitmap
 }
 
 /**
@@ -274,19 +238,19 @@ private class CurrentPositionOverlay : Overlay() {
  *   still renders (last-known/default world view) but with no marker.
  * @param anchorLatDeg/[anchorLonDeg] the outage-anchor point the dashed
  *   drift line is drawn back to during DEAD_RECKONING/REACQUISITION.
- * @param isDarkTheme toggles [TilesOverlay.INVERT_COLORS] over the one real
- *   [STREET_TILE_SOURCE] (user-requested light mode, 2026-08-26) — switched
- *   live via a [LaunchedEffect] below if the app's theme toggle changes
- *   while this screen is showing.
+ * @param isDarkTheme selects Mapbox's own [Style.DARK] vs [Style.MAPBOX_STREETS]
+ *   — a genuine dark cartography style, replacing the osmdroid version's
+ *   `INVERT_COLORS` filter hack over its one light-only tile source.
  * @param routeGeometry a REAL computed route's geometry (from
  *   `routing/RoutingRepository.kt`'s OSRM call), drawn as a solid CtaRed
- *   polyline — Figma's own route-line color. Null clears it (no active
- *   route). Added 2026-08-26 alongside real destination search/routing.
- * @param onMapViewReady hands back the underlying osmdroid [MapView] once
- *   created, so a caller (MapScreen's offline-download button) can pass
- *   it to `routing/OfflineRouteCache.kt`'s [org.osmdroid.tileprovider.cachemanager.CacheManager]
- *   — the SAME MapView instance, not a second one, so downloaded tiles
- *   land in the cache this view already reads from.
+ *   line. Null clears it (no active route). Still `List<GeoPoint>` — see
+ *   this file's header doc for why that type wasn't migrated too.
+ * @param onMapViewReady hands back the underlying Mapbox [MapView] once
+ *   created, so a caller (MapScreen.kt) can drive the camera directly
+ *   (e.g. the navigation-start zoom-in) — same pattern the osmdroid version
+ *   used, now with Mapbox's own MapView type (CLAUDE.md Rule 9: this is a
+ *   named, deliberate type change, not silent — see MapScreen.kt's own
+ *   updated comments at its two call sites).
  */
 @Composable
 fun StreetMapView(
@@ -299,209 +263,227 @@ fun StreetMapView(
     routeGeometry: List<GeoPoint>? = null,
     /**
      * Real device heading (degrees clockwise from north) to rotate the map
-     * to "heading-up" — Google Maps navigation-mode convention — while
-     * turn-by-turn is active. Null means north-up (the normal Drive/idle-Map
-     * behavior, unchanged). UNVERIFIED ON A REAL DEVICE (CLAUDE.md Rule 13):
-     * osmdroid's `setMapOrientation` rotation direction/sign was set from
-     * its documented convention, not confirmed against a live compass
-     * heading outdoors yet.
+     * to "heading-up" while turn-by-turn is active. Null means north-up.
+     * UNVERIFIED ON A REAL DEVICE (CLAUDE.md Rule 13) for this Mapbox path
+     * specifically — the osmdroid version's own sign convention was never
+     * confirmed against a live compass either; carrying the same caveat
+     * forward rather than claiming new certainty.
      */
     headingDeg: Float? = null,
     /**
-     * Real device/travel heading (degrees clockwise from north — same
-     * WORLD-frame convention as [headingDeg], CLAUDE.md Rule 14), used to
-     * rotate the current-position MARKER icon into a directional arrow.
-     * Unlike [headingDeg] (which only rotates the whole MAP, and only
-     * while navigating — see MapScreen's `isNavigating` gating), this is
-     * meant to be fed whenever a real heading is available at all, so the
-     * marker itself points the right way even when the map stays
-     * north-up. Null falls back to the previous plain (non-directional)
-     * dot marker — STATUS_AND_ROADMAP.md Tier-1 item #1.
+     * Real device/travel heading, used to rotate the current-position
+     * MARKER icon into a directional arrow — independent of [headingDeg]
+     * (which only rotates the whole map, and only while navigating). Null
+     * falls back to the plain dot marker.
      */
     markerHeadingDeg: Float? = null,
     onMapViewReady: (MapView) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    val overlay = remember { CurrentPositionOverlay() }
-    val routePolyline = remember { Polyline().apply { color = CtaRed.toArgb(); width = 12f } }
-    // REAL BUG FIX (2026-08-26, on-device test — map stuck showing mostly
-    // osmdroid's "tile unavailable" placeholder): `update` below re-runs on
-    // EVERY recomposition, i.e. every ~10Hz live sensor/GNSS tick (the
-    // exact hazard this file's Slice 8b "black tiles" bug, above, already
-    // named) — not just when currentLatDeg/currentLonDeg actually change.
-    // Unconditionally calling `view.controller.animateTo(point)` every
-    // single tick was re-centering the viewport dozens of times a second
-    // for near-zero real movement, each call abandoning whatever tiles
-    // were still mid-download for the previous center. logcat confirmed
-    // this: a genuine mode flip (GNSS_AIDED -> TRANSITION -> DEAD_RECKONING,
-    // switching which position source MapScreen.kt feeds in — see that
-    // file's currentLatDeg/currentLonDeg selection) jumped the requested
-    // tiles across 5 unrelated map areas within 34 seconds, so almost none
-    // of them ever finished downloading. Gated on [MIN_RECENTER_DISTANCE_M]
-    // below so only a REAL move re-centers the map; this does not fix the
-    // underlying GNSS_AIDED-vs-drifted-DR position source jump itself
-    // (a separate, already-flagged issue), only the redundant/wasteful
-    // re-centering that was making every jump worse for tile loading.
-    val lastCenteredPoint = remember { mutableStateOf<GeoPoint?>(null) }
-    // REAL BUG FIX (2026-08-26, user report: "can't scroll through the
-    // map, it just resurfaces at the same location"): panning itself was
-    // never disabled (setMultiTouchControls(true) below already gives real
-    // one/two-finger drag-to-pan and pinch-to-zoom) — the live position
-    // update above was simply re-centering the viewport out from under any
-    // manual pan on the very next tick, since it never knew the user had
-    // just moved the map by hand. [isFollowingLocation] tracks whether the
-    // map should keep auto-centering on the live position; a real user
-    // gesture (detected via the MapListener below) turns it off, and the
-    // small recenter button that then appears (bottom-end of the map)
-    // turns it back on — the same "follow me" vs. "user is browsing"
-    // pattern every turn-by-turn map app uses. [isProgrammaticMove]
-    // distinguishes OUR OWN recentering calls from a real user gesture in
-    // that same onScroll callback, since osmdroid fires it for both.
-    var isFollowingLocation by remember { mutableStateOf(true) }
-    val isProgrammaticMove = remember { mutableStateOf(false) }
-    val mapView = remember {
-        configureOsmdroid(context)
-        MapView(context).apply {
-            setTileSource(STREET_TILE_SOURCE)
-            overlayManager.tilesOverlay.setColorFilter(if (isDarkTheme) TilesOverlay.INVERT_COLORS else null)
-            setMultiTouchControls(true)
-            // User-reported bug (2026-08-26): osmdroid's default on-screen
-            // +/- zoom buttons render bottom-center over this screen's own
-            // bottom content (vehicle-mode selector / drift card /
-            // ActiveRouteCard, all in StatusOverlayContent.kt / MapScreen.kt),
-            // and there's no osmdroid API to reposition them independently of
-            // that fixed placement. Disabled outright rather than fought over
-            // z-order — setMultiTouchControls(true) above already gives real
-            // pinch-to-zoom, so the on-screen buttons were redundant anyway.
-            setBuiltInZoomControls(false)
-            controller.setZoom(18.0)
-            overlays.add(routePolyline)
-            overlays.add(overlay)
-            addMapListener(object : MapListener {
-                override fun onScroll(event: ScrollEvent?): Boolean {
-                    if (!isProgrammaticMove.value) {
-                        isFollowingLocation = false
-                    }
-                    return false
-                }
 
-                override fun onZoom(event: ZoomEvent?): Boolean = false
-            })
-        }.also(onMapViewReady)
+    val mapView = remember {
+        configureMapbox()
+        MapView(context)
     }
 
     DisposableEffect(mapView) {
-        onDispose { mapView.onDetach() }
+        onDispose { mapView.onDestroy() }
     }
 
-    // Round 2 UI smoothness pass (2026-08-28): the marker position and
-    // map rotation used to be set directly from currentLatDeg/currentLonDeg/
-    // headingDeg inside the `update` block below, which only re-runs on a
-    // real GNSS/DR tick (~5-10Hz) — visibly stepping/teleporting in small
-    // discrete jumps rather than gliding, since the display itself
-    // refreshes at ~60Hz. `targetPosition`/`targetHeadingDeg` below are
-    // updated at that same ~5-10Hz tick rate (from `update`); THIS loop
-    // runs independently at display frame rate, chasing them smoothly via
-    // PositionSmoother. Keyed on `mapView` (stable for this composable's
-    // lifetime) so it starts once and is cancelled automatically when this
-    // screen leaves composition (standard LaunchedEffect behavior) — no
-    // manual cleanup needed. An always-on 60fps loop is an accepted cost
-    // for a foreground live-navigation screen (every real turn-by-turn map
-    // app redraws continuously while active), not a battery concern this
-    // MVP needs to optimize away.
+    // Bitmaps generated once per composition, not per frame or per update —
+    // Mapbox's PointAnnotation `iconRotate` handles live rotation without
+    // needing the bitmap itself redrawn (see renderArrowMarkerBitmap's doc).
+    val dotMarkerBitmap = remember { renderDotMarkerBitmap() }
+    val arrowMarkerBitmap = remember { renderArrowMarkerBitmap() }
+    val anchorDotBitmap = remember { renderAnchorDotBitmap() }
+    val destinationPinBitmap = remember { renderDestinationPinBitmap() }
+
+    var pointAnnotationManager by remember { mutableStateOf<PointAnnotationManager?>(null) }
+    var currentPositionAnnotation by remember { mutableStateOf<PointAnnotation?>(null) }
+    var anchorAnnotation by remember { mutableStateOf<PointAnnotation?>(null) }
+    var destinationAnnotation by remember { mutableStateOf<PointAnnotation?>(null) }
+
+    // Same "follow me" vs "user is browsing" pattern the osmdroid version
+    // used: a real user pan gesture (detected via OnMoveListener below)
+    // turns auto-follow off; the recenter button turns it back on.
+    // [isProgrammaticMove] guards EVERY programmatic `setCamera` call
+    // (center recenter AND bearing updates) — REAL ON-DEVICE FINDING
+    // (2026-09-04): this guard IS load-bearing here too, same as it was
+    // for osmdroid, not redundant belt-and-braces as first assumed.
+    // Mapbox's OnMoveListener apparently fires for ANY camera change, not
+    // just genuine touch gestures — an unguarded per-frame bearing update
+    // was found re-triggering `onMoveBegin` on literally the next frame
+    // after the recenter button set this true, making the button appear
+    // to do nothing. See the bearing-update call site below for the fix.
+    var isFollowingLocation by remember { mutableStateOf(true) }
+    val isProgrammaticMove = remember { mutableStateOf(false) }
+    val lastCenteredPoint = remember { mutableStateOf<Point?>(null) }
+
     val positionSmoother = remember { PositionSmoother() }
     val targetPosition = remember { mutableStateOf<GeoPoint?>(null) }
     val targetHeadingDeg = remember { mutableStateOf(0f) }
-    // Origin's directional-arrow marker feature (STATUS_AND_ROADMAP.md
-    // Tier-1 item #1) — same "feed a target, let this loop chase it"
-    // treatment as targetPosition/targetHeadingDeg above, rather than
-    // setting overlay.iconRotationDeg directly from the `update` block:
-    // the icon-rotation math below has to subtract out the map's own
-    // CURRENT rotation (see its own comment), which is the SMOOTHED
-    // mapOrientationDeg this loop computes each frame, not the raw,
-    // possibly-stale value `update` last saw.
     val targetMarkerHeadingDeg = remember { mutableStateOf<Float?>(null) }
-    LaunchedEffect(mapView) {
-        while (true) {
-            withFrameNanos { }
-            val target = targetPosition.value
-            if (target != null) {
-                val smoothed = positionSmoother.stepPosition(target.latitude, target.longitude)
-                if (smoothed != null) {
-                    overlay.position = GeoPoint(smoothed.first, smoothed.second)
-                }
-            }
-            val smoothedHeadingDeg = positionSmoother.stepHeading(targetHeadingDeg.value)
-            // osmdroid rotates the MAP clockwise by the given degrees, so to
-            // make the device's own heading point "up" the map must be
-            // rotated by the OPPOSITE (negative) amount — same convention
-            // the old per-tick call used, just now fed a smoothed value.
-            val mapOrientationDeg = -smoothedHeadingDeg
-            mapView.setMapOrientation(mapOrientationDeg)
-            // Subtract the map's own rotation back out so the directional
-            // arrow always points at the REAL travel direction on screen —
-            // see CurrentPositionOverlay.iconRotationDeg's own doc for why
-            // this subtraction is needed (osmdroid pre-rotates the canvas
-            // this overlay draws into by mapOrientationDeg). UNVERIFIED ON
-            // A REAL DEVICE (CLAUDE.md Rule 13), same caveat as the map's
-            // own rotation direction above.
-            overlay.iconRotationDeg = targetMarkerHeadingDeg.value?.let { it - mapOrientationDeg }
-            mapView.invalidate()
+
+    // REAL BUG FOUND on-device (2026-09-04, user report: "current location
+    // indicator not visible, route line doesn't show"): this used to be
+    // TWO separate LaunchedEffects — one here (keyed on `mapView`, running
+    // `loadStyle` WITH the setup callback below) and a second one keyed on
+    // `isDarkTheme` that called a BARE `loadStyle(...)` with no callback
+    // (further down, now removed). Compose runs EVERY LaunchedEffect at
+    // least once on first composition regardless of its key, so both fired
+    // on app launch — and since Mapbox's `loadStyle` fully REPLACES the
+    // style (sources, layers, and the annotation plugin's own internal
+    // layer all get torn down), whichever call landed second silently wiped
+    // out everything the first one had just added, with no error to see
+    // (the base map tiles render fine either way, since a plain style load
+    // succeeds regardless — only the CUSTOM sources/layers/annotation
+    // manager this file adds were the casualty). Fixed by keying the WHOLE
+    // style setup — load + re-add every custom source/layer/manager — on
+    // [isDarkTheme] alone, so a theme change (which forces a real style
+    // swap) redoes the setup instead of losing it, and there is only ever
+    // ONE `loadStyle` call site.
+    LaunchedEffect(isDarkTheme) {
+        mapView.mapboxMap.loadStyle(if (isDarkTheme) Style.DARK else Style.MAPBOX_STREETS) { style ->
+            // Anchor dashed line + route solid line as raw style
+            // source/layers (not the simplified annotation plugin) — only
+            // the raw LineLayer exposes `lineDasharray`, which the anchor
+            // line needs to match the osmdroid version's dashed-line look.
+            style.addSource(GeoJsonSource.Builder(SOURCE_ID_ANCHOR_LINE).build())
+            style.addLayer(
+                LineLayer(LAYER_ID_ANCHOR_LINE, SOURCE_ID_ANCHOR_LINE).apply {
+                    lineColor(CtaRed.toArgb())
+                    lineWidth(3.0)
+                    lineDasharray(listOf(2.0, 1.5))
+                    lineCap(LineCap.ROUND)
+                    lineJoin(LineJoin.ROUND)
+                },
+            )
+            style.addSource(GeoJsonSource.Builder(SOURCE_ID_ROUTE_LINE).build())
+            style.addLayer(
+                LineLayer(LAYER_ID_ROUTE_LINE, SOURCE_ID_ROUTE_LINE).apply {
+                    lineColor(CtaRed.toArgb())
+                    lineWidth(5.0)
+                    lineCap(LineCap.ROUND)
+                    lineJoin(LineJoin.ROUND)
+                },
+            )
+
+            pointAnnotationManager = mapView.annotations.createPointAnnotationManager()
+            // The previous manager's annotations (if any — a theme change
+            // after the marker/route were already showing) no longer exist
+            // in the new style; drop the stale handles so the smoothing
+            // loop and update block below `create()` fresh ones instead of
+            // calling `.update()` on now-orphaned references.
+            currentPositionAnnotation = null
+            anchorAnnotation = null
+            destinationAnnotation = null
         }
     }
 
-    // BUG FIX (2026-08-26, real on-device test): setTileSource() rebuilds
-    // osmdroid's internal tile-provider modules (closes/reopens caches),
-    // which interrupts any tile download already in flight — a real problem
-    // when this toggled the tile SOURCE on every theme change. Now dark mode
-    // is a color filter over the one real tile source (see the doc comment
-    // above), so there is no tile-provider rebuild to worry about; this
-    // LaunchedEffect only flips the filter and repaints already-cached
-    // tiles in place. Still keyed on [isDarkTheme] alone, not every
-    // recomposition, to keep that guarantee explicit.
-    LaunchedEffect(isDarkTheme) {
-        mapView.overlayManager.tilesOverlay.setColorFilter(if (isDarkTheme) TilesOverlay.INVERT_COLORS else null)
-        mapView.invalidate()
+    LaunchedEffect(mapView) {
+        mapView.mapboxMap.setCamera(CameraOptions.Builder().zoom(18.0).build())
+
+        mapView.gestures.addOnMoveListener(object : OnMoveListener {
+            override fun onMoveBegin(detector: com.mapbox.android.gestures.MoveGestureDetector) {
+                if (!isProgrammaticMove.value) {
+                    isFollowingLocation = false
+                }
+            }
+            override fun onMove(detector: com.mapbox.android.gestures.MoveGestureDetector): Boolean = false
+            override fun onMoveEnd(detector: com.mapbox.android.gestures.MoveGestureDetector) = Unit
+        })
+
+        onMapViewReady(mapView)
     }
 
-    // REAL on-device finding: a newly-computed route can be geographically
-    // far from wherever the map camera currently happens to be centered
-    // (e.g. still parked near (0,0) if no GNSS-quality fix has ever set
-    // the marker position this run, even though `routing/RoutingRepository.kt`
-    // successfully used a looser fallback origin for the ROUTE calculation
-    // itself) — the route would be computed and drawn correctly but
-    // invisible off-screen. Zoom-to-fit the route's own bounding box once
-    // per new route, independent of the marker-centering logic above.
+    // Round 2 UI smoothness pass, carried over from the osmdroid version:
+    // GNSS/DR ticks arrive at ~5-10Hz; this loop runs at display frame rate
+    // (~60Hz) chasing the smoothed value via [PositionSmoother] so the
+    // marker/camera glide instead of visibly stepping.
+    LaunchedEffect(mapView) {
+        while (true) {
+            withFrameNanos { }
+            // Bearing computed FIRST and applied to the camera before the
+            // marker-rotation math below needs it (see that block's own
+            // comment for why).
+            //
+            // REAL BUG FOUND on-device (2026-09-04, MapVerificationScreen
+            // test: the recenter button appeared to do nothing while
+            // heading-up was on): this call was UNGUARDED by
+            // [isProgrammaticMove] — every ~60fps frame's bearing update
+            // apparently registers with Mapbox's gesture plugin as a
+            // camera move (contrary to this file's earlier assumption,
+            // documented elsewhere, that Mapbox's OnMoveListener only
+            // fires for genuine touch-gesture moves), re-firing
+            // `onMoveBegin` and forcing `isFollowingLocation` back to
+            // false on literally the next frame after the recenter button
+            // had just set it true. Wrapping this call in the SAME guard
+            // the center-recenter calls already use fixes it — confirmed
+            // this guard IS load-bearing here after all, not the
+            // redundant belt-and-braces it was assumed to be.
+            val smoothedHeadingDeg = positionSmoother.stepHeading(targetHeadingDeg.value)
+            isProgrammaticMove.value = true
+            mapView.mapboxMap.setCamera(CameraOptions.Builder().bearing(smoothedHeadingDeg.toDouble()).build())
+            isProgrammaticMove.value = false
+
+            val manager = pointAnnotationManager
+            val target = targetPosition.value
+            if (manager != null && target != null) {
+                val smoothed = positionSmoother.stepPosition(target.latitude, target.longitude)
+                if (smoothed != null) {
+                    val point = Point.fromLngLat(smoothed.second, smoothed.first)
+                    // REAL BUG FOUND on-device (2026-09-04, MapVerificationScreen
+                    // test): Mapbox's `icon-rotate` is VIEWPORT-relative (a
+                    // fixed on-screen direction), NOT map/compass-relative —
+                    // confirmed by testing heading-up mode at heading=180:
+                    // the arrow pointed DOWN (the raw uncorrected heading)
+                    // instead of UP (the correct "pointing where you're
+                    // going" reading once the map itself has rotated 180 to
+                    // put that heading at the top of the screen). Same
+                    // correction the osmdroid version's `iconRotationDeg`
+                    // doc already required, just a different sign: Mapbox's
+                    // `bearing` convention already matches "heading points
+                    // up" directly (no negation needed, unlike osmdroid's
+                    // `setMapOrientation`), so the subtraction here uses the
+                    // SAME sign, not flipped.
+                    val rotationDeg = targetMarkerHeadingDeg.value?.let { it - smoothedHeadingDeg }
+                    val existing = currentPositionAnnotation
+                    if (existing == null) {
+                        val options = PointAnnotationOptions()
+                            .withPoint(point)
+                            .withIconImage(if (rotationDeg != null) arrowMarkerBitmap else dotMarkerBitmap)
+                            .apply { if (rotationDeg != null) withIconRotate(rotationDeg.toDouble()) }
+                        currentPositionAnnotation = manager.create(options)
+                    } else {
+                        existing.point = point
+                        existing.iconImageBitmap = if (rotationDeg != null) arrowMarkerBitmap else dotMarkerBitmap
+                        existing.iconRotate = rotationDeg?.toDouble()
+                        manager.update(existing)
+                    }
+                }
+            }
+        }
+    }
+
+    // Zoom-to-fit the route's own bounding box once per new route — same
+    // reasoning as the osmdroid version's zoomToBoundingBox call (a freshly
+    // computed route can be far from wherever the camera currently is).
     LaunchedEffect(routeGeometry) {
         val geometry = routeGeometry
         if (!geometry.isNullOrEmpty()) {
-            mapView.post {
-                // BUG FIX (Round 2, 2026-08-28, user report: "glitchy
-                // buffer... large pixel tiles of some random places" after
-                // pressing Go, needing a manual recenter tap to fix): this
-                // call used to fire WITHOUT the isProgrammaticMove guard
-                // the marker-recenter logic below already uses, so
-                // osmdroid's own onScroll/onZoom callbacks (fired BY
-                // zoomToBoundingBox itself) were misclassified as a REAL
-                // user gesture by the MapListener below, permanently
-                // flipping isFollowingLocation off. Later, when navigation
-                // started and the map zoomed in tight
-                // (MapScreen.kt's isNavigating effect, setZoom(19.0)), it
-                // zoomed in at the STALE route-preview center instead of
-                // recentering on the live position — a real but far-off,
-                // sparsely-tile-cached area, which is exactly what reads
-                // as "random places" made of large placeholder tiles.
-                // animated=false (was true) for the same reason setCenter
-                // (not animateTo) is used for marker-following below: an
-                // ANIMATED call fires its scroll/zoom callbacks
-                // asynchronously over several frames, after this flag
-                // would already be reset — only an instant jump lets the
-                // guard actually cover every callback it causes.
-                isProgrammaticMove.value = true
-                mapView.zoomToBoundingBox(BoundingBox.fromGeoPoints(geometry), false, 100)
-                isProgrammaticMove.value = false
-            }
+            val points = geometry.map { it.toMapboxPoint() }
+            // Deprecated in favor of a callback-based overload (compiler
+            // warning, not an error) — this synchronous form still works
+            // and its EdgeInsets padding directly matches the fixed-margin
+            // behavior the osmdroid version's zoomToBoundingBox(..., 100)
+            // used, so it's kept rather than guessing at the newer async
+            // API's exact semantics without a device to verify against.
+            @Suppress("DEPRECATION")
+            val cameraOptions = mapView.mapboxMap.cameraForCoordinates(points, com.mapbox.maps.EdgeInsets(100.0, 100.0, 100.0, 100.0), null, null)
+            isProgrammaticMove.value = true
+            mapView.mapboxMap.setCamera(cameraOptions)
+            isProgrammaticMove.value = false
         }
     }
 
@@ -510,56 +492,75 @@ fun StreetMapView(
             modifier = Modifier.fillMaxSize(),
             factory = { mapView },
             update = { view ->
-                routePolyline.setPoints(routeGeometry ?: emptyList())
-                overlay.mode = mode
-                // Round 2 addition (2026-08-28, user report: "line
-                // terminating vaguely") — the route's own last geometry
-                // point IS the destination; no separate geocode lookup
-                // needed, RoutingRepository's OSRM response already ends
-                // exactly there.
-                overlay.destination = routeGeometry?.lastOrNull()
-                overlay.anchor = if (anchorLatDeg != null && anchorLonDeg != null) {
-                    GeoPoint(anchorLatDeg, anchorLonDeg)
+                val routeSource = view.mapboxMap.style?.getSource(SOURCE_ID_ROUTE_LINE) as? GeoJsonSource
+                if (routeGeometry.isNullOrEmpty()) {
+                    routeSource?.geometry(LineString.fromLngLats(emptyList()))
                 } else {
-                    null
+                    routeSource?.geometry(LineString.fromLngLats(routeGeometry.map { it.toMapboxPoint() }))
                 }
-                // Heading-up rotation while navigating (headingDeg != null),
-                // north-up (0 degrees) otherwise. Feeds the target the
-                // per-frame smoothing loop above chases toward — does NOT
-                // set the map's rotation directly (Round 2 UI smoothness
-                // pass, 2026-08-28, see that loop's doc). Same treatment
-                // for markerHeadingDeg (the directional-arrow icon heading)
-                // — see targetMarkerHeadingDeg's own doc for why the icon-
-                // rotation subtraction has to happen in that loop, not here.
+
+                val manager = pointAnnotationManager
+                val destinationPoint = routeGeometry?.lastOrNull()?.toMapboxPoint()
+                if (manager != null) {
+                    if (destinationPoint == null) {
+                        destinationAnnotation?.let { manager.delete(it) }
+                        destinationAnnotation = null
+                    } else {
+                        val existing = destinationAnnotation
+                        if (existing == null) {
+                            destinationAnnotation = manager.create(
+                                PointAnnotationOptions()
+                                    .withPoint(destinationPoint)
+                                    .withIconImage(destinationPinBitmap)
+                                    .withIconAnchor(IconAnchor.BOTTOM),
+                            )
+                        } else {
+                            existing.point = destinationPoint
+                            manager.update(existing)
+                        }
+                    }
+                }
+
+                val anchorSource = view.mapboxMap.style?.getSource(SOURCE_ID_ANCHOR_LINE) as? GeoJsonSource
+                val showAnchorLine = (mode == GnssMode.DEAD_RECKONING || mode == GnssMode.REACQUISITION) &&
+                    anchorLatDeg != null && anchorLonDeg != null && currentLatDeg != null && currentLonDeg != null
+                if (showAnchorLine) {
+                    val anchorPoint = Point.fromLngLat(anchorLonDeg!!, anchorLatDeg!!)
+                    val currentPoint = Point.fromLngLat(currentLonDeg!!, currentLatDeg!!)
+                    anchorSource?.geometry(LineString.fromLngLats(listOf(anchorPoint, currentPoint)))
+                    if (manager != null) {
+                        val existing = anchorAnnotation
+                        if (existing == null) {
+                            anchorAnnotation = manager.create(
+                                PointAnnotationOptions().withPoint(anchorPoint).withIconImage(anchorDotBitmap),
+                            )
+                        } else {
+                            existing.point = anchorPoint
+                            manager.update(existing)
+                        }
+                    }
+                } else {
+                    anchorSource?.geometry(LineString.fromLngLats(emptyList()))
+                    manager?.let { m -> anchorAnnotation?.let { m.delete(it) } }
+                    anchorAnnotation = null
+                }
+
                 targetHeadingDeg.value = headingDeg ?: 0f
                 targetMarkerHeadingDeg.value = markerHeadingDeg
                 if (currentLatDeg != null && currentLonDeg != null) {
-                    val point = GeoPoint(currentLatDeg, currentLonDeg)
-                    // Feeds the target the per-frame smoothing loop above
-                    // chases toward — does NOT set the marker position
-                    // directly (same Round 2 change as headingDeg above).
-                    targetPosition.value = point
+                    val geoPoint = GeoPoint(currentLatDeg, currentLonDeg)
+                    targetPosition.value = geoPoint
+                    val point = geoPoint.toMapboxPoint()
                     val previousCenter = lastCenteredPoint.value
                     val shouldRecenter = isFollowingLocation &&
-                        (previousCenter == null || previousCenter.distanceToAsDouble(point) >= MIN_RECENTER_DISTANCE_M)
+                        (previousCenter == null || distanceMeters(previousCenter, point) >= MIN_RECENTER_DISTANCE_M)
                     if (shouldRecenter) {
-                        // setCenter (instant), not animateTo (animated over
-                        // several frames) — the animated version would fire
-                        // onScroll callbacks asynchronously AFTER this flag
-                        // is reset below, so the MapListener above couldn't
-                        // tell those apart from a real user gesture
-                        // mid-animation. Trades away the smooth pan for a
-                        // reliable follow/user-pan distinction, an honest
-                        // simplification given this map already jumps
-                        // around from real GNSS/DR position-source changes
-                        // (see the fix above).
                         isProgrammaticMove.value = true
-                        view.controller.setCenter(point)
+                        view.mapboxMap.setCamera(CameraOptions.Builder().center(point).build())
                         isProgrammaticMove.value = false
                         lastCenteredPoint.value = point
                     }
                 }
-                view.invalidate()
             },
         )
 
@@ -569,34 +570,28 @@ fun StreetMapView(
                 contentDescription = "Resume following current location",
                 onClick = {
                     isFollowingLocation = true
-                    // Prefer the TRUE target position over overlay.position
-                    // (Round 2: the latter is now a smoothed, slightly-
-                    // lagged cosmetic value, see the smoothing loop above)
-                    // — recentering should snap to where the phone actually
-                    // is, not to wherever the marker's glide animation
-                    // happens to be mid-frame.
-                    val point = targetPosition.value ?: overlay.position
+                    val geoPoint = targetPosition.value
+                    val point = geoPoint?.toMapboxPoint()
                     if (point != null) {
                         isProgrammaticMove.value = true
-                        mapView.controller.setCenter(point)
+                        mapView.mapboxMap.setCamera(CameraOptions.Builder().center(point).build())
                         isProgrammaticMove.value = false
                         lastCenteredPoint.value = point
                     } else {
-                        // No live position yet to snap to — just let the
-                        // next real position update (the `update` block
-                        // above) recenter as soon as one arrives.
                         lastCenteredPoint.value = null
                     }
                 },
-                // Bottom-end, like most map apps' recenter button, but
-                // pushed up well clear of MapScreen.kt's own bottom row
-                // (StatusOverlayContent's vehicle-mode selector + its
-                // recalibrate button, drawn ON TOP of this view in that
-                // screen's Box z-order) — REAL on-device finding: at the
-                // default 16dp padding this button was fully hidden behind
-                // that existing bottom row, not just visually close to it.
                 modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 96.dp),
             )
         }
     }
+}
+
+/** Equirectangular-approximation distance in meters — good enough at the few-meter recenter-threshold scale this is used for (same accuracy tradeoff osmdroid's own `distanceToAsDouble` made at this call site). */
+private fun distanceMeters(a: Point, b: Point): Double {
+    val metersPerDegLat = 111_320.0
+    val metersPerDegLon = 111_320.0 * kotlin.math.cos(Math.toRadians(a.latitude()))
+    val dLat = (b.latitude() - a.latitude()) * metersPerDegLat
+    val dLon = (b.longitude() - a.longitude()) * metersPerDegLon
+    return kotlin.math.sqrt(dLat * dLat + dLon * dLon)
 }

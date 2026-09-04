@@ -17,8 +17,7 @@ re-alignment on reacquisition, two deterministic (not yet ML-trained)
 motion-classification stand-ins, a Figma-derived UI with Drive/Map/
 History tabs, real OpenStreetMap street tiles, and full search ->
 route -> turn-by-turn navigation against live Nominatim/OSRM services.
-`train_motion_classifier.py` remains PLANNED (blocked on self-captured
-Pothole/Phone-Moved labels IO-VNBD doesn't provide). UPDATE (2026-09-01):
+UPDATE (2026-09-01):
 a real outdoor GNSS_AIDED lock has now happened (325.9s drive, 3
 GNSS_AIDED segments up to 149.9s, 3 genuine DEAD_RECKONING stretches up
 to 37.8s) — see DriveDataLogger.kt's entry below for the full result.
@@ -32,8 +31,26 @@ missing map anchor, tile-loading fights with `animateTo`, and others).
 Same day: SensorRecorder.kt gained a `CaptureLabel`
 (NONE/POTHOLE/PHONE_MOVED) marker mechanism and two debug-screen buttons
 so a real self-captured labeled drive can now be recorded — tooling
-only so far, no labeled drive has actually been captured yet, so
-`train_motion_classifier.py` stays PLANNED.
+only so far, no labeled drive has actually been captured yet. UPDATE
+(2026-09-02): `train_motion_classifier.py` is now IMPLEMENTED for 6 of
+PRD.md Section 14's 8 classes, using real (not heuristic) ground truth
+from IO-VNBD's vehicle CAN-bus CSV instead of waiting on a self-captured
+drive — see that file's own entry and `motion_labels.py`'s for the full
+finding. Measured result: an unweighted RandomForestClassifier reaches
+47.2% val accuracy, beating both a trivial majority-class guess (40.4%)
+and the deterministic on-device stand-ins re-implemented in Python
+(29.6%) — real but modest, and NOT wired into the app (two of six
+classes still have near-zero recall). Pothole and Phone-Moved remain
+blocked on a self-captured drive exactly as before — no signal for
+either exists anywhere in IO-VNBD.
+UPDATE (2026-09-04): the basemap was migrated from osmdroid/OpenStreetMap
+tiles to the Mapbox Maps SDK (PRD.md Section 7 amendment — see that
+section and `ui/map/StreetMapView.kt`'s own entry below for the full
+reasoning and what did/didn't carry over). Compiles and assembles clean,
+existing unit tests pass; NOT yet verified on a real device. The prior
+osmdroid+OSRM build is preserved intact and independently buildable in a
+sibling folder, `C:\projects\26168-osmdroid`, requiring no Mapbox
+account/credentials — a working fallback if ever needed.
 
 **The full chronological history — every dated bug fix, scope decision,
 and on-device verification — now lives in `summary.txt` at the repo
@@ -147,6 +164,22 @@ Important concept: the wrapper *jar* (gradle-wrapper.jar) is now
   `android/`. The project builds headlessly via `./gradlew.bat` with no
   further setup. `android/local.properties` (gitignored, machine-
   specific) points `sdk.dir` at the existing Android SDK install.
+UPDATE (2026-09-04, PRD.md Section 7 amendment): `settings.gradle.kts`
+  now also declares Mapbox's private Maven repo
+  (`api.mapbox.com/downloads/v2/releases/maven`) inside
+  `dependencyResolutionManagement`, authenticated with a hand-read
+  `MAPBOX_DOWNLOADS_TOKEN` from `local.properties` (fixed username
+  `"mapbox"`, per Mapbox's own convention — not a personal account name).
+  Read manually via `java.util.Properties` rather than
+  `providers.gradleProperty`, matching the existing `sdk.dir` pattern in
+  this same file rather than introducing gradle.properties (which,
+  unlike local.properties, IS git-tracked here) as a second config
+  surface. `local.properties` itself now carries two real Mapbox tokens:
+  `MAPBOX_DOWNLOADS_TOKEN` (secret, `DOWNLOADS:READ` scope only — used
+  solely by Gradle to fetch the SDK, never reaches the compiled app) and
+  `MAPBOX_PUBLIC_TOKEN` (public `pk.` token, safe client-side, consumed
+  by `app/build.gradle.kts` — see below). Anyone cloning this repo must
+  populate both from their own Mapbox account before the app resolves.
 
 android/app/build.gradle.kts
 Status: IMPLEMENTED
@@ -171,12 +204,51 @@ Known issue: the resulting debug APK is ~76 MB, almost entirely
   ahead of Slice 6 but not yet used. Not a problem for local builds, but
   worth trimming (e.g. `abiFilters`) before a demo APK needs to be
   side-loaded quickly.
+UPDATE (2026-09-04, PRD.md Section 7 amendment): adds
+  `com.mapbox.maps:android:11.29.1` alongside the existing `osmdroid`
+  dependency (comment on that line updated to point here rather than
+  claiming Mapbox was rejected — see PRD.md's dated amendment for the
+  full reasoning). `buildFeatures.buildConfig = true` newly enabled so
+  `BuildConfig.MAPBOX_PUBLIC_TOKEN` (read from `local.properties`, empty
+  string if absent) is available to app code.
+UPDATE (same day, later): the actual UI migration landed too —
+  `ui/map/StreetMapView.kt` (below) now renders via this Mapbox
+  dependency, not `osmdroid`. `osmdroid-android:6.1.20` is still declared
+  (nothing in the live app path calls it anymore, but it is not yet
+  removed — no functional reason to touch it this session, and the
+  preserved `C:\projects\26168-osmdroid` sibling folder is the actual
+  fallback if osmdroid is ever needed again, not this now-dead
+  dependency). Verified via `:app:assembleDebug` (full APK, Mapbox SDK
+  resolved/linked) and `:app:testDebugUnitTest` (all pass) — NOT yet
+  installed/run on a real device (CLAUDE.md Rule 13 — a clean build is
+  not on-device verification).
+UPDATE (2026-09-05, PRD.md Section 7 amendment, developer override —
+  see that amendment for the full record): adds the Mapbox Navigation
+  SDK, six modules (`com.mapbox.navigationcore:android/ui-maps/voice/
+  tripdata/ui-components/navigation:3.30.0`) plus
+  `androidx.constraintlayout:constraintlayout:2.1.4` (a real, required
+  transitive — `MapboxManeuverView` extends `ConstraintLayout` and
+  nothing else on the classpath provided it; the build failed with
+  "Supertypes... cannot be resolved" until this was added). Verified via
+  `:app:assembleDebug`/`:app:testDebugUnitTest` AND installed/run on a
+  real device this time — see `nav/NavigationSessionRepository.kt`'s
+  entry for the full on-device verification writeup.
 
 android/app/src/main/AndroidManifest.xml
 Status: IMPLEMENTED
 Purpose: Declares ACCESS_FINE/COARSE_LOCATION, HIGH_SAMPLING_RATE_SENSORS,
   and required accelerometer/gyroscope/GPS hardware features; registers
   MainActivity as launcher.
+UPDATE (2026-09-05, Mapbox Navigation SDK): FOREGROUND_SERVICE,
+  FOREGROUND_SERVICE_LOCATION, POST_NOTIFICATIONS, ACCESS_WIFI_STATE,
+  WAKE_LOCK, RECEIVE_BOOT_COMPLETED, and a foreground-service declaration
+  are auto-merged in from the Navigation SDK's own manifest (active
+  guidance runs as a foreground service with a persistent notification)
+  — confirmed via the actual merged manifest output, not assumed from
+  the SDK's docs claim of bundling them. POST_NOTIFICATIONS still needs
+  a RUNTIME request on API 33+ (a manifest declaration alone doesn't
+  grant it there) — added to `MainActivity.kt`'s permission-request flow
+  alongside the existing location-permission request.
 
 android/app/src/main/res/values/{strings.xml,themes.xml}
 Status: IMPLEMENTED
@@ -2957,11 +3029,136 @@ ui/map/StreetMapView.kt
 Status: IMPLEMENTED (Slice 8b) — marker/heading smoothing +
   directional heading arrow, both merged 2026-08-30 from two
   independently-built implementations (see MERGE NOTE below)
-Purpose: Real osmdroid/OpenStreetMap tile base layer plus the
-  current-position halo/ring marker, outage-anchor dashed line, and
-  active-route polyline — see this file's own extensive header doc
-  comment for the CARTO->MAPNIK tile-source history and the
-  setCenter-vs-animateTo camera-follow bug fix.
+Purpose: Real street-map base layer plus the current-position
+  halo/ring/directional-arrow marker, outage-anchor dashed line, active-
+  route line, and destination pin.
+MIGRATED TO MAPBOX (2026-09-04, PRD.md Section 7 amendment): this file's
+  entire osmdroid implementation was replaced with the Mapbox Maps SDK —
+  the public composable signature (name, every parameter) is UNCHANGED,
+  so every UPDATE note below this point describes the OLD osmdroid
+  implementation, kept as historical record of the bugs/decisions that
+  shaped the CURRENT marker/smoothing/follow-camera behavior, which this
+  rewrite preserved feature-for-feature except where noted. Concretely,
+  in the new implementation: `CurrentPositionOverlay`'s Canvas-drawn
+  halo/ring/dot/arrow/anchor/pin became bitmaps rendered once and
+  displayed via Mapbox's `PointAnnotationManager` (rotation is now a live
+  `iconRotate` property Mapbox's GPU compositor applies — no per-frame
+  canvas redraw needed, unlike the old arrow, which had to be); the
+  osmdroid `Polyline`/dashed-line-via-`DashPathEffect` became a raw
+  `GeoJsonSource`+`LineLayer` pair (the only style layer with real
+  `line-dasharray` support) for the route line and outage-anchor line;
+  `MapListener.onScroll` became `OnMoveListener` (gestures plugin) for
+  follow/user-pan detection; `zoomToBoundingBox` became
+  `cameraForCoordinates`+`setCamera`. `PositionSmoother` (below) is
+  REUSED UNCHANGED — pure lat/lon/heading math, no osmdroid dependency,
+  so the same per-frame chase loop and its whole bug history (below)
+  still applies verbatim. Dark mode is now Mapbox's own `Style.DARK` (a
+  real dark cartography style), replacing the old `INVERT_COLORS` filter
+  hack the osmdroid version needed because its one tile source had no
+  native dark variant. SCOPED OUT, not silently dropped: offline tile
+  pre-fetch/download — see `ui/screens/MapScreen.kt`'s own UPDATE entry
+  for why (it was already a permanent no-op against osmdroid's MAPNIK
+  source before this migration).
+VERIFIED ON A REAL DEVICE (2026-09-04, same S24 FE this project always
+  tests on): installed via `installDebug`, launched, empty crash buffer
+  (`adb logcat -b crash`) and no FATAL EXCEPTION in logcat. Screenshot
+  confirms the dark Mapbox style genuinely rendering real Chennai street
+  geometry (PUZHUTHIVAKKAM/MADIPAKKAM/ADAMBAKKAM labels, Inner Ring Road),
+  with the Mapbox wordmark + attribution control visible (proof it's
+  really Mapbox, not a blank/fallback view), scale bar, search bar, and
+  the ported recenter button all laid out correctly. Some
+  ClassNotFoundException System.err spam for
+  com.mapbox.common.location.*/MovementMonitor*/BatteryMonitor* classes
+  appears at startup -- Mapbox's own optional-capability probing
+  (background location/telemetry extras this project didn't add), caught
+  and swallowed internally by the SDK, not a real error; app is stable.
+REAL BUG FOUND + FIXED (2026-09-04, user report: "I cant see the current
+  location indicator blue icon ... the path does not show orange line"):
+  confirmed the marker/route-line/anchor-line gap above was NOT just "no
+  GNSS fix yet" — reproduced live on the real search -> destination ->
+  route flow. Root cause: TWO separate `LaunchedEffect`s both called
+  `mapboxMap.loadStyle(...)`, one keyed on `mapView` (with the real setup
+  callback — addSource/addLayer for the route/anchor lines,
+  createPointAnnotationManager for the marker) and a second, keyed on
+  `isDarkTheme`, with NO callback. Compose runs every `LaunchedEffect` at
+  least once on first composition regardless of its key, so BOTH fired on
+  launch — and since Mapbox's `loadStyle` fully REPLACES the style
+  (sources, layers, and the annotation plugin's own internal layer all
+  get torn down), whichever landed second silently wiped out everything
+  the first had just added. No error anywhere: base map tiles render
+  fine either way (a plain style load always succeeds), only the CUSTOM
+  layers were the casualty — which is exactly why "the map renders" but
+  "nothing on it shows" looked contradictory until traced through.
+  FIXED by keying the WHOLE style setup (load + every addSource/addLayer/
+  createPointAnnotationManager call) on `isDarkTheme` alone, so a theme
+  change correctly REDOES the setup instead of losing it, with only one
+  `loadStyle` call site left in the file. Stale annotation handles
+  (`currentPositionAnnotation`/`anchorAnnotation`/`destinationAnnotation`)
+  are reset to null inside the same callback so a later theme change
+  creates fresh ones instead of calling `.update()` on orphaned
+  references from the torn-down style.
+VERIFIED ON A REAL DEVICE, same S24 FE, same day: rebuilt, reinstalled,
+  relaunched — the current-position marker (blue ring + directional
+  arrow) now renders on the real MAP tab with a live DEAD_RECKONING mode
+  reading. Repeated the user's exact real flow (search -> tapped a recent
+  destination -> route computed) and the real OSRM route now renders as
+  a solid red line correctly following actual roads through
+  Puzhuthivakkam/Adambakkam/Alandur toward Nandambakkam — not a straight
+  line, genuinely road-snapped geometry from RoutingRepository's OSRM
+  call. Empty crash buffer, no FATAL EXCEPTION. NOT YET exercised: the
+  outage-anchor dashed line specifically (needs a real DEAD_RECKONING
+  transition with a set anchor point, not just the mode reading DR),
+  heading-up camera rotation, and the follow/recenter gesture logic —
+  `ui/screens/MapVerificationScreen.kt` (new file, see its own entry) was
+  built specifically to exercise these without waiting on a real GNSS
+  outage, and is the next thing to click through.
+
+ALL REMAINING PIECES VERIFIED ON A REAL DEVICE (2026-09-04, same
+  session, via MapVerificationScreen): two more real bugs found and
+  fixed, one false alarm ruled out.
+  1. REAL BUG: the marker-arrow's iconRotate was set directly from raw
+     heading with no correction -- Mapbox's icon-rotate turned out to be
+     VIEWPORT-relative (a fixed on-screen direction), not map-relative,
+     confirmed by testing heading-up mode at heading=180: the arrow
+     pointed DOWN (wrong) instead of UP (correct, since the map itself
+     rotates 180 in heading-up mode, putting that heading at the top of
+     the screen). Same correction the osmdroid version's marker rotation
+     already needed, just the opposite sign -- Mapbox's bearing
+     convention already matches "heading points up" directly, no
+     negation needed unlike osmdroid's setMapOrientation. Fixed by
+     subtracting the current smoothed map bearing from the target
+     heading before setting iconRotate. Re-verified: arrow now stays
+     pointing up correctly through the whole simulated heading sweep.
+  2. REAL BUG: the smoothing loop's bearing-only setCamera call (for
+     heading-up rotation) was UNGUARDED by isProgrammaticMove, unlike
+     the center-recenter calls. Mapbox's OnMoveListener turned out to
+     fire for ANY camera change, not just genuine touch gestures (this
+     file's earlier assumption that the guard was redundant
+     belt-and-braces was wrong) -- every ~60fps bearing update was
+     re-triggering onMoveBegin and forcing isFollowingLocation back
+     to false the frame after the recenter button set it true, making
+     the button appear broken. Fixed by wrapping that call in the same
+     guard. Re-verified with temporary Log.d instrumentation (removed
+     after use) confirming onMoveBegin no longer misfires during
+     programmatic bearing updates.
+  3. FALSE ALARM, not a code bug: after fix #2, the recenter button
+     STILL appeared unresponsive in manual testing -- traced with
+     uiautomator dump to a testing-methodology error, not application
+     code: the button's real on-screen bounds were nowhere near where
+     screenshot-pixel-math had placed them (a scaling error converting
+     the downscaled screenshot's coordinates back to real device
+     pixels). Tapping the button's ACTUAL bounds worked correctly the
+     whole time -- isFollowingLocation flips true, the button
+     disappears, and the camera snaps back to the marker. No code
+     change was needed for this one; recorded here so the false lead
+     isn't repeated.
+  Final state: `:app:testDebugUnitTest` and `:app:assembleDebug` both
+  pass; installed fresh, empty crash buffer, no FATAL EXCEPTION. All six
+  pieces (marker, directional arrow + rotation, route line, destination
+  pin, outage-anchor line, heading-up camera rotation, follow/recenter)
+  confirmed working via MapVerificationScreen; marker + route line
+  additionally confirmed on the real MapScreen flow (search ->
+  destination -> route) earlier the same session.
 UPDATE (Round 2 UI smoothness pass, 2026-08-28): the marker position and
   map rotation (`setMapOrientation`) used to be set directly inside the
   `AndroidView` `update` block, which only re-runs on a real GNSS/DR tick
@@ -3029,8 +3226,10 @@ MERGE NOTE (2026-08-30): the two Round 2 branches independently built
   `overlay.position` every frame. The tween's `LaunchedEffect` and the
   now-unused `MARKER_ANIMATION_DURATION_MS` constant were deleted.
 Connected to: ui/screens/MapScreen.kt (currentLatDeg/currentLonDeg,
-  headingDeg, markerHeadingDeg) -> StreetMapView -> CurrentPositionOverlay;
-  ui/map/PositionSmoother -> StreetMapView.kt
+  headingDeg, markerHeadingDeg) -> StreetMapView -> Mapbox
+  PointAnnotationManager/GeoJsonSource+LineLayer (osmdroid's
+  CurrentPositionOverlay/MapListener/Polyline no longer exist here — see
+  MIGRATED TO MAPBOX note above); ui/map/PositionSmoother -> StreetMapView.kt
 
 ui/map/TrackCanvas.kt
 Status: REMOVED (2026-08-30) — was IMPLEMENTED (Slice 8, 2026-08-25)
@@ -3192,10 +3391,280 @@ REAL CRASH FOUND + FIXED (2026-08-29, user report: "if i start the
   computing the same route succeeds end-to-end (ActiveRouteCard renders
   a real distance/duration/steps) with the process still alive and the
   crash buffer empty.
+UPDATE (2026-09-04, PRD.md Section 7 Mapbox migration): `mapViewRef`'s
+  type changed from `org.osmdroid.views.MapView` to `com.mapbox.maps.MapView`
+  (StreetMapView.kt's `onMapViewReady` now hands back the Mapbox
+  instance). Two ripples from that: (1) the navigation-start zoom-in now
+  calls `mapboxMap.setCamera(CameraOptions.Builder().zoom(19.0).build())`
+  instead of osmdroid's `controller.setZoom`; (2) BOTH the automatic
+  prefetch (above) and ActiveRouteCard's explicit "Download offline"
+  button's tile-download call were REMOVED, not adapted — they were built
+  against osmdroid's `CacheManager`, which this screen no longer has a
+  reference to, and (per the crash-fix finding directly above) that call
+  path could never succeed anyway. The explicit button now just persists
+  the route JSON (`OfflineRouteCache.saveRoute`, unaffected — no
+  MapView/tiles involved) and shows an honest "isn't implemented for the
+  Mapbox map yet" status (CLAUDE.md Rule 13) rather than silently doing
+  nothing or calling a function with a type it can't provide. Building a
+  real Mapbox-native offline system (`OfflineManager`/`TileStore`) is
+  explicitly NOT done here — a separately-scoped feature, not a port.
+UPDATE (2026-09-05, PRD.md Section 7 amendment, Mapbox Navigation SDK,
+  developer override): `isNavigating` now means the FULL-SCREEN
+  `ui/screens/ActiveGuidanceScreen.kt` overlay is showing (drawn last,
+  own MapView) — the old inline `NavigationInstructionCard`/
+  `NavigationEtaBar` overlay on top of THIS screen's `StreetMapView` is
+  REMOVED (both components and the `routeProgress`/`RouteProgress.compute`
+  local-East/North-frame calculation that fed them are now dead code,
+  deleted rather than left orphaned). `ActiveRouteCard`'s "Go" button no
+  longer just flips `isNavigating` — it first calls
+  `nav/NavigationSessionRepository.requestRoute` (a REAL Mapbox
+  Directions API call, separate from the OSRM route already shown in the
+  card — see that file's header doc for why) and only enters the overlay
+  once that route is ready; a failure surfaces via the existing
+  `routingError` text instead of silently doing nothing. New "Free
+  Drive" button (idle state, no destination needed) starts a Mapbox trip
+  session with no route via the same overlay. HONEST CONSEQUENCE, not
+  silently dropped: the DR-aware route progress this screen used to
+  compute (`RouteProgress.compute` projecting the route into the local
+  East/North frame so "distance remaining" kept counting through a GNSS
+  outage via physics/ML dead reckoning, not just live GNSS) does NOT
+  carry over to active guidance — Mapbox's own `RouteProgress` (now
+  driving the ETA text in `ActiveGuidanceScreen.kt`) is GNSS-only, same
+  as any standard nav app. The route PREVIEW state (before tapping "Go")
+  is completely unaffected by any of this.
 Connected to: routing/GeocodingRepository, routing/RoutingRepository,
   routing/OfflineRouteCache, fusion/GeoProjection, ui/screens/SearchScreen
-  (new, opened on demand) -> ui/components/ActiveRouteCard/
-  NavigationInstructionCard/NavigationEtaBar
+  (new, opened on demand) -> ui/components/ActiveRouteCard;
+  nav/NavigationSessionRepository -> ui/screens/ActiveGuidanceScreen
+  (full-screen overlay, isNavigating || isFreeDriving)
+```
+
+```
+ui/screens/MapVerificationScreen.kt
+Status: IMPLEMENTED (new file, 2026-09-04)
+Purpose: TEST TOOLING ONLY (CLAUDE.md Android Rule 8 / PRD.md Section
+  31/32's "controlled simulated" testing path) — exercises
+  `ui/map/StreetMapView.kt`'s Mapbox rendering (position marker,
+  directional arrow, outage-anchor dashed line, route line, destination
+  pin, heading-up camera rotation, follow/recenter gesture logic) with
+  entirely client-side simulated data, so it can be verified on a real
+  device without waiting on a real GNSS fix or an outdoor drive. Built
+  the same day the real marker/route-line bug above was found and fixed,
+  specifically so the remaining unverified pieces (outage-anchor line,
+  heading-up rotation, follow/recenter) don't need another real bug
+  report to surface — click through it instead.
+Important concept: simulates a small fixed SQUARE LOOP (not a straight
+  line) so heading changes at each corner exercise the marker-arrow
+  rotation and, when heading-up is toggled, the map bearing rotation,
+  without needing any button taps — movement alone covers it. Never
+  reads or writes any real GNSS/DR/fusion state; `ui/screens/MapScreen.kt`'s
+  real pipeline is completely untouched by this file (CLAUDE.md Rule 8's
+  "clearly separated from the shipped demo path" — verified by
+  construction, this file has no import of any real repository).
+Reached only via the existing debug screen (`MainActivity.kt`'s
+  `IdrSensorScreen`, same "Debug" entry point already used for the
+  sensor-recording/drive-logging test tools) through a new
+  `onShowMapVerification` callback and a `showMapVerificationScreen`
+  boolean, mirroring the existing `showDebugScreen` pattern exactly
+  (including its own `BackHandler`).
+Connected to: MainActivity.kt (IdrSensorScreen's "Verify Mapbox UI
+  (simulated)" button) -> MapVerificationScreen -> ui/map/StreetMapView
+```
+
+```
+nav/NavigationSessionRepository.kt
+Status: IMPLEMENTED (new file, 2026-09-05)
+Purpose: Owns the Mapbox Navigation SDK's active-guidance/free-drive
+  session (PRD.md Section 7 2026-09-05 amendment, developer-requested
+  override of CLAUDE.md Rule 2/4's normal discussion-first process — the
+  developer's own words were "disregard claude.md"; the tradeoffs
+  (separate billing SKUs, separate SDK footprint, explicitly a "general
+  maps competitor" capability) were surfaced first and the developer
+  confirmed proceeding — see PRD.md's dated amendment for the full
+  record). A singleton object, not a per-screen instance, matching
+  [MapboxNavigationApp]/[MapboxNavigation]'s own process-wide-singleton
+  design (one native navigator per app) rather than fighting that shape.
+REAL ROUTING-BACKEND SPLIT (CLAUDE.md Rule 9 — naming this explicitly,
+  it's a non-obvious boundary): [requestRoute] calls Mapbox's own
+  Directions API via this SDK, NOT `routing/RoutingRepository.kt`'s
+  OSRM call — voice/banner/lane instruction TEXT is generated
+  server-side by Mapbox's routing engine and does not exist in a plain
+  OSRM response. The OSRM-based route PREVIEW (search,
+  distance/duration, `ActiveRouteCard`) is completely unchanged; only
+  entering active guidance (`startActiveGuidance`) or free-drive
+  (`startFreeDrive`) touches this file.
+Real API surface confirmed by decompiling the actual downloaded SDK
+  jars (`com.mapbox.navigationcore` v3.30.0), not guessed from
+  memory or an outdated doc page — see the REAL API SURFACE NOTE below.
+REAL API SURFACE NOTE: this SDK generation (v3) has NO single
+  "NavigationView"/"Drop-In UI" widget — that class only exists in an
+  older v2 doc page that was initially (incorrectly) assumed to still
+  apply. v3's real architecture is individual components
+  (`MapboxManeuverView` for banner+lane, the `voice` module's
+  `MapboxSpeechApi`/`MapboxVoiceInstructionsPlayer`, the core
+  `MapboxNavigation` session) assembled by the app — this file is that
+  assembly.
+REAL BUG FOUND + FIXED (2026-09-05, before first successful install):
+  `MapboxVoiceInstructionsPlayer`'s second constructor parameter is a
+  LANGUAGE CODE ("en"), not an access token — copied
+  `MapboxSpeechApi`'s constructor shape (where the second param really
+  IS a token) onto this class without checking, and it crashed on every
+  launch (`NullPointerException` inside Android's own
+  `TextToSpeech.isLanguageAvailable` trying to parse the Mapbox token
+  string as a `Locale`). Fixed by passing `"en"`.
+Automatic rerouting on off-route (developer-requested feature) is
+  Mapbox's own built-in `MapboxRerouteController` — `onAttached`
+  confirms `setRerouteEnabled(true)` rather than assuming the SDK
+  default (CLAUDE.md Rule 13). NOT independently verified triggering a
+  real reroute — needs an actual off-route deviation, which this
+  session's stationary/simulated testing could not produce.
+Connected to: MainActivity.kt (MapboxNavigationApp.setup, initIfNeeded)
+  -> ui/screens/MapScreen.kt (requestRoute/startActiveGuidance/
+  startFreeDrive) -> ui/screens/ActiveGuidanceScreen.kt (consumes
+  `state` StateFlow + `locationProvider`)
+```
+
+```
+ui/screens/ActiveGuidanceScreen.kt
+Status: IMPLEMENTED (new file, 2026-09-05)
+Purpose: Mapbox Navigation SDK active-guidance/free-drive full-screen
+  overlay (PRD.md Section 7 2026-09-05 amendment). Simpler than the
+  idle/route-preview map (`ui/map/StreetMapView.kt`) in one respect —
+  the current-position marker is the Maps SDK's own built-in location
+  puck (`mapView.location`), fed by
+  `NavigationSessionRepository.locationProvider`, not a custom
+  bitmap/annotation — but the route line IS drawn (same
+  GeoJsonSource+LineLayer pattern StreetMapView.kt uses, CtaRed to
+  match; see the REAL BUG note below for why this needed a fix).
+  `MapboxManeuverView` (an Android View, wrapped via `AndroidView`)
+  handles banner text + lane guidance as one bundled component. Voice
+  announcements play automatically via
+  `NavigationSessionRepository`'s own observers — nothing in this file
+  triggers audio directly.
+REAL BUG FOUND + FIXED (2026-09-05, user report: "the orange line path
+  to destination is not coming... just a free drive window with the
+  blue circle"): this screen originally drew NO route line at all — a
+  deliberate scope-cut documented as "simpler than StreetMapView.kt",
+  but that read as a real broken feature to a user starting guidance,
+  not an acceptable simplification. Fixed by adding
+  `NavUiState.routeGeometryPoints` to `nav/NavigationSessionRepository.kt`
+  (decoded once from the active route's polyline6 geometry in
+  `startActiveGuidance`, see that file's entry) and drawing it here.
+  SECOND REAL BUG caught while fixing the first, same race class
+  `ui/map/StreetMapView.kt`'s style-load bug already was: the route's
+  geometry is set in the repository BEFORE this screen even composes,
+  so a naive `LaunchedEffect(navState.routeGeometryPoints)` alone could
+  run (and find `getSource(...)` still null, since style loading is
+  async) BEFORE the style-load callback that creates the source has
+  fired — and since that value never changes again afterward, nothing
+  would retry. Fixed by ALSO seeding the source's initial geometry
+  directly from the live repository state (`NavigationSessionRepository.
+  state.value`, not the possibly-stale captured `navState`) inside the
+  style-load callback itself, so a route present at screen-open time is
+  drawn regardless of which finishes first.
+VERIFIED ON A REAL DEVICE (2026-09-05, same session, same S24 FE): real
+  guidance to Voltas Colony, Chennai — the route line now renders
+  correctly, visibly following the actual road geometry (traced down
+  13th extension Street then turning, matching the "Turn right, 200 ft"
+  banner shown at the same moment).
+Important concept: `isFreeDrive` hides the maneuver/ETA UI (free-drive
+  has no route) and shows only the live map-matched position + Exit.
+  `DisposableEffect` calls `NavigationSessionRepository.stop()` on
+  dispose as a defensive backstop — `ui/screens/MapScreen.kt`'s own
+  `onExit` callback also calls `stop()` before this composable leaves
+  composition, so it's called twice in the normal exit path (harmless,
+  idempotent) but guarantees the session tears down even if this screen
+  is ever dismissed some other way.
+VERIFIED ON A REAL DEVICE (2026-09-05, same S24 FE): free-drive —
+  real location puck + compass control visible, live map-matched
+  position tracked as the phone (device, stationary but with GNSS
+  drift/dead-reckoning still running underneath) moved between ticks,
+  clean Exit back to the normal MapScreen with the GNSS/DR pipeline
+  unaffected. Active guidance on a real destination (Voltas Colony,
+  Chennai) — real Mapbox-routed "Turn right, 100 ft" banner instruction
+  rendered by `MapboxManeuverView` with the correct turn icon, live ETA
+  text (3834 m / 14 min) from Mapbox's own `RouteProgress`, clean Exit.
+  Empty crash buffer both times. See `nav/NavigationSessionRepository.kt`'s
+  own entry for what's NOT independently verified (audible voice, a
+  real reroute trigger).
+UPDATE (2026-09-05, same session, developer-requested): added
+  follow/recenter — same `OnMoveListener`/`isFollowingLocation`/
+  `isProgrammaticMove` pattern `ui/map/StreetMapView.kt` uses, applied
+  correctly from the start this time (the per-tick auto-follow
+  `setCamera` call is guarded, learning directly from
+  StreetMapView.kt's own dated bug where an unguarded bearing-only
+  `setCamera` call fought its recenter button). Recenter button placed
+  `BottomEnd` (not `TopEnd`, which would collide with Mapbox's own
+  compass control there by default). VERIFIED ON A REAL DEVICE: panned
+  the map manually mid-guidance, recenter button appeared, tapping it
+  snapped the camera back and the button disappeared — worked correctly
+  on the first try (no repeat of StreetMapView's bug).
+UPDATE (2026-09-05, same session, developer-requested: "make it an
+  arrow pointing towards the direction the front of the phone is
+  facing"): REAL BUG FOUND — `puckBearingEnabled`/`puckBearing` alone
+  only select WHICH heading source rotates the puck; they don't change
+  its SHAPE, and the plugin's actual default `locationPuck` is a plain
+  non-directional dot regardless. Fixed with an explicit
+  `mapView.location.locationPuck = createDefault2DPuck(withBearing = true)`,
+  Mapbox's own bearing-aware 2D puck (a dot + arrow/chevron indicator).
+  `PuckBearing.HEADING` (device compass, already set — not `.COURSE`,
+  GPS direction of travel) is what "front of the phone" actually means
+  here. VERIFIED ON A REAL DEVICE: the puck now shows a visible
+  directional arrow attached to the dot during active guidance.
+REAL BUG FOUND + FIXED (2026-09-05, user report: "the gnss aided ->
+  transition -> dead reckoning -> reacquisition -> gnss aided card is
+  gone, add that along with speed, moving/stationary/turning cards as
+  well"): this screen is a completely separate full-screen overlay from
+  `ui/screens/MapScreen.kt` (own MapView, drawn last on top) and — unlike
+  `StatusOverlayContent.kt`, which MapScreen keeps rendering underneath
+  it — never received the underlying GNSS/DR pipeline state
+  (`DeadReckoningState`/`GnssModeUiState`/`MlVelocityUiState`/
+  `FusedPositionUiState`) in the first place, only
+  `NavigationSessionRepository`'s Mapbox-side state. So FR10's status
+  readout simply didn't exist here from day one, not a regression in the
+  narrow sense, but a real gap once a user is actually using the feature.
+  Fixed by adding `drState`/`gnssState`/`mlState`/`fusedState` params
+  (threaded through from `ui/screens/MapScreen.kt`, which already holds
+  all four) and rendering the same three chips `StatusOverlayContent.kt`
+  shows — GNSS state-machine mode (color-coded
+  GNSS_AIDED/TRANSITION/DEAD_RECKONING/REACQUISITION, same palette), 
+  speed, motion label (Stationary/Moving/Turning/Accelerating/Braking/
+  Cruising/Pothole) — computed via that same file's `estimateSpeedMps`/
+  `estimateMotionLabel` (both already `internal` in `ui.screens`, shared
+  rather than duplicated, so the two screens can't silently disagree).
+  Placed `TopStart` (guided mode's `MapboxManeuverView` already owns
+  `TopCenter`).
+REAL BUG FOUND + FIXED (2026-09-05, same session, follow-up user report:
+  "in the current guided destination window I cant see those cards. make
+  sure those cards are small and right to the end trip button"): the
+  `TopStart` placement above was wrong for GUIDED navigation specifically
+  (free-drive, which has no `MapboxManeuverView`, showed them fine) —
+  `MapboxManeuverView` is an `AndroidView` with its own opaque background,
+  `fillMaxWidth()`'d at `TopCenter`, and since it's added to the `Box`
+  AFTER the chips it draws on top of that entire width, burying anything
+  underneath regardless of the chips' own alignment being nominally
+  "TopStart" not "TopCenter" — Compose alignment governs position, not
+  z-order/paint-over. Fixed by moving the three chips off the top
+  entirely: they now sit in a `Column` to the right of the Exit button,
+  inside the same bottom `Row` (`SpaceBetween`, `Alignment.Bottom`) —
+  a region `MapboxManeuverView` never reaches. Shrunk to a new
+  `MiniStatusChip` (private to this file: 8dp/4dp padding, 6dp dot,
+  `labelSmall` text vs. `StatusChip`'s 14dp/8dp/8dp/`bodySmall`) per the
+  "make sure those cards are small" ask. The recenter `FloatingIconButton`
+  below (still `BottomEnd`) had its fixed bottom offset bumped from 140dp
+  to 190dp to clear the now-taller bottom row (Exit button + 3-chip
+  column stacked beside it).
+VERIFIED ON A REAL DEVICE (2026-09-05, same S24 FE): real guided
+  navigation to Voltas Colony, Chennai (via History's Recent Voltas
+  Colony entry, same destination prior sessions used) — "Turn right,
+  200 ft" banner rendered correctly at TopCenter, DEAD_RECKONING/0.0 m/s/
+  Stationary chips now visibly stacked to the right of the Exit button at
+  the bottom, no overlap with the banner or the Exit button itself. Clean
+  Exit back to MapScreen, empty crash buffer throughout both this and the
+  free-drive re-check.
+Connected to: ui/screens/MapScreen.kt (isNavigating || isFreeDriving
+  overlay, drawn last, now also passes drState/gnssState/mlState/
+  fusedState) -> ActiveGuidanceScreen -> nav/NavigationSessionRepository
 ```
 
 ```
@@ -3499,18 +3968,122 @@ Unit tests: tests/ml/test_train_velocity_model.py (14 cases, added
   just synthetic-data unit tests. `python -m pytest
   tests/ml/test_train_velocity_model.py` — 14/14 pass.
 
+motion_labels.py
+Status: IMPLEMENTED
+Purpose: Derives real, non-heuristic ground-truth motion-class labels
+  from IO-VNBD's VEHICLE CSV (V-<trip>.csv, a real VBOX CAN-bus
+  recording of actual driver input, independent of the phone) —
+  train_motion_classifier.py's dedicated labeling module (CLAUDE.md
+  Rule 5, same split as feature_extraction.py/train_velocity_model.py).
+REAL DATA-QUALITY FINDING (2026-09-02, CLAUDE.md Rule 13 — same lesson
+  as feature_extraction.py's forward-axis sign correction and
+  inspect_dataset.py's GPS-1Hz finding): "Accelerator Pedal Position
+  (0 or 1)"'s own column header is wrong — checked directly across all
+  72 trips (1,071,035 rows): it's actually a continuous 0-99 throttle
+  position (mean 9.8, 42% exactly 0), not binary. "Brake Position
+  (0 or 1)" IS genuinely binary, confirmed the same way. The
+  Accelerating threshold (20.0) was picked empirically, not guessed: at
+  pedal > 20, 94.6% of matching rows have real positive Indicated
+  Longitudinal Acceleration (vs. 62.7% at pedal > 0).
+Outputs: MOTION_CLASSES = [Stationary, Turning, Braking, Accelerating,
+  Cruising, Moving] — the 6 of PRD.md Section 14's 8 classes this
+  dataset can genuinely support. Pothole and Phone Moved have NO signal
+  anywhere in IO-VNBD (no event markers, nothing CAN-bus-related to
+  either) and stay on their existing deterministic stand-ins
+  (motion/PotholeShockDetector.kt, motion/PhoneMovedDetector.kt) until a
+  real self-captured drive exists (capture/SensorRecorder.kt's
+  CaptureLabel tooling, still unused).
+Important functions/classes: vehicle_csv_path_for() (the S-/V- filename
+  swap, duplicated from inspect_dataset.py's inline expression rather
+  than importing a private helper); load_vehicle_csv() (positional load,
+  29 columns, same philosophy as _load_smartphone_csv); derive_motion_labels()
+  — a pure, vectorized, first-match-wins precedence chain: Stationary
+  (velocity < 1.0 km/h) > Turning (|yaw rate| >= 8.6 deg/s, matching
+  motion/TurningDetector.kt's own default) > Braking (real brake-pedal
+  ground truth) > Accelerating (throttle > 20%) > Cruising (steady
+  velocity, rolling std < 0.5 km/h) > Moving (fallback).
+Unit tests: tests/ml/test_motion_labels.py (18 cases) — each condition
+  fires correctly in isolation; precedence order (Stationary beats
+  Turning/Braking/Accelerating; Turning beats Braking/Accelerating;
+  Braking beats Accelerating); Cruising/Moving split respects the
+  window_samples parameter, not hardcoded; vehicle_csv_path_for only
+  replaces the first "S-" occurrence.
+
 train_motion_classifier.py
-Status: PLANNED
-Purpose: Train + evaluate the motion classifier (PRD.md Section 14 —
-  Stationary/Pothole/Turning/Phone Moved/etc.), report metrics per
-  PRD.md Section 28. Blocked on the self-captured supplementary data
-  the Phase 4 findings above call for (Pothole/Phone Moved have no
-  ground-truth signal in IO-VNBD) — Stationary alone could proceed now
-  via weak-labeling from GPS speed ≈ 0, but the other classes cannot.
+Status: IMPLEMENTED — training/evaluation only, no export/on-device
+  wiring yet (see MotionClassifierModel.kt's own entry, still PLANNED)
+Purpose: Trains + evaluates a RandomForestClassifier over the velocity
+  model's EXACT shared FEATURE_COLUMNS (PRD.md Section 14's own "shared
+  feature extraction reduces on-device cost" requirement) against
+  motion_labels.py's real vehicle-CAN ground truth — join is by
+  (trip_name, row position); 63/72 trips have byte-identical smartphone/
+  vehicle row counts, the other 9 differ only by a small trailing amount
+  (confirmed, worst case, to be exactly explained by one logger running
+  slightly longer — 232 extra rows x 0.1s sample period = 23.2s,
+  matching that trip's real wall-clock duration difference) — truncated
+  to min(len), a disclosed simplification, not a silent one.
+REAL MEASURED RESULT (2026-09-02, S24-adjacent session, 58 train / 14 val
+  trips, seed=42, 159,145 val rows): reported FOUR ways side by side
+  (CLAUDE.md Rule 3 — no cherry-picked single number), because the first
+  configuration tried was misleading on its own:
+    Trivial majority-class baseline ("Cruising" always): 40.4% accuracy
+    Deterministic baseline (Python re-impl of what ships on-device):    29.6% accuracy
+    Trained RandomForestClassifier, UNWEIGHTED:                          47.2% accuracy
+    Trained RandomForestClassifier, class_weight="balanced":             30.5% accuracy
+  REAL FINDING while building this: class_weight="balanced" alone (the
+  first thing tried) reported 30.5% — BELOW simply always guessing the
+  majority class (40.4%). That is not a complete comparison on its own;
+  balanced weighting trades overall accuracy for minority-class recall,
+  it does not make the model worse in an absolute sense. All four are
+  now trained/reported together so the real tradeoff is visible, not
+  hidden behind one convenient setting.
+  HONEST VERDICT: the unweighted trained classifier (47.2%) is the only
+  configuration that beats BOTH the deterministic baseline AND the
+  trivial majority-class baseline — a real, measured, if modest,
+  justification for ML on THIS metric (CLAUDE.md Rule 3) — but its own
+  per-class report shows why it wins on raw accuracy: Accelerating and
+  Moving recall are catastrophic (2% and 1%) — the model is mostly just
+  learning to say "Cruising" (94% recall there) and "Stationary" (83%
+  recall), which happen to be a large enough share of the val set to
+  inflate the accuracy number. PRD.md Section 28's "no class assumed to
+  just work" is not satisfied by any of the four configurations tested —
+  NOT wired into the app on this result. HONEST, ACCEPTED LIMITATION
+  (matches PRD.md Section 31's own documented StationaryDetector.kt
+  finding): FEATURE_COLUMNS has no velocity feature, so every
+  configuration here shares the same "can't fully tell parked from
+  steady coasting" blind spot — expected, not fixed by smuggling in a
+  velocity feature that wouldn't reflect what ships on-device.
+  Feature importances (unweighted model): elapsed_since_last_gnss_fix_s
+  (0.210) and accel_up_std_mps2 (0.198) dominate — the SAME vibration-
+  scales-with-something signal already flagged as a generalization risk
+  for the velocity model (PRD.md Section 31), now showing up here too.
+Important functions/classes: build_labeled_dataset() (the row-position
+  join + truncation described above); deterministic_baseline_labels()
+  (Python re-implementation of what's shipping today, reusing already-
+  defined thresholds — ZUPT_MAX_ACCEL_MPS2/ZUPT_MAX_GYRO_RADPS from
+  train_velocity_model.py, TurningDetector.kt's 0.15 rad/s,
+  LongitudinalMotionClassifier.kt's 1.0 m/s^2 — not re-guessed); reuses
+  split_trips() by IMPORT from train_velocity_model.py (not duplicated),
+  same precedent train_reacquisition_model.py already established.
+Unit tests: tests/ml/test_train_motion_classifier.py (10 cases) —
+  build_labeled_dataset truncates correctly in both directions (smartphone
+  longer / vehicle longer); a trip with no paired vehicle file is skipped
+  and reported, not silently dropped or crashed; raises when NO trip can
+  be labeled at all; deterministic_baseline_labels' four branches plus its
+  median Cruising/Moving split; split_trips import wiring. `python -m
+  pytest tests/ml/test_motion_labels.py tests/ml/test_train_motion_classifier.py`
+  — 28/28 pass; full suite `python -m pytest tests/` — 71/71 pass, no
+  regressions.
+Connected to: data/processed/io_vnbd_features.parquet, motion_labels.py
+  -> train_motion_classifier.py -> (printed comparison report only — no
+  model artifact saved, same pattern as train_velocity_model.py; export
+  is explicitly a separate, later, not-yet-built step)
 
 export_model.py
 Status: IMPLEMENTED (velocity model only — motion classifier export
-  waits on train_motion_classifier.py)
+  waits on a measured result that actually justifies it, see
+  train_motion_classifier.py's own entry above for why this one doesn't
+  yet)
 Purpose: Retrains the velocity model on ALL 72 trips (not just the
   58-trip train split train_velocity_model.py used for honest
   evaluation — standard practice once the approach is already
