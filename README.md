@@ -27,7 +27,8 @@ a minute; under 100 m over 1 km at 60 km/h.
 ## The solution
 
 IDR is a real Android app, not a slide deck. Underneath a full navigation
-UI (real street maps, destination search, turn-by-turn routing) sits a
+UI (real street maps, destination search, voice-guided turn-by-turn with
+banner/lane instructions, free drive, automatic rerouting) sits a
 positioning engine that:
 
 1. Reads accelerometer, gyroscope, and orientation at ~10 Hz.
@@ -52,9 +53,9 @@ Section 30 (SIH WOW Factor) for the reasoning behind each one.
 
 | | |
 |---|---|
-| ![Live GNSS/DR status overlay](docs/screenshots/01-drive-status.png) **Live status overlay** — GNSS mode, speed, motion state, and phone-to-vehicle alignment, all reading from the same real pipeline described above. | ![Real destination search](docs/screenshots/02-destination-search.png) **Real destination search** — OpenStreetMap/Nominatim, no mock data, no API key. |
-| ![Real computed route](docs/screenshots/03-route-preview.png) **Real turn-by-turn routing** — an actual OSRM-computed route (14.7 km / 20 min) with real street-name steps. | ![Live turn-by-turn navigation](docs/screenshots/04-live-navigation.png) **Live "Go" navigation** — the next-turn distance keeps counting down using physics + ML fusion, so it doesn't freeze mid-outage like a normal map app. |
-| ![Real measured drift history](docs/screenshots/05-drift-history.png) **Honest drift log** — every number here is measured at the instant GPS was reacquired, not simulated or invented. | |
+| ![Live GNSS/DR status overlay](docs/screenshots/01-drive-status.png) **Live status overlay** — GNSS mode, speed, motion state, and phone-to-vehicle alignment, all reading from the same real pipeline described above, rendered over a real Mapbox street map. | ![Real destination search](docs/screenshots/02-destination-search.png) **Real destination search** — live OpenStreetMap/Nominatim results as you type, no mock data, no API key. |
+| ![Real computed route](docs/screenshots/03-route-preview.png) **Real turn-by-turn routing** — an actual OSRM-computed route (3.8 km / 9 min) with real street-name steps. | ![Live turn-by-turn navigation](docs/screenshots/04-live-navigation.png) **Live guided navigation** — Mapbox Navigation SDK turn-by-turn: real banner + lane instructions, voice guidance, and the same GNSS/DR status chips (small, next to Exit) so the positioning story stays visible even mid-guidance. |
+| ![Free drive mode](docs/screenshots/06-free-drive.png) **Free drive** — no destination needed; a live map-matched, compass-heading position with the GNSS/DR pipeline still running underneath. | ![Real measured drift history](docs/screenshots/05-drift-history.png) **Honest drift log** — every number here is measured at the instant GPS was reacquired, not simulated or invented. |
 
 ## How it works
 
@@ -82,7 +83,7 @@ No number below is assumed or invented — see [`docs/PROJECT_MAP.md`](docs/PROJ
 | Metric | Result |
 |---|---|
 | ML velocity model vs. physics+ZUPT baseline | **4.2× more accurate** (MAE 1.244 m/s vs. 5.205 m/s, RMSE 1.593 vs. 6.345 m/s — IO-VNBD dataset, held-out trips) |
-| Recurring service cost | **₹0** — OpenStreetMap tiles, Nominatim search, and OSRM routing are all free and keyless |
+| Recurring service cost | **₹0** — Nominatim search and OSRM routing are free and keyless; Mapbox map rendering + Navigation SDK run on its free tier (usage-notification alerts set well below the cap, never billed) |
 | Test device | Samsung Galaxy S24 FE (Android 16 / One UI 8.5) — every number above was measured on real hardware, not a simulator |
 | At-rest drift after ZUPT | Reduced from several metres to near-zero over 15+ seconds of real stationary testing |
 
@@ -91,9 +92,10 @@ No number below is assumed or invented — see [`docs/PROJECT_MAP.md`](docs/PROJ
 **Android app** — Kotlin, Jetpack Compose, coroutines/`StateFlow`
 - **Sensors**: Android `SensorManager` (accelerometer, gyroscope, rotation vector) at ~10 Hz, on a dedicated background thread
 - **On-device ML inference**: [ONNX Runtime Mobile](https://onnxruntime.ai/) (`onnxruntime-android`)
-- **Maps**: [osmdroid](https://github.com/osmdroid/osmdroid) rendering real OpenStreetMap tiles (via CartoDB's free endpoint)
+- **Maps**: [Mapbox Maps SDK](https://docs.mapbox.com/android/maps/guides/) rendering OpenStreetMap-derived street tiles — keeps the same basemap geometry the OSRM routing/road-snap logic below already relies on
+- **Turn-by-turn guidance**: [Mapbox Navigation SDK](https://docs.mapbox.com/android/navigation/guides/) — real voice guidance, banner + lane instructions, automatic rerouting on off-route, and a free-drive (no destination) mode, layered over the same live GNSS/DR pipeline
 - **Geocoding**: [OpenStreetMap Nominatim](https://nominatim.org/) — free destination search, no API key
-- **Routing**: [OSRM](http://project-osrm.org/) — free turn-by-turn routing, no API key
+- **Route preview/planning**: [OSRM](http://project-osrm.org/) — free turn-by-turn routing, no API key; active guidance switches to Mapbox's own Directions API specifically because voice/banner/lane text is generated server-side and doesn't exist in a plain OSRM response
 - **Location**: Google Play Services `FusedLocationProviderClient`
 
 **ML training pipeline** — offline, Python
@@ -101,8 +103,13 @@ No number below is assumed or invented — see [`docs/PROJECT_MAP.md`](docs/PROJ
 - `onnx` / `skl2onnx` for export, with an explicit output-parity check against the on-device ONNX Runtime path before it's trusted
 - Trained and evaluated against the real **IO-VNBD** dataset
 
-No paid API, SDK, or backend anywhere in the stack — deliberately, so
-nothing here is blocked on a credential or a billing account.
+The core positioning engine, ML pipeline, sensor processing, geocoding,
+and route planning stay free/keyless as above. The one exception is the
+Mapbox Maps + Navigation SDKs (map rendering and turn-by-turn guidance,
+added Round 2): a free-tier Mapbox account and public token are required
+to build/run, kept usage-capped well inside the free tier and out of this
+repo (`android/local.properties`, gitignored) — see [`PRD.md`](PRD.md)
+Section 7's dated amendment for the tradeoff reasoning.
 
 ## SIH requirement coverage
 
@@ -115,11 +122,11 @@ nothing here is blocked on a credential or a billing account.
 | Pothole/bump detection | ✅ Deterministic vertical-shock detector (real, not yet ML-trained — see Honest Limitations) |
 | Non-holonomic constraints | ✅ Built, with an explicit Walking-mode exception |
 | Seamless GNSS ↔ DR transition | ✅ Built, every transition logged and replayable |
-| Real-time mobile navigation UI | ✅ Full app — search, routing, turn-by-turn, offline tiles |
+| Real-time mobile navigation UI | ✅ Full app — search, route preview, and Mapbox Navigation SDK turn-by-turn (voice, banner + lane instructions, auto-reroute, free drive) |
 | Lightweight edge-deployable inference | ✅ Random Forest → ONNX, running live on-device |
 | Preliminary testing on IO-VNBD | ✅ Done — see measured results above |
 | Automatic phone-to-vehicle alignment | ✅ Built (GNSS-aided initialization window) + manual recalibrate fallback |
-| Map matching | 🔜 Not built — see Honest Limitations |
+| Map matching | 🟡 MVP built (nearest-road-snap + heading check while a route is active) — full HMM-style map matching is explicitly out of scope, see Honest Limitations |
 
 ## Getting started
 
@@ -132,7 +139,13 @@ Create `android/local.properties` (gitignored, machine-specific):
 
 ```properties
 sdk.dir=/path/to/your/Android/Sdk
+MAPBOX_DOWNLOADS_TOKEN=<a Mapbox secret token with DOWNLOADS:READ scope>
+MAPBOX_PUBLIC_TOKEN=<a Mapbox public (pk.) token>
 ```
+
+Both Mapbox tokens are free — create a free-tier account at
+[mapbox.com](https://www.mapbox.com/) to generate them; no other part of
+the build needs a key, signup, or billing account.
 
 Then either open `android/` in Android Studio, or build from the CLI:
 
@@ -140,7 +153,6 @@ Then either open `android/` in Android Studio, or build from the CLI:
 ./gradlew assembleDebug
 ```
 
-No API keys, no signup, no billing account needed anywhere in the build.
 The ONNX velocity model is already bundled in the repo
 (`android/app/src/main/assets/velocity_v1.onnx`) — if it's ever missing,
 the app degrades gracefully to physics-only and says so on screen, it does
@@ -165,16 +177,25 @@ docs/       PROJECT_MAP.md — the living, file-by-file source of truth
 This project would rather show two honest columns than one impressive
 overstatement:
 
-- **Trained motion classifier** (pothole / turning / cruising) — blocked on
-  more self-captured labeled driving data. Deterministic stand-ins are
-  wired in and clearly labeled as such, not presented as the real thing.
-- **Map matching / road-snapping** — not built. Positions are shown as
-  measured, not snapped to the nearest road.
-- **A real multi-minute outdoor GNSS outage during an actual drive** —
-  validated so far by unit tests and one real outdoor walking test, not
-  yet a full live tunnel/underpass drive test.
-- **Heading-up map rotation while navigating** — implemented, not yet
-  confirmed against a live compass outdoors.
+- **Trained motion classifier** (pothole / turning / cruising) — the
+  training pipeline now exists (`ml/motion_labels.py`,
+  `ml/train_motion_classifier.py`, real IO-VNBD CAN-bus ground truth) but
+  the on-device model wrapper is not yet wired into the app. Deterministic
+  stand-ins are used instead and clearly labeled as such, not presented as
+  the real thing.
+- **Map matching** — an MVP nearest-road-snap + heading-compatibility
+  check is built and running (`map/MapConstraint.kt`, while a route is
+  active), not a full HMM-style map-matching engine — that's explicitly
+  out of scope by design, not an oversight.
+- **A real multi-minute outdoor GNSS outage during an actual drive** — a
+  real 325.9s outdoor drive has been logged, with genuine GNSS_AIDED lock
+  (up to 149.9s) and genuine DEAD_RECKONING stretches (up to 37.8s each),
+  but not yet a single continuous multi-minute outage or a live
+  tunnel/underpass test.
+- **Mapbox Navigation SDK voice guidance and automatic rerouting** — wired
+  in and crash-free on a real device, but audible voice playback and a
+  real off-route reroute trigger haven't been independently confirmed yet
+  (stationary on-device testing can't produce either).
 
 Every one of these is tracked with the same specificity in
 [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md) — nothing here is a vague
