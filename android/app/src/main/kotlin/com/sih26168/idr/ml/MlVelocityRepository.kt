@@ -378,11 +378,19 @@ class MlVelocityRepository(
                 // Motion-classification stand-in: the plain accel/gyro
                 // dwell-confirmed flag alone can't tell "truly at rest" from
                 // "smoothly cruising" (see MotionStateClassifier's doc) —
-                // corroborate with the raw model prediction before deciding
-                // whether to override the context-aware ZUPT decision below.
+                // corroborate with the SAME bias-corrected/damped velocity
+                // that actually feeds the position integrator below, before
+                // deciding whether to override the context-aware ZUPT
+                // decision. FIXED 2026-09-05: this used to pass the model's
+                // raw (pre-bias-correction) prediction, which stayed
+                // near-zero even at real riding speed on a real outdoor
+                // bike test — the override never fired because it was
+                // corroborating against a stale, uncorrected value instead
+                // of the ~11 m/s the bias calibrator had actually converged
+                // on, so ZUPT froze the position despite genuine motion.
                 val motionClassification = motionStateClassifier.classify(
                     classification.dwellConfirmedStationary,
-                    rawPredictedVelocityMps,
+                    dampedVelocityMps,
                 )
 
                 // The actual ZUPT gate: StopEventClassifier's context-aware

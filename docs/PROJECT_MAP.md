@@ -1960,10 +1960,14 @@ REAL FINDING from on-device testing (2026-08-25) — position drift
   UPDATE (2026-08-25, same day): now also owns a `motion/MotionStateClassifier`
   and a `motion/PotholeShockDetector` instance. Before ZUPT-gating
   `positionIntegrator`, `physicallyStill` (from `stationaryDetector`) is
-  corroborated against `rawPredictedVelocityMps` via
+  corroborated against the current velocity estimate via
   `MotionStateClassifier.classify()` — a physically-still tick with a
-  meaningful raw prediction gets overridden to NOT ZUPT
-  (`MlVelocityUiState.isCruising = true`). Before the forward/lateral
+  meaningful velocity estimate gets overridden to NOT ZUPT
+  (`MlVelocityUiState.isCruising = true`). ORIGINALLY passed
+  `rawPredictedVelocityMps` here — CHANGED 2026-09-05, see this class's
+  own "REAL BUG FOUND AND FIXED" entry below and MotionStateClassifier.kt's
+  entry for why that was wrong (it must be the bias-corrected/damped
+  value, not the raw pre-correction one). Before the forward/lateral
   accel projection, `potholeShockDetector.isShock(linearAccel[2])` is
   checked; a detected shock zeroes the East/North linear-accel
   components before they're turned into `accelForwardMps2`/
@@ -2009,19 +2013,27 @@ REAL FINDING from on-device testing (2026-08-25) — position drift
   UPDATE (context-aware ZUPT): the owned `StationaryDetector` field is
   replaced by `motion/StopEventClassifier.kt` (see its own entry) —
   `dampedVelocityMps` and (when GNSS_AIDED + GnssQuality.isGood) GNSS
-  speed feed it as the two extra inputs. `MotionStateClassifier`'s
-  existing contract is UNCHANGED — it now reads
-  `StopClassification.dwellConfirmedStationary` instead of a second,
-  redundant `StationaryDetector.evaluate()` call, but receives the exact
-  same accel/gyro-dwell-only boolean it always did. The actual ZUPT gate
-  fed to `positionIntegrator.update()` is
+  speed feed it as the two extra inputs. `MotionStateClassifier` still
+  reads `StopClassification.dwellConfirmedStationary` instead of a
+  second, redundant `StationaryDetector.evaluate()` call for its
+  physically-still input, same as before. The actual ZUPT gate fed to
+  `positionIntegrator.update()` is
   `classification.shouldApplyZupt && !motionClassification.isCruising` —
   StopEventClassifier's context-aware decision, still overridable by the
-  existing cruising signal exactly as before, so neither signal's prior
-  protective behavior is lost. `MlVelocityUiState.stationaryContext`
-  (new field) carries the classification for logging/debug/UI only, same
-  as `DeadReckoningState.stationaryContext` on the physics side. Logs
+  cruising signal. `MlVelocityUiState.stationaryContext` (new field)
+  carries the classification for logging/debug/UI only, same as
+  `DeadReckoningState.stationaryContext` on the physics side. Logs
   (`Log.d`) on every context change, not every tick.
+  BUG FIXED (2026-09-05): the cruising override's SECOND input
+  (velocity) was `rawPredictedVelocityMps` until this date — that
+  defeated the override whenever VelocityBiasCalibrator had learned a
+  large bias (exactly what happened on a real outdoor bike test: raw
+  model near-0 while bias-corrected `dampedVelocityMps` was ~11 m/s),
+  because the override compared the wrong, stale value against
+  `minCruisingSpeedMps` and never fired, so ZUPT froze the ML position
+  marker despite genuine motion. Now passes `dampedVelocityMps` instead
+  — see MotionStateClassifier.kt's entry for the full writeup. NOT YET
+  re-verified against a fresh outdoor GPS-off drive.
 Connected to: SensorRepository, GnssModeRepository -> MlVelocityRepository -> MainActivity (Compose UI);
   MlVelocityRepository -> fusion/StateEstimator (Slice 7, reads its position + isAligned);
   motion/MotionStateClassifier, motion/PotholeShockDetector, motion/LongitudinalMotionClassifier
@@ -2540,7 +2552,7 @@ Important concepts/assumptions: HONEST LIMITATION (CLAUDE.md Rule 13) —
 Connected to: fusion/StateEstimator.kt -> DriftSummary.compute() -> FusedPositionUiState.driftSummary
 
 motion/MotionStateClassifier.kt
-Status: IMPLEMENTED (2026-08-25)
+Status: IMPLEMENTED (2026-08-25); BUG FIXED (2026-09-05)
 Purpose: A DETERMINISTIC, PARTIAL stand-in for two of PRD.md Section 14's
   8 Motion Classification classes — `Stationary` and `Cruising` — NOT the
   trained Random Forest/GBT classifier Section 14 actually specifies
@@ -2552,16 +2564,45 @@ Purpose: A DETERMINISTIC, PARTIAL stand-in for two of PRD.md Section 14's
   'smoothly coasting'" — a genuine accelerometer/gyro-only sensor-physics
   limit no threshold on accel/gyro alone can fix. Breaks the tie using an
   independent signal already computed every tick: the ML velocity
-  model's RAW prediction (ml/VelocityModel.kt). Same "deterministic
+  model's prediction (ml/VelocityModel.kt). Same "deterministic
   stand-in before the real ML classifier" precedent as StationaryDetector
   itself.
+  REAL BUG FOUND AND FIXED (2026-09-05, real outdoor bike drive test,
+  GPS-off segment): this used to receive the RAW, pre-bias-correction
+  model output as its corroborating signal. That output stayed near 0
+  m/s the entire outage even though the bike was genuinely riding at
+  ~11 m/s, because the raw ONNX model (trained on car data) badly
+  under-predicts this bike's real speed — the domain gap
+  VelocityBiasCalibrator exists to paper over. VelocityBiasCalibrator had
+  correctly learned a ~11 m/s compensating bias from GNSS ground truth
+  before the outage, so ml/MlVelocityRepository's displayed
+  `dampedVelocityMps` correctly showed ~11 m/s — but this classifier
+  never saw that number, only the stale near-zero raw one, so it never
+  crossed minCruisingSpeedMps and never fired isCruising. Net effect on
+  a smooth road (low accel/gyro, matching StationaryDetector's own
+  documented ambiguity): StopEventClassifier fell into BRIEF_STOP/
+  LONG_IDLE, nothing overrode it, ZUPT fired, and
+  ml/MlPositionIntegrator zeroed the position update despite real
+  motion — the on-screen ML position marker froze while the velocity
+  readout kept showing ~11 m/s. Fix: this classifier's second parameter
+  (renamed rawPredictedVelocityMps -> velocityEstimateMps) must be the
+  SAME bias-corrected/damped velocity MlVelocityRepository actually feeds
+  to the position integrator, not the pre-correction raw model output —
+  see this file's own class doc and MlVelocityRepository.kt's call site
+  for the full writeup. Rebuilt, unit tests updated
+  (MotionStateClassifierTest.kt), installed on-device via `adb install`.
+  NOT YET re-verified against a fresh outdoor GPS-off drive — CLAUDE.md
+  Rule 13/"How Claude Should Work" #3 still applies until that re-run
+  happens and the ML position marker is confirmed to actually advance
+  during smooth constant-speed cruising with GNSS off.
 Inputs: physicallyStill (StationaryDetector's own accel/gyro-only
-  output), rawPredictedVelocityMps (pre-bias-correction ML prediction).
+  output), velocityEstimateMps (bias-corrected/damped ML velocity — the
+  SAME value fed to ml/MlPositionIntegrator, NOT the raw model output).
 Outputs: MotionClassification(isStationary, isCruising) — mutually
   exclusive; both false if not physicallyStill (no ambiguity to resolve
   there — this class only resolves the ONE stationary-vs-cruising tie).
 Important functions/classes: classify() — physicallyStill=false -> both
-  false; physicallyStill=true and rawPredictedVelocityMps below
+  false; physicallyStill=true and velocityEstimateMps below
   minCruisingSpeedMps (default 1.0 m/s, engineering default, unvalidated
   per CLAUDE.md Rule 13) -> isStationary; at/above the threshold ->
   isCruising (ZUPT override).

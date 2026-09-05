@@ -32,17 +32,31 @@ data class MotionClassification(
  * accelerometer/gyro-only sensor-physics limit (zero net force feels the
  * same whether the phone is parked or gliding at a constant speed) — no
  * threshold on accel/gyro alone can ever resolve it. It CAN be resolved
- * with an independent signal: the ML velocity model's RAW prediction
+ * with an independent signal: the ML velocity model's prediction
  * (ml/VelocityModel.kt), already computed every tick regardless of GNSS
  * mode. If accel/gyro look quiet BUT the model still predicts meaningful
  * forward speed, that's real corroborating evidence of cruising, not
  * true rest.
  *
+ * BUG FIXED 2026-09-05 (real outdoor bike test, GPS-off segment): this
+ * used to receive the model's RAW, pre-bias-correction output. That's
+ * wrong whenever VelocityBiasCalibrator has learned a large correction
+ * - which it had here, because the raw model (trained on car data)
+ * badly under-predicted this bike's real speed. Symptom: the velocity
+ * readout showed ~11 m/s (correctly bias-corrected) while the position
+ * marker stayed frozen, because this classifier was still looking at
+ * the near-zero RAW value, never saw it cross minCruisingSpeedMps, and
+ * so never overrode ZUPT. This must be given the SAME corrected/damped
+ * velocity that actually feeds MlPositionIntegrator - corroborating a
+ * value against a different, pre-correction version of itself defeats
+ * the whole point of this override.
+ *
  * Explicitly NOT the PRD Section 14 classifier: this reuses an
- * already-trained REGRESSION model's raw output as a corroborating
- * signal for one binary decision, not a trained classifier over the
- * full 8-class taxonomy, and has not been validated against any
- * real cruising ground truth (no labeled data exists yet).
+ * already-trained REGRESSION model's (bias-corrected) output as a
+ * corroborating signal for one binary decision, not a trained
+ * classifier over the full 8-class taxonomy, and has not been
+ * validated against any real cruising ground truth (no labeled data
+ * exists yet).
  */
 class MotionStateClassifier(
     private val minCruisingSpeedMps: Float = DEFAULT_MIN_CRUISING_SPEED_MPS,
@@ -56,11 +70,18 @@ class MotionStateClassifier(
         const val DEFAULT_MIN_CRUISING_SPEED_MPS = 1.0f
     }
 
-    fun classify(physicallyStill: Boolean, rawPredictedVelocityMps: Float): MotionClassification {
+    /**
+     * @param velocityEstimateMps the SAME bias-corrected/damped velocity
+     *   the caller actually uses for position integration (e.g.
+     *   MlVelocityRepository's `dampedVelocityMps`) - NOT the model's
+     *   raw pre-correction output. See the 2026-09-05 bug note above for
+     *   why that distinction matters.
+     */
+    fun classify(physicallyStill: Boolean, velocityEstimateMps: Float): MotionClassification {
         if (!physicallyStill) {
             return MotionClassification(isStationary = false, isCruising = false)
         }
-        val cruising = rawPredictedVelocityMps >= minCruisingSpeedMps
+        val cruising = velocityEstimateMps >= minCruisingSpeedMps
         return MotionClassification(isStationary = !cruising, isCruising = cruising)
     }
 }
