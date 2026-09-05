@@ -3518,10 +3518,61 @@ Automatic rerouting on off-route (developer-requested feature) is
   default (CLAUDE.md Rule 13). NOT independently verified triggering a
   real reroute — needs an actual off-route deviation, which this
   session's stationary/simulated testing could not produce.
+REAL BUG FOUND + FIXED (2026-09-05, user report: "the dead reckoning
+  system is not working in the app" / "the marker freezes completely,
+  doesn't move at all during outage", found while testing via
+  turn-by-turn navigation): THE CORE MISSION FEATURE WAS BYPASSED ON
+  THIS SCREEN. `locationProvider` (which feeds the guidance puck) was
+  written ONLY from `locationObserver.onNewLocationMatcherResult` — the
+  Mapbox Navigation SDK's own GPS-backed map matcher. That path has NO
+  connection to this project's dead-reckoning pipeline
+  (`gnss/GnssModeRepository` -> `dr/BaselineDeadReckoningRepository` ->
+  `fusion/StateEstimator`), so once GNSS was genuinely denied the SDK
+  simply stopped delivering location updates and the puck froze solid —
+  while the app's own DR estimate underneath had been updating correctly
+  the whole time. `ui/screens/MapScreen.kt`'s marker never had this bug
+  (it projects `fusion/StateEstimator`'s fused position itself), so
+  entering active guidance had silently swapped in a second,
+  DR-unaware position source — i.e. the 2026-09-05 Mapbox Navigation
+  SDK integration regressed the project's central
+  GNSS->DR->GNSS demonstration for the navigation screen specifically.
+  FIXED by `setDeadReckonedPosition(latDeg, lonDeg, headingDeg)`: while
+  GNSS is not trusted, `ui/screens/ActiveGuidanceScreen.kt` projects
+  `fusion/StateEstimator`'s fused East/North meters back to lat/lon
+  (fusion/GeoProjection.toLatLon, through the same outage anchor) and
+  hands them here; this pushes them to the puck AND publishes them as
+  `NavUiState.currentLatDeg/currentLonDeg` (so camera-follow/recenter
+  follow the DR position unchanged). An `isDeadReckoningActive` flag
+  (@Volatile — written on the UI thread, read on the SDK's location
+  callback thread) suppresses the SDK's own position writes for the
+  duration, so the two sources can never fight over the same puck.
+  Passing null lat/lon hands control back on reacquisition.
+KNOWN LIMITATION of that fix (deliberate scope cut, CLAUDE.md "ship the
+  simpler version... record the deferred sophistication as Future
+  Work"): it moves the PUCK and this class's published position only. It
+  does NOT feed the DR estimate into `MapboxNavigation`'s navigator, so
+  route progress (distance/duration remaining, maneuver advance, voice
+  announcements, off-route rerouting) still stalls during an outage and
+  resumes on reacquisition. Doing that properly means replacing the
+  SDK's location engine with a custom `DeviceLocationProvider` for the
+  whole trip session — that changes the position source for the working
+  turn-by-turn path too, and cannot be validated without a real outdoor
+  drive through a real outage.
+NOT YET VERIFIED ON DEVICE (CLAUDE.md Rule 13 / "How Claude Should
+  Work" #3): the machine this fix was written on has NO
+  `MAPBOX_DOWNLOADS_TOKEN` in `android/local.properties` and no cached
+  `com.mapbox.*` artifacts, so `:app:compileDebugKotlin` cannot resolve
+  dependencies there at all — the change is UNCOMPILED and UNRUN. The
+  `Location.Builder()` API used (`.latitude/.longitude/.bearing/
+  .timestamp/.build()`) was taken from Mapbox's own published source
+  (`mapbox-navigation-android`'s `LocationEx.kt`), not from memory, but
+  that is not a substitute for building it.
 Connected to: MainActivity.kt (MapboxNavigationApp.setup, initIfNeeded)
   -> ui/screens/MapScreen.kt (requestRoute/startActiveGuidance/
   startFreeDrive) -> ui/screens/ActiveGuidanceScreen.kt (consumes
-  `state` StateFlow + `locationProvider`)
+  `state` StateFlow + `locationProvider`; calls
+  `setDeadReckonedPosition` with fusion/StateEstimator's fused position
+  while GNSS is not trusted)
 ```
 
 ```
@@ -3662,9 +3713,37 @@ VERIFIED ON A REAL DEVICE (2026-09-05, same S24 FE): real guided
   the bottom, no overlap with the banner or the Exit button itself. Clean
   Exit back to MapScreen, empty crash buffer throughout both this and the
   free-drive re-check.
+REAL BUG FOUND + FIXED (2026-09-05, user report: "the dead reckoning
+  system is not working in the app" / "the marker freezes completely,
+  doesn't move at all during outage"): the location puck on this screen
+  never had any connection to this project's dead-reckoning pipeline —
+  it was fed exclusively by the Mapbox Navigation SDK's own GPS-backed
+  matcher, which stops delivering updates entirely once GNSS is denied,
+  so it froze in place during exactly the scenario this whole project
+  exists to demonstrate. See `nav/NavigationSessionRepository.kt`'s own
+  entry for the full root cause, the fix, its known limitation (route
+  progress/voice still stall during an outage), and the fact that it is
+  UNCOMPILED/UNVERIFIED — the machine it was written on has no
+  `MAPBOX_DOWNLOADS_TOKEN`. This file's half: a `LaunchedEffect` keyed on
+  the GNSS mode + fused position projects `fusion/StateEstimator`'s fused
+  East/North meters back to WORLD-frame lat/lon (CLAUDE.md Rule 14) via
+  `fusion/GeoProjection.toLatLon`, through the SAME outage anchor those
+  meters accumulated against — identical to what `ui/screens/MapScreen.kt`
+  already does for its own marker — and hands the result to
+  `NavigationSessionRepository.setDeadReckonedPosition` whenever the mode
+  is not GNSS_AIDED (passing nulls hands control back on reacquisition,
+  and while no anchor exists yet, since there is then no real-world point
+  to project against — no invented position, CLAUDE.md Rule 8/13).
+  Camera-follow and the recenter button needed no change: they already
+  read `NavUiState.currentLatDeg/currentLonDeg`, which that same call now
+  publishes.
 Connected to: ui/screens/MapScreen.kt (isNavigating || isFreeDriving
   overlay, drawn last, now also passes drState/gnssState/mlState/
   fusedState) -> ActiveGuidanceScreen -> nav/NavigationSessionRepository
+  (`state` + `locationProvider`, and `setDeadReckonedPosition` while GNSS
+  is not trusted); fusion/StateEstimator (via fusedState) ->
+  fusion/GeoProjection.toLatLon -> ActiveGuidanceScreen -> the guidance
+  puck
 ```
 
 ```

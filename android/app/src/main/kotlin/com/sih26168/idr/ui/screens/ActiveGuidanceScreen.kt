@@ -50,6 +50,7 @@ import com.sih26168.idr.BuildConfig
 import com.sih26168.idr.R
 import com.sih26168.idr.dr.DeadReckoningState
 import com.sih26168.idr.fusion.FusedPositionUiState
+import com.sih26168.idr.fusion.GeoProjection
 import com.sih26168.idr.gnss.GnssMode
 import com.sih26168.idr.gnss.GnssModeUiState
 import com.sih26168.idr.ml.MlVelocityUiState
@@ -208,6 +209,54 @@ fun ActiveGuidanceScreen(
             override fun onMove(detector: com.mapbox.android.gestures.MoveGestureDetector): Boolean = false
             override fun onMoveEnd(detector: com.mapbox.android.gestures.MoveGestureDetector) = Unit
         })
+    }
+
+    // REAL BUG FIX (2026-09-05, user report: "the dead reckoning system is
+    // not working in the app... the marker freezes completely, doesn't move
+    // at all during outage") — see
+    // [NavigationSessionRepository.setDeadReckonedPosition]'s own doc for the
+    // full root cause. The location puck on this screen was fed ONLY by the
+    // Mapbox Navigation SDK's own GPS-backed matcher, which stops delivering
+    // updates entirely once GNSS is denied; this app's own dead-reckoned
+    // estimate was never wired to it at all.
+    //
+    // Projects [fusedState]'s local East/North meters back to WORLD-frame
+    // lat/lon (CLAUDE.md Rule 14) through the SAME outage anchor
+    // fusion/StateEstimator.kt accumulated them against — fusion/GeoProjection.kt's
+    // exact inverse of its own forward projection, identical to what
+    // ui/screens/MapScreen.kt already does for its own marker (that screen's
+    // marker never froze, which is precisely why this one's freezing pointed
+    // at the position SOURCE rather than at the DR pipeline itself).
+    //
+    // Null anchor means no GNSS fix has EVER been seen this run, so there is
+    // no real-world point to project against — hand control back to the SDK
+    // rather than invent a position (CLAUDE.md Rule 8/13).
+    val isGnssTrusted = gnssState.mode == GnssMode.GNSS_AIDED
+    LaunchedEffect(
+        isGnssTrusted,
+        fusedState.fusedEastM,
+        fusedState.fusedNorthM,
+        fusedState.anchorLatDeg,
+        fusedState.anchorLonDeg,
+        fusedState.fusedHeadingDeg,
+    ) {
+        val anchorLat = fusedState.anchorLatDeg
+        val anchorLon = fusedState.anchorLonDeg
+        if (isGnssTrusted || anchorLat == null || anchorLon == null) {
+            NavigationSessionRepository.setDeadReckonedPosition(null, null, null)
+        } else {
+            val (drLatDeg, drLonDeg) = GeoProjection.toLatLon(
+                eastM = fusedState.fusedEastM,
+                northM = fusedState.fusedNorthM,
+                refLatDeg = anchorLat,
+                refLonDeg = anchorLon,
+            )
+            NavigationSessionRepository.setDeadReckonedPosition(
+                latDeg = drLatDeg,
+                lonDeg = drLonDeg,
+                headingDeg = fusedState.fusedHeadingDeg,
+            )
+        }
     }
 
     // Updates whenever the active route's geometry changes (set once per

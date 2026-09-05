@@ -129,9 +129,24 @@ object NavigationSessionRepository {
         }
     }
 
+    // True while this app's OWN dead-reckoned estimate is driving the puck
+    // (see [setDeadReckonedPosition]). @Volatile because it is written from
+    // the UI thread (the Composable effect in ui/screens/ActiveGuidanceScreen.kt)
+    // and read on whichever thread the Navigation SDK delivers its location
+    // callbacks on — two different threads, so the write must be visible to
+    // the reader without a lock.
+    @Volatile
+    private var isDeadReckoningActive = false
+
     private val locationObserver = object : LocationObserver {
         override fun onNewRawLocation(rawLocation: Location) = Unit
         override fun onNewLocationMatcherResult(locationMatcherResult: com.mapbox.navigation.core.trip.session.LocationMatcherResult) {
+            // While dead reckoning owns the puck, the SDK's own map-matched
+            // position must NOT also write to it — the two would fight for
+            // the same puck every tick. This is the whole point of the DR
+            // handover: during a GNSS outage the SDK's own estimate is
+            // exactly the thing that has stopped being trustworthy.
+            if (isDeadReckoningActive) return
             val enhanced = locationMatcherResult.enhancedLocation
             locationProvider.changePosition(enhanced, locationMatcherResult.keyPoints)
             _state.value = _state.value.copy(
@@ -140,6 +155,69 @@ object NavigationSessionRepository {
                 currentHeadingDeg = enhanced.bearing?.toFloat(),
             )
         }
+    }
+
+    /**
+     * REAL BUG FOUND (2026-09-05, user report: "the dead reckoning system is
+     * not working in the app... the marker freezes completely, doesn't move
+     * at all during outage", testing via turn-by-turn navigation): this
+     * screen's location puck is fed by [locationProvider], which until now
+     * was written ONLY from [locationObserver] above — i.e. the Mapbox
+     * Navigation SDK's own GPS-backed map matcher. That path has no
+     * connection whatsoever to this project's dead-reckoning pipeline
+     * (`gnss/GnssModeRepository` -> `dr/BaselineDeadReckoningRepository` ->
+     * `fusion/StateEstimator`), so the moment GNSS was actually denied the
+     * SDK simply stopped delivering location updates and the puck froze in
+     * place — while the app's own DR estimate underneath was updating
+     * correctly the entire time. `ui/screens/MapScreen.kt`'s marker never had
+     * this bug because it projects `fusion/StateEstimator`'s fused position
+     * itself; entering active guidance silently swapped in a second,
+     * DR-unaware position source.
+     *
+     * Passing a real [latDeg]/[lonDeg] hands the puck over to this app's own
+     * fused DR estimate and suppresses the SDK's own position updates until
+     * handed back; passing null for either hands control back to the SDK
+     * (GNSS trusted again). Called from `ui/screens/ActiveGuidanceScreen.kt`,
+     * which already receives the GNSS mode + fused position it needs to
+     * decide which of the two is live.
+     *
+     * @param latDeg/[lonDeg] WORLD-frame WGS84 degrees (CLAUDE.md Rule 14) —
+     *   the fused DR position, already projected out of `fusion/StateEstimator`'s
+     *   local East/North meter frame by the caller.
+     * @param headingDeg WORLD-frame compass heading, degrees clockwise from
+     *   north (CLAUDE.md Rule 15), or null if not known.
+     *
+     * KNOWN LIMITATION (deliberate scope cut, CLAUDE.md "ship the simpler
+     * version... record the deferred sophistication as Future Work"): this
+     * moves the PUCK and this class's own published position only. It does
+     * NOT feed the DR estimate back into [MapboxNavigation]'s navigator, so
+     * route progress (distance/duration remaining, maneuver advance, voice
+     * announcements, off-route rerouting) still stalls during an outage and
+     * resumes on reacquisition. Doing that properly means replacing the
+     * SDK's location engine with a custom DeviceLocationProvider for the
+     * whole trip session, which changes the position source for the working
+     * turn-by-turn path too and cannot be validated without a real outdoor
+     * drive through a real outage.
+     */
+    fun setDeadReckonedPosition(latDeg: Double?, lonDeg: Double?, headingDeg: Float?) {
+        if (latDeg == null || lonDeg == null) {
+            isDeadReckoningActive = false
+            return
+        }
+        isDeadReckoningActive = true
+        locationProvider.changePosition(
+            Location.Builder()
+                .latitude(latDeg)
+                .longitude(lonDeg)
+                .bearing(headingDeg?.toDouble())
+                .timestamp(System.currentTimeMillis())
+                .build(),
+        )
+        _state.value = _state.value.copy(
+            currentLatDeg = latDeg,
+            currentLonDeg = lonDeg,
+            currentHeadingDeg = headingDeg,
+        )
     }
 
     private val navigationObserver = object : MapboxNavigationObserver {
@@ -247,6 +325,10 @@ object NavigationSessionRepository {
     }
 
     fun stop() {
+        // Cleared before the early return below so a session that ended
+        // while dead reckoning owned the puck can never leave the SDK's own
+        // location updates suppressed for the NEXT session.
+        isDeadReckoningActive = false
         val mapboxNavigation = MapboxNavigationApp.current() ?: return
         mapboxNavigation.setNavigationRoutes(emptyList())
         mapboxNavigation.stopTripSession()
